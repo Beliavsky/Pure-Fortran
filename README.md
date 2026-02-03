@@ -28,10 +28,12 @@ Main programs:
 - `xprivate.py` - suggest/apply module-level `private :: name` restrictions.
 - `xprune.py` - compile-validated pruning of likely unused top-level procedures.
 - `ximplicit_none.py` - suggest/apply `implicit none` in program units.
+- `xuse_only.py` - suggest/apply `use ..., only: ...` imports from broad `use` statements.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
 - `xstrip_implicit_none.py` - strip `implicit none` statements for test-case generation.
+- `xstrip_use_only.py` - strip `use ..., only: ...` back to broad `use` for testing.
 
 Shared support modules:
 
@@ -174,7 +176,31 @@ python ximplicit_none.py --fix
 python ximplicit_none.py --fix --compiler "gfortran -o foo.exe"
 ```
 
-### 7) `xintent_pure_private.py`
+### 7) `xuse_only.py`
+
+Suggests and optionally rewrites broad imports such as:
+
+- `use foo`
+
+to explicit imports such as:
+
+- `use foo, only: func_a, sub_b`
+
+Typical commands:
+
+```bash
+python xuse_only.py
+python xuse_only.py --fix
+python xuse_only.py --fix --compiler "gfortran -o foo.exe"
+```
+
+Notes:
+
+- Conservative analysis across source files using discovered module exports and identifier usage.
+- In `--fix` mode, compile checks can be used (`baseline` and `after-fix`) with rollback on failure.
+- Renamed imports (`=>`) are handled conservatively and may be skipped.
+
+### 8) `xintent_pure_private.py`
 
 Full pipeline wrapper for:
 
@@ -189,7 +215,7 @@ Typical command:
 python xintent_pure_private.py --suggest-intent-out --suggest-elemental --compiler "gfortran -o foo.exe"
 ```
 
-### 8) `xstrip.py`
+### 9) `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -203,7 +229,7 @@ python xstrip.py --strip pure
 
 By default summary output is off; enable with `--summary`.
 
-### 9) `xstrip_implicit_none.py`
+### 10) `xstrip_implicit_none.py`
 
 Utility to remove `implicit none` statements for testing `ximplicit_none.py`.
 
@@ -212,6 +238,17 @@ Typical commands:
 ```bash
 python xstrip_implicit_none.py --fix
 python xstrip_implicit_none.py foo.f90 --fix --diff
+```
+
+### 11) `xstrip_use_only.py`
+
+Utility to remove `only:` clauses from `use` statements for testing `xuse_only.py`.
+
+Typical commands:
+
+```bash
+python xstrip_use_only.py --fix
+python xstrip_use_only.py foo.f90 --fix --diff
 ```
 
 ## Recommended Transformation Order
