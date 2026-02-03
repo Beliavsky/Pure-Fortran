@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""Suggest/apply USE, ONLY lists for broad USE imports."""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import re
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+import fortran_build as fbuild
+import fortran_scan as fscan
+
+USE_STMT_FULL_RE = re.compile(
+    r"^(?P<prefix>\s*use\b(?:\s*,\s*(?:non_intrinsic|intrinsic)\s*)?(?:\s*::\s*|\s+))"
+    r"(?P<module>[a-z][a-z0-9_]*)\s*$",
+    re.IGNORECASE,
+)
+USE_RE = re.compile(
+    r"^\s*use\b(?:\s*,\s*(?:non_intrinsic|intrinsic)\s*)?(?:\s*::\s*|\s+)([a-z][a-z0-9_]*)(.*)$",
+    re.IGNORECASE,
+)
+MODULE_START_RE = re.compile(r"^\s*module\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+MODULE_END_RE = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
+CONTAINS_RE = re.compile(r"^\s*contains\b", re.IGNORECASE)
+PROC_START_RE = re.compile(
+    r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(function|subroutine)\s+([a-z][a-z0-9_]*)\b",
+    re.IGNORECASE,
+)
+INTERFACE_RE = re.compile(r"^\s*interface\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+ACCESS_RE = re.compile(r"^\s*(public|private)\b(.*)$", re.IGNORECASE)
+IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+TYPE_DECL_RE = re.compile(
+    r"^\s*(integer|real|logical|character|complex|type\b|class\b|procedure\b)",
+    re.IGNORECASE,
+)
+FORTRAN_KEYWORDS = {
+    "if",
+    "then",
+    "else",
+    "elseif",
+    "end",
+    "do",
+    "select",
+    "case",
+    "where",
+    "forall",
+    "function",
+    "subroutine",
+    "module",
+    "program",
+    "contains",
+    "call",
+    "use",
+    "only",
+    "result",
+    "implicit",
+    "none",
+    "integer",
+    "real",
+    "logical",
+    "character",
+    "complex",
+    "type",
+    "class",
+    "public",
+    "private",
+    "interface",
+    "procedure",
+    "allocate",
+    "deallocate",
+    "return",
+    "stop",
+    "error",
+    "print",
+    "read",
+    "write",
+    "open",
+    "close",
+    "rewind",
+    "backspace",
+    "flush",
+    "inquire",
+    "intent",
+    "in",
+    "out",
+    "inout",
+    "value",
+    "optional",
+    "allocatable",
+    "pointer",
+    "parameter",
+    "save",
+    "target",
+    "pure",
+    "elemental",
+    "recursive",
+}
+
+
+@dataclass
+class ModuleExports:
+    """Store conservative export information for one module."""
+
+    name: str
+    default_private: bool = False
+    explicit_public: Set[str] = field(default_factory=set)
+    explicit_private: Set[str] = field(default_factory=set)
+    symbols: Set[str] = field(default_factory=set)
+
+    def exported(self) -> Set[str]:
+        """Return currently exported symbol names."""
+        if self.default_private:
+            return set(self.explicit_public)
+        return set(self.symbols) - set(self.explicit_private) | set(self.explicit_public)
+
+
+def parse_access_names(rest: str) -> Optional[List[str]]:
+    """Parse PUBLIC/PRIVATE name list text and return names."""
+    r = rest.strip()
+    if not r:
+        return []
+    if r.startswith("::"):
+        r = r[2:].strip()
+    elif r.startswith(","):
+        r = r[1:].strip()
+    if not r:
+        return []
+    out: List[str] = []
+    for chunk in r.split(","):
+        t = chunk.strip()
+        if not t:
+            continue
+        if "=>" in t:
+            t = t.split("=>", 1)[1].strip()
+        m = re.match(r"^([a-z][a-z0-9_]*)$", t, re.IGNORECASE)
+        if m:
+            out.append(m.group(1).lower())
+    return out
+
+
+def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
+    """Resolve input file paths from CLI args or current directory defaults."""
+    if args_files:
+        files = args_files
+    else:
+        files = sorted(
+            set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
+            key=lambda p: p.name.lower(),
+        )
+    return fscan.apply_excludes(files, exclude)
+
+
+def collect_module_exports(infos: List[fscan.SourceFileInfo]) -> Dict[str, ModuleExports]:
+    """Collect conservative module export sets across all source files."""
+    out: Dict[str, ModuleExports] = {}
+
+    for finfo in infos:
+        lines = finfo.parsed_lines
+        current: Optional[ModuleExports] = None
+        in_contains = False
+        proc_depth = 0
+        for _lineno, stmt in fscan.iter_fortran_statements(lines):
+            low = stmt.strip().lower()
+            if not low:
+                continue
+            m_mod = MODULE_START_RE.match(low)
+            if m_mod:
+                toks = low.split()
+                if len(toks) >= 2 and toks[1] != "procedure":
+                    current = out.setdefault(m_mod.group(1).lower(), ModuleExports(m_mod.group(1).lower()))
+                    in_contains = False
+                    proc_depth = 0
+                continue
+            if current is None:
+                continue
+            if MODULE_END_RE.match(low):
+                current = None
+                in_contains = False
+                proc_depth = 0
+                continue
+            if CONTAINS_RE.match(low):
+                in_contains = True
+                continue
+
+            m_acc = ACCESS_RE.match(low)
+            if m_acc:
+                names = parse_access_names(m_acc.group(2))
+                if names is not None:
+                    if names:
+                        if m_acc.group(1).lower() == "public":
+                            current.explicit_public.update(names)
+                        else:
+                            current.explicit_private.update(names)
+                    else:
+                        current.default_private = m_acc.group(1).lower() == "private"
+                continue
+
+            m_iface = INTERFACE_RE.match(low)
+            if m_iface:
+                current.symbols.add(m_iface.group(1).lower())
+
+            if not in_contains and TYPE_DECL_RE.match(low) and "::" in low:
+                current.symbols.update(fscan.parse_declared_names_from_decl(low))
+                continue
+
+            if in_contains:
+                m_proc = PROC_START_RE.match(low)
+                if m_proc:
+                    proc_depth += 1
+                    if proc_depth == 1:
+                        current.symbols.add(m_proc.group(2).lower())
+                    continue
+                if low.startswith("end") and proc_depth > 0:
+                    toks = low.split()
+                    if len(toks) == 1 or (len(toks) > 1 and toks[1] in {"function", "subroutine"}):
+                        proc_depth -= 1
+    return out
+
+
+def used_names_in_file(finfo: fscan.SourceFileInfo, candidates: Set[str]) -> List[str]:
+    """Return candidate names referenced in a file, preserving first-seen order."""
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for _lineno, stmt in fscan.iter_fortran_statements(finfo.parsed_lines):
+        low = stmt.lower()
+        for m in IDENT_RE.finditer(low):
+            n = m.group(1).lower()
+            if n in FORTRAN_KEYWORDS or n not in candidates or n in seen:
+                continue
+            seen.add(n)
+            ordered.append(n)
+    return ordered
+
+
+def rewrite_use_line(line: str, only_names: List[str]) -> Optional[str]:
+    """Rewrite one broad USE line to USE, ONLY form."""
+    code, comment = split_code_comment(line.rstrip("\r\n"))
+    if "&" in code:
+        return None
+    m = USE_STMT_FULL_RE.match(code)
+    if not m:
+        return None
+    eol = get_eol(line)
+    return f"{m.group('prefix')}{m.group('module')}, only: {', '.join(only_names)}{comment}{eol}"
+
+
+def split_code_comment(line: str) -> Tuple[str, str]:
+    """Split one line into code and trailing comment."""
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "!" and not in_single and not in_double:
+            return line[:i], line[i:]
+    return line, ""
+
+
+def get_eol(line: str) -> str:
+    """Return line-ending sequence from a source line."""
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\n"):
+        return "\n"
+    return ""
+
+
+def apply_fix_for_file(
+    finfo: fscan.SourceFileInfo,
+    module_exports: Dict[str, ModuleExports],
+    backup: bool,
+    show_diff: bool,
+) -> Tuple[int, Optional[Path], Dict[str, List[str]]]:
+    """Apply USE, ONLY rewrites for one file and return changed module-name mapping."""
+    lines = finfo.lines[:]
+    changed = 0
+    changes: Dict[str, List[str]] = {}
+
+    for idx, line in enumerate(lines):
+        code, _comment = split_code_comment(line.rstrip("\r\n"))
+        m = USE_RE.match(code)
+        if not m:
+            continue
+        mod = m.group(1).lower()
+        rest = (m.group(2) or "").lower()
+        if "only" in rest:
+            continue
+        exp = module_exports.get(mod)
+        if exp is None:
+            continue
+        candidate_names = exp.exported()
+        if not candidate_names:
+            continue
+        used = used_names_in_file(finfo, candidate_names)
+        if not used:
+            continue
+        new_line = rewrite_use_line(line, used)
+        if new_line is None or new_line == line:
+            continue
+        lines[idx] = new_line
+        changed += 1
+        changes[mod] = used
+
+    if changed == 0:
+        return 0, None, {}
+
+    if show_diff:
+        diff = difflib.unified_diff(
+            finfo.lines,
+            lines,
+            fromfile=str(finfo.path),
+            tofile=str(finfo.path),
+            lineterm="",
+        )
+        print("\nProposed diff:")
+        for d in diff:
+            print(d)
+
+    backup_path: Optional[Path] = None
+    if backup:
+        backup_path = finfo.path.with_name(finfo.path.name + ".bak")
+        shutil.copy2(finfo.path, backup_path)
+        print(f"Backup written: {backup_path.name}")
+
+    finfo.path.write_text("".join(lines), encoding="utf-8", newline="")
+    return changed, backup_path, changes
+
+
+def main() -> int:
+    """Run USE, ONLY suggestion or rewrite workflow."""
+    parser = argparse.ArgumentParser(description="Suggest/apply USE, ONLY lists for broad USE imports")
+    parser.add_argument("fortran_files", type=Path, nargs="*")
+    parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
+    parser.add_argument("--fix", action="store_true", help="Rewrite USE statements to USE, ONLY")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
+    parser.add_argument("--diff", action="store_true")
+    parser.add_argument("--compiler", type=str, help="Compilation command for fix validation")
+    args = parser.parse_args()
+
+    files = choose_files(args.fortran_files, args.exclude)
+    if not files:
+        print("No source files remain after applying --exclude filters.")
+        return 2
+
+    infos, any_missing = fscan.load_source_files(files)
+    if not infos:
+        return 2 if any_missing else 1
+    ordered_infos, _ = fscan.order_files_least_dependent(infos)
+    if len(ordered_infos) > 1:
+        print("Processing order:", " ".join(f.path.name for f in ordered_infos))
+
+    module_exports = collect_module_exports(ordered_infos)
+
+    if not args.fix:
+        total = 0
+        for finfo in ordered_infos:
+            for line in finfo.parsed_lines:
+                m = USE_RE.match(line)
+                if not m:
+                    continue
+                mod = m.group(1).lower()
+                rest = (m.group(2) or "").lower()
+                if "only" in rest:
+                    continue
+                exp = module_exports.get(mod)
+                if exp is None:
+                    continue
+                used = used_names_in_file(finfo, exp.exported())
+                if not used:
+                    continue
+                total += 1
+                print(f"{finfo.path.name}: use {mod} -> only: {', '.join(used)}")
+        print(f"\n{total} USE statement(s) can be converted to USE, ONLY.")
+        return 0
+
+    compile_paths = [f.path for f in ordered_infos]
+    if args.compiler:
+        compile_paths, _ = fscan.build_compile_closure(ordered_infos)
+
+    if args.compiler and not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+        return 5
+
+    changed_total = 0
+    backup_pairs: List[Tuple[Path, Path]] = []
+    summary: Dict[str, Dict[str, List[str]]] = {}
+    for finfo in ordered_infos:
+        changed, backup_path, changes = apply_fix_for_file(
+            finfo,
+            module_exports=module_exports,
+            backup=args.backup,
+            show_diff=args.diff,
+        )
+        changed_total += changed
+        if backup_path:
+            backup_pairs.append((finfo.path, backup_path))
+        if changes:
+            summary[finfo.path.name] = changes
+
+    if args.compiler and not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+        fbuild.rollback_backups(backup_pairs, fscan.display_path)
+        return 5
+
+    print(f"\nConverted {changed_total} USE statement(s) to USE, ONLY.")
+    for fname in sorted(summary.keys(), key=str.lower):
+        for mod, names in summary[fname].items():
+            print(f"{fname}: use {mod}, only: {', '.join(names)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
