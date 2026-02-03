@@ -255,12 +255,14 @@ python xstrip_use_only.py foo.f90 --fix --diff
 
 If applying all transformations, use this order:
 
-1. `intent` (`xintent.py`)
-2. `pure` (`xpure.py`)
-3. `elemental` (`xpure.py --suggest-elemental`)
-4. `private` (`xprivate.py`)
+1. `implicit none` (`ximplicit_none.py`)
+2. `intent` (`xintent.py`)
+3. `pure` (`xpure.py`)
+4. `elemental` (`xpure.py --suggest-elemental`)
+5. `private` (`xprivate.py`)
+6. optional cleanup: prune/tighten imports (`xprune.py`, `xuse_only.py`)
 
-This order is implemented directly in `xintent_pure_private.py`.
+`xintent_pure_private.py` implements the intent/pure/elemental/private subset of this sequence.
 
 ## Safety Model
 
