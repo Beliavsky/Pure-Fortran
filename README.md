@@ -223,7 +223,3 @@ Examples:
 For tools that modify source, `--git` can auto-commit changed files with an informative message.
 
 Use this only when your working tree state is ready for automatic commits.
-
-## License / Status
-
-This repository is currently focused on practical tooling and may evolve quickly as heuristics improve.
