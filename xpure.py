@@ -51,6 +51,11 @@ TYPE_DECL_RE = re.compile(
     r"^\s*(integer|real|logical|character|complex|type\b|class\b|procedure\b)",
     re.IGNORECASE,
 )
+NO_COLON_DECL_RE = re.compile(
+    r"^\s*(?P<spec>(?:integer|real|logical|complex|character)\s*(?:\([^)]*\))?"
+    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s+(?P<rhs>.+)$",
+    re.IGNORECASE,
+)
 ASSIGN_RE = re.compile(
     r"^\s*([a-z][a-z0-9_]*(?:\s*%\s*[a-z][a-z0-9_]*)?)\s*(?:\([^)]*\))?\s*=",
     re.IGNORECASE,
@@ -90,10 +95,12 @@ class Procedure:
 
     @property
     def is_pure_or_elemental(self) -> bool:
+        """is pure or elemental."""
         return "pure" in self.attrs or "elemental" in self.attrs
 
     @property
     def selector(self) -> str:
+        """selector."""
         return f"{self.name}@{self.start}"
 
 
@@ -116,19 +123,23 @@ class SourceFileInfo:
 
 
 def display_path(path: Path) -> str:
+    """Return the short display path used in CLI output."""
     return fscan.display_path(path)
 
 
 def quote_cmd_arg(arg: str) -> str:
+    """Quote one command-line argument for safe shell execution."""
     return fbuild.quote_cmd_arg(arg)
 
 
 def run_compiler_command(command: str, files: List[Path], phase: str) -> bool:
+    """Run compiler validation for a phase and report pass/fail details."""
     return fbuild.run_compiler_command(command, files, phase, display_path)
 
 
 def strip_comment(line: str) -> str:
     # Good-enough comment stripper for typical free-form Fortran.
+    """Strip trailing Fortran comments while preserving quoted text."""
     in_single = False
     in_double = False
     for i, ch in enumerate(line):
@@ -142,6 +153,7 @@ def strip_comment(line: str) -> str:
 
 
 def parse_arglist(arglist: Optional[str]) -> Set[str]:
+    """Parse procedure argument list text into normalized names."""
     if not arglist:
         return set()
     inner = arglist.strip()[1:-1].strip()
@@ -156,6 +168,7 @@ def parse_arglist(arglist: Optional[str]) -> Set[str]:
 
 
 def parse_declared_names_from_decl(line: str) -> Set[str]:
+    """Extract declared names from a Fortran declaration line."""
     if "::" not in line:
         return set()
     rhs = line.split("::", 1)[1]
@@ -174,13 +187,40 @@ def parse_declared_names_from_decl(line: str) -> Set[str]:
     return out
 
 
+def parse_declared_names_any(line: str) -> Set[str]:
+    """Extract declared names from declarations with or without ::."""
+    if "::" in line:
+        return parse_declared_names_from_decl(line)
+    m = NO_COLON_DECL_RE.match(line.strip())
+    if not m:
+        return set()
+    out: Set[str] = set()
+    for chunk in split_top_level_commas(m.group("rhs")):
+        name = chunk.strip()
+        if not name:
+            continue
+        if "=" in name and "=>" not in name:
+            name = name.split("=", 1)[0].strip()
+        if "=>" in name:
+            name = name.split("=>", 1)[0].strip()
+        mm = re.match(r"^([a-z][a-z0-9_]*)", name, re.IGNORECASE)
+        if mm:
+            out.add(mm.group(1).lower())
+    return out
+
+
 def parse_declared_entities(line: str) -> List[Tuple[str, bool]]:
-    """Return (name, has_array_spec_after_name) for entities in a declaration."""
-    if "::" not in line:
-        return []
-    rhs = line.split("::", 1)[1]
+    """Extract declared entities and whether each has an inline array spec."""
+    rhs = ""
+    if "::" in line:
+        rhs = line.split("::", 1)[1]
+    else:
+        m = NO_COLON_DECL_RE.match(line.strip())
+        if not m:
+            return []
+        rhs = m.group("rhs")
     out: List[Tuple[str, bool]] = []
-    for chunk in rhs.split(","):
+    for chunk in split_top_level_commas(rhs):
         text = chunk.strip()
         if not text:
             continue
@@ -192,6 +232,7 @@ def parse_declared_entities(line: str) -> List[Tuple[str, bool]]:
 
 
 def base_identifier(expr: str) -> Optional[str]:
+    """Return the base identifier at the start of an expression string."""
     m = re.match(r"^\s*([a-z][a-z0-9_]*)", expr, re.IGNORECASE)
     if not m:
         return None
@@ -199,6 +240,7 @@ def base_identifier(expr: str) -> Optional[str]:
 
 
 def split_top_level_commas(text: str) -> List[str]:
+    """Split text by top-level commas, ignoring nested parentheses and strings."""
     out: List[str] = []
     cur: List[str] = []
     depth = 0
@@ -226,6 +268,7 @@ def split_top_level_commas(text: str) -> List[str]:
 
 
 def extract_io_control_list(line: str, keyword: str) -> Optional[str]:
+    """Extract the control-list substring from READ/WRITE statement text."""
     s = line.strip()
     if not s.lower().startswith(keyword):
         return None
@@ -252,6 +295,7 @@ def extract_io_control_list(line: str, keyword: str) -> Optional[str]:
 
 
 def parse_decl_intent(line_low: str) -> Optional[str]:
+    """Parse INTENT or VALUE information from a declaration fragment."""
     m = re.search(r"\bintent\s*\(\s*(inout|out|in)\s*\)", line_low)
     if m:
         return m.group(1).lower()
@@ -261,6 +305,7 @@ def parse_decl_intent(line_low: str) -> Optional[str]:
 
 
 def io_unit_expr_from_control(control: str) -> Optional[str]:
+    """Return the unit expression from an I/O control list when present."""
     tokens = split_top_level_commas(control)
     if not tokens:
         return None
@@ -276,6 +321,7 @@ def io_unit_expr_from_control(control: str) -> Optional[str]:
 
 
 def parse_procedures(lines: List[str]) -> List[Procedure]:
+    """Parse procedures and their bodies from source lines."""
     stack: List[Procedure] = []
     out: List[Procedure] = []
     interface_depth = 0
@@ -351,10 +397,12 @@ def parse_procedures(lines: List[str]) -> List[Procedure]:
 
 def has_function_reference(line: str, callee: str) -> bool:
     # Looks for token like "callee(".
+    """Heuristically detect function-style references to a given name in code."""
     return re.search(rf"\b{re.escape(callee)}\s*\(", line, flags=re.IGNORECASE) is not None
 
 
 def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Dict[str, Set[str]]]:
+    """Parse defined/used modules and generic interface procedure mappings."""
     defined: Set[str] = set()
     used: Set[str] = set()
     generics: Dict[str, Set[str]] = {}
@@ -403,6 +451,7 @@ def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Di
 
 
 def load_source_files(paths: Iterable[Path]) -> Tuple[List[SourceFileInfo], bool]:
+    """Load source files into parsed analysis records."""
     infos: List[SourceFileInfo] = []
     any_missing = False
     for p in paths:
@@ -430,6 +479,7 @@ def load_source_files(paths: Iterable[Path]) -> Tuple[List[SourceFileInfo], bool
 
 
 def compute_file_dependencies(files: List[SourceFileInfo]) -> Dict[Path, Set[Path]]:
+    """Infer file dependencies from USEs and known inter-file calls."""
     proc_name_to_files: Dict[str, Set[Path]] = {}
     module_to_file: Dict[str, Path] = {}
 
@@ -462,6 +512,7 @@ def compute_file_dependencies(files: List[SourceFileInfo]) -> Dict[Path, Set[Pat
 
 
 def order_files_least_dependent(files: List[SourceFileInfo]) -> Tuple[List[SourceFileInfo], bool]:
+    """Order files so providers appear before dependents when possible."""
     if len(files) <= 1:
         return files[:], False
 
@@ -485,6 +536,7 @@ def order_files_least_dependent(files: List[SourceFileInfo]) -> Tuple[List[Sourc
 
 def build_compile_closure(requested_files: List[SourceFileInfo]) -> Tuple[List[Path], Set[str]]:
     # Discover nearby sources so module providers can be included automatically.
+    """Expand compile inputs to include files needed to satisfy module USEs."""
     candidate_paths: Set[Path] = {f.path.resolve() for f in requested_files}
     for finfo in requested_files:
         parent = finfo.path.resolve().parent
@@ -528,6 +580,7 @@ def analyze_lines(
     generic_interfaces: Optional[Dict[str, Set[str]]] = None,
     strict_unknown_calls: bool = False,
 ) -> AnalysisResult:
+    """Analyze procedures and classify likely pure candidates or rejections."""
     procs = parse_procedures(lines)
     if not procs:
         return AnalysisResult(procs, [], [])
@@ -576,7 +629,7 @@ def analyze_lines(
                 continue
 
             if TYPE_DECL_RE.match(low):
-                declared = parse_declared_names_from_decl(low)
+                declared = parse_declared_names_any(low)
                 if declared:
                     local_names.update(declared)
                     if low.strip().startswith("character"):
@@ -586,9 +639,7 @@ def analyze_lines(
                         for d in proc.dummy_names:
                             if d in declared:
                                 dummy_intent[d] = intent_attr
-                    if proc.kind == "subroutine" and (
-                        "intent(" in low or re.search(r"\bvalue\b", low)
-                    ):
+                    if "intent(" in low or re.search(r"\bvalue\b", low):
                         for d in proc.dummy_names:
                             if d in declared:
                                 dummy_with_intent_or_value.add(d)
@@ -709,6 +760,13 @@ def analyze_lines(
                     reasons.append(
                         f"dummy argument '{d}' lacks explicit INTENT/VALUE declaration (conservative pure check)"
                     )
+        elif proc.kind == "function":
+            for d in sorted(proc.dummy_names):
+                dint = dummy_intent.get(d, "")
+                if dint not in {"in", "value"}:
+                    reasons.append(
+                        f"dummy argument '{d}' lacks INTENT(IN)/VALUE declaration required for pure function"
+                    )
 
         # Deduplicate while preserving order.
         deduped: List[str] = []
@@ -727,6 +785,7 @@ def analyze_lines(
 
 
 def print_analysis(path: Path, result: AnalysisResult, show_rejections: bool = False) -> None:
+    """Print per-file candidate and rejection details."""
     print(f"File: {display_path(path)}")
     n_candidates = len(result.candidates)
     print(f"\n{n_candidates} Likely PURE candidates (not currently marked pure/elemental):")
@@ -748,6 +807,7 @@ def print_analysis(path: Path, result: AnalysisResult, show_rejections: bool = F
 
 
 def print_suggestion_list(path: Path, label: str, procs: List[Procedure]) -> None:
+    """Print compact suggestion entries for one file."""
     print(f"File: {display_path(path)}")
     print(f"\n{len(procs)} {label}:")
     for p in procs:
@@ -757,6 +817,7 @@ def update_external_name_status(
     external_name_status: Dict[str, bool],
     result: AnalysisResult,
 ) -> None:
+    """Update purity status map for external names discovered in analyses."""
     candidate_ids = {id(p) for p in result.candidates}
     for proc in result.procedures:
         if proc.parent is not None:
@@ -770,6 +831,7 @@ def update_external_name_status(
 
 
 def unique_names_by_kind(candidates: List[Procedure], kind: str) -> List[str]:
+    """Return deduplicated changed procedure names grouped by procedure kind."""
     names: List[str] = []
     seen: Set[str] = set()
     for p in candidates:
@@ -785,6 +847,7 @@ def unique_names_by_kind(candidates: List[Procedure], kind: str) -> List[str]:
 
 def suggest_elemental_candidates(result: AnalysisResult) -> List[Procedure]:
     # Elemental needs pure semantics and scalar dummy arguments.
+    """Filter pure candidates to those likely valid as elemental."""
     pure_candidate_ids = {id(p) for p in result.candidates}
     out: List[Procedure] = []
     for proc in result.procedures:
@@ -838,6 +901,7 @@ def add_changed_names(
     filename: str,
     changed_names: List[Tuple[str, str]],
 ) -> None:
+    """Record changed procedure names into the overall summary map."""
     for kind, name in changed_names:
         key = (filename, kind)
         bucket = changed_summary.setdefault(key, [])
@@ -849,6 +913,7 @@ def print_changed_summary(
     changed_summary: Dict[Tuple[str, str], List[str]],
     attribute_label: str = "pure",
 ) -> None:
+    """Print final summary of procedures modified by fix mode."""
     if not changed_summary:
         return
     n_functions = sum(
@@ -879,6 +944,7 @@ def maybe_git_commit(
     changed_summary: Dict[Tuple[str, str], List[str]],
     attribute_label: str,
 ) -> None:
+    """Create a git commit for changed files when requested."""
     if not do_git or not changed_files:
         return
     n_functions = sum(
@@ -896,6 +962,7 @@ def maybe_git_commit(
 
 
 def parse_only_selectors(only: str) -> Set[str]:
+    """Parse --only selector tokens into name and optional line constraints."""
     out = set()
     for tok in only.split(","):
         t = tok.strip().lower()
@@ -905,6 +972,7 @@ def parse_only_selectors(only: str) -> Set[str]:
 
 
 def choose_targets(candidates: List[Procedure], only: Optional[str], all_candidates: bool) -> Tuple[List[Procedure], List[str]]:
+    """Choose which candidate procedures should be modified in fix mode."""
     if all_candidates:
         return candidates[:], []
     if not only:
@@ -928,6 +996,7 @@ def choose_targets(candidates: List[Procedure], only: Optional[str], all_candida
 
 
 def split_code_comment(line: str) -> Tuple[str, str]:
+    """Split a line into code and trailing comment segments."""
     in_single = False
     in_double = False
     for i, ch in enumerate(line):
@@ -941,6 +1010,7 @@ def split_code_comment(line: str) -> Tuple[str, str]:
 
 
 def add_pure_to_declaration(line: str) -> Tuple[str, bool]:
+    """Insert PURE into a procedure declaration line when missing."""
     code, comment = split_code_comment(line)
     m = DECL_RE.match(code)
     if not m:
@@ -957,6 +1027,7 @@ def add_pure_to_declaration(line: str) -> Tuple[str, bool]:
 
 
 def add_elemental_to_declaration(line: str) -> Tuple[str, bool]:
+    """Insert ELEMENTAL and remove PURE in a declaration line."""
     code, comment = split_code_comment(line)
     m = DECL_RE.match(code)
     if not m:
@@ -987,6 +1058,7 @@ def apply_fix(
     backup: bool,
     show_diff: bool,
 ) -> Tuple[int, Optional[Path], List[Tuple[str, str]]]:
+    """Apply PURE edits to selected procedures in one source file."""
     if not targets:
         return 0, None, []
 
@@ -1036,6 +1108,7 @@ def apply_elemental_fix(
     backup: bool,
     show_diff: bool,
 ) -> Tuple[int, Optional[Path], List[Tuple[str, str]]]:
+    """Apply ELEMENTAL edits to selected procedures in one source file."""
     if not targets:
         return 0, None, []
 
@@ -1079,10 +1152,12 @@ def apply_elemental_fix(
 
 
 def rollback_backups(backup_pairs: List[Tuple[Path, Path]]) -> None:
+    """Restore modified files from backups after a failed run."""
     fbuild.rollback_backups(backup_pairs, display_path)
 
 
 def main() -> int:
+    """Run pure/elemental suggestion or fix workflow across selected Fortran files."""
     parser = argparse.ArgumentParser(
         description="Suggest Fortran procedures that may be markable as PURE"
     )

@@ -9,6 +9,7 @@ from typing import Callable, List, Optional, Tuple
 
 
 def quote_cmd_arg(arg: str) -> str:
+    """Quote one shell argument for Windows-safe command composition."""
     return subprocess.list2cmdline([arg])
 
 
@@ -18,6 +19,7 @@ def run_compiler_command(
     phase: str,
     display_path: Callable[[Path], str],
 ) -> bool:
+    """Run a compile command for the given files and print pass/fail output."""
     file_args = " ".join(quote_cmd_arg(str(p)) for p in files)
     file_args_display = " ".join(quote_cmd_arg(display_path(p)) for p in files)
     if "{files}" in command:
@@ -45,6 +47,7 @@ def rollback_backups(
     backup_pairs: List[Tuple[Path, Path]],
     display_path: Callable[[Path], str],
 ) -> None:
+    """Restore original files from backup paths after a failed transformation."""
     if not backup_pairs:
         return
     print("Rolling back modified files from backups...")
@@ -61,6 +64,7 @@ def git_commit_files(
     message: str,
     display_path: Callable[[Path], str],
 ) -> bool:
+    """Stage selected files and create a git commit with the provided message."""
     if not files:
         return False
     uniq = []

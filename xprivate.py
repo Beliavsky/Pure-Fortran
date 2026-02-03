@@ -59,6 +59,7 @@ class ModuleInfo:
     entities: Dict[str, Entity] = field(default_factory=dict)
 
     def is_public_now(self, name: str) -> bool:
+        """is public now."""
         n = name.lower()
         if n in self.explicit_private:
             return False
@@ -76,6 +77,7 @@ class Candidate:
 
 
 def split_code_comment(line: str) -> Tuple[str, str]:
+    """Split a line into code and trailing comment text."""
     in_single = False
     in_double = False
     for i, ch in enumerate(line):
@@ -89,6 +91,7 @@ def split_code_comment(line: str) -> Tuple[str, str]:
 
 
 def get_eol(line: str) -> str:
+    """Return the line-ending sequence used by the input line."""
     if line.endswith("\r\n"):
         return "\r\n"
     if line.endswith("\n"):
@@ -97,6 +100,7 @@ def get_eol(line: str) -> str:
 
 
 def split_top_level_commas(text: str) -> List[str]:
+    """Split text on commas while ignoring nested parentheses and strings."""
     out: List[str] = []
     cur: List[str] = []
     depth = 0
@@ -124,6 +128,7 @@ def split_top_level_commas(text: str) -> List[str]:
 
 
 def parse_access_stmt_names(code: str, keyword: str) -> Optional[List[str]]:
+    """Parse names from PUBLIC/PRIVATE access statements."""
     m = ACCESS_STMT_RE.match(code.strip())
     if not m or m.group(1).lower() != keyword.lower():
         return None
@@ -148,6 +153,7 @@ def parse_access_stmt_names(code: str, keyword: str) -> Optional[List[str]]:
 
 
 def parse_use_only_names(rest: str) -> Optional[Set[str]]:
+    """Extract imported names from a USE, ONLY list."""
     m = re.search(r"\bonly\s*:\s*(.*)$", rest, re.IGNORECASE)
     if not m:
         return None
@@ -170,6 +176,7 @@ def parse_use_only_names(rest: str) -> Optional[Set[str]]:
 
 
 def parse_module_block(path: Path, lines: List[str], start_idx: int) -> Tuple[ModuleInfo, int]:
+    """Parse one module block and collect accessibility and entity metadata."""
     start_line = start_idx + 1
     m_start = MODULE_START_RE.match(fscan.strip_comment(lines[start_idx]).strip())
     assert m_start is not None
@@ -260,6 +267,7 @@ def parse_module_block(path: Path, lines: List[str], start_idx: int) -> Tuple[Mo
 
 
 def parse_modules_in_file(path: Path, lines: List[str]) -> List[ModuleInfo]:
+    """Find and parse all module blocks in a source file."""
     modules: List[ModuleInfo] = []
     i = 0
     while i < len(lines):
@@ -277,6 +285,7 @@ def parse_modules_in_file(path: Path, lines: List[str]) -> List[ModuleInfo]:
 
 
 def parse_external_uses(paths: Iterable[Path]) -> Tuple[Dict[str, Set[str]], Set[str]]:
+    """Collect module names and ONLY-imported symbols used across files."""
     only_uses: Dict[str, Set[str]] = {}
     wildcard_uses: Set[str] = set()
     for p in paths:
@@ -296,6 +305,7 @@ def parse_external_uses(paths: Iterable[Path]) -> Tuple[Dict[str, Set[str]], Set
 
 
 def choose_files(args_files: List[Path], exclude: List[str]) -> List[Path]:
+    """Choose input files from CLI args or current-directory defaults with excludes."""
     if args_files:
         files = args_files
     else:
@@ -312,6 +322,7 @@ def collect_candidates(
     wildcard_uses: Set[str],
     conservative_suggest: bool,
 ) -> List[Candidate]:
+    """Build private-marking candidates using conservative dependency signals."""
     out: List[Candidate] = []
     for path, mods in modules_by_file.items():
         for mod in mods:
@@ -331,6 +342,7 @@ def collect_candidates(
 
 
 def remove_name_from_access_line(line: str, keyword: str, target: str) -> Tuple[str, bool]:
+    """Remove one symbol from a PUBLIC/PRIVATE name list line."""
     eol = get_eol(line)
     code, comment = split_code_comment(line.rstrip("\r\n"))
     names = parse_access_stmt_names(code, keyword)
@@ -349,6 +361,7 @@ def remove_name_from_access_line(line: str, keyword: str, target: str) -> Tuple[
 
 
 def apply_private_change(path: Path, mod_name: str, entity: str, show_diff: bool) -> bool:
+    """Apply one private-marking edit for a module entity in a file."""
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines(keepends=True)
     modules = parse_modules_in_file(path, lines)
@@ -398,6 +411,7 @@ def apply_private_change(path: Path, mod_name: str, entity: str, show_diff: bool
 
 
 def build_compile_cmd(command: str, files: List[Path]) -> Tuple[str, str]:
+    """Build executable and display compiler command strings for file lists."""
     file_args = " ".join(fbuild.quote_cmd_arg(str(p)) for p in files)
     file_args_display = " ".join(fbuild.quote_cmd_arg(fscan.display_path(p)) for p in files)
     if "{files}" in command:
@@ -406,6 +420,7 @@ def build_compile_cmd(command: str, files: List[Path]) -> Tuple[str, str]:
 
 
 def compile_check(command: str, files: List[Path], phase: str, announce: bool = True) -> bool:
+    """Run compile validation for a phase and optionally print diagnostics."""
     cmd, cmd_display = build_compile_cmd(command, files)
     if announce:
         print(f"Compile ({phase}): {cmd_display}")
@@ -423,6 +438,7 @@ def compile_check(command: str, files: List[Path], phase: str, announce: bool = 
 
 
 def print_summary(summary: Dict[Tuple[str, str], List[str]], intro: str) -> None:
+    """Print grouped summary lines for accepted private markings."""
     if not summary:
         return
     n_items = sum(len(v) for v in summary.values())
@@ -437,6 +453,7 @@ def print_summary(summary: Dict[Tuple[str, str], List[str]], intro: str) -> None
 
 
 def main() -> int:
+    """Parse CLI flags, suggest or apply private edits, and validate by compilation."""
     parser = argparse.ArgumentParser(
         description="Suggest/mark module entities PRIVATE (conservative; compile-validated in --fix mode)"
     )

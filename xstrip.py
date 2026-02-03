@@ -18,6 +18,7 @@ VALUE_ATTR_RE = re.compile(r"(?i),?\s*value\b")
 
 
 def split_code_comment(line: str) -> Tuple[str, str]:
+    """Split one line into code and comment parts."""
     in_single = False
     in_double = False
     for i, ch in enumerate(line):
@@ -31,6 +32,7 @@ def split_code_comment(line: str) -> Tuple[str, str]:
 
 
 def get_eol(line: str) -> str:
+    """Return the end-of-line marker used by a line."""
     if line.endswith("\r\n"):
         return "\r\n"
     if line.endswith("\n"):
@@ -39,6 +41,7 @@ def get_eol(line: str) -> str:
 
 
 def collapse_decl_spaces(code: str) -> str:
+    """Normalize spacing in declaration prefixes after attribute removal."""
     code = re.sub(r"\s+,", ",", code)
     code = re.sub(r",\s+", ", ", code)
     code = re.sub(r"\s*::\s*", " :: ", code)
@@ -47,6 +50,7 @@ def collapse_decl_spaces(code: str) -> str:
 
 
 def strip_intent_line(line: str, strip_value: bool) -> Tuple[str, int]:
+    """Remove INTENT (and optionally VALUE) attributes from one declaration line."""
     eol = get_eol(line)
     code, comment = split_code_comment(line)
     n = 0
@@ -69,6 +73,7 @@ def strip_intent_line(line: str, strip_value: bool) -> Tuple[str, int]:
 
 
 def strip_pure_line(line: str) -> Tuple[str, int]:
+    """Remove PURE/ELEMENTAL/IMPURE attributes from a procedure declaration line."""
     eol = get_eol(line)
     code, comment = split_code_comment(line)
     m_kind = re.search(r"\b(function|subroutine)\b", code, flags=re.IGNORECASE)
@@ -105,6 +110,7 @@ def process_file(
     backup: bool,
     show_diff: bool,
 ) -> Tuple[int, int]:
+    """Apply requested stripping operations to a file and write changes."""
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines(keepends=True)
     updated = lines[:]
@@ -147,6 +153,7 @@ def process_file(
 
 
 def choose_files(args_files: List[Path], exclude: List[str]) -> List[Path]:
+    """Resolve input files from arguments or current directory defaults."""
     if args_files:
         files = args_files
     else:
@@ -158,6 +165,7 @@ def choose_files(args_files: List[Path], exclude: List[str]) -> List[Path]:
 
 
 def main() -> int:
+    """Parse CLI options and strip selected attributes from Fortran files."""
     parser = argparse.ArgumentParser(description="Strip Fortran intent/pure/elemental annotations")
     parser.add_argument("fortran_files", type=Path, nargs="*", help="Source files (default: *.f90/*.F90 in cwd)")
     parser.add_argument(

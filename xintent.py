@@ -19,6 +19,11 @@ TYPE_DECL_RE = re.compile(
     r"^\s*(integer|real|logical|character|complex|type\b|class\b|procedure\b)",
     re.IGNORECASE,
 )
+NO_COLON_DECL_RE = re.compile(
+    r"^\s*(?P<spec>(?:integer|real|logical|complex|character)\s*(?:\([^)]*\))?"
+    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s+(?P<rhs>.+)$",
+    re.IGNORECASE,
+)
 ASSIGN_RE = re.compile(
     r"^\s*([a-z][a-z0-9_]*(?:\s*%\s*[a-z][a-z0-9_]*)?)\s*(?:\([^)]*\))?\s*=",
     re.IGNORECASE,
@@ -40,6 +45,7 @@ class IntentSuggestion:
 
 
 def add_summary_item(summary: Dict[Tuple[str, str], List[str]], s: IntentSuggestion) -> None:
+    """Add a deduplicated procedure:dummy entry to a summary bucket."""
     key = (s.filename, s.proc_kind)
     token = f"{s.proc_name}:{s.dummy}"
     bucket = summary.setdefault(key, [])
@@ -48,6 +54,7 @@ def add_summary_item(summary: Dict[Tuple[str, str], List[str]], s: IntentSuggest
 
 
 def print_summary(summary: Dict[Tuple[str, str], List[str]], label: str) -> None:
+    """Print grouped function/subroutine intent summary lines."""
     if not summary:
         return
     n_functions = sum(len(v) for (fname, kind), v in summary.items() if kind == "function")
@@ -74,6 +81,7 @@ def maybe_git_commit(
     changed_summary: Dict[Tuple[str, str], List[str]],
     intent_label: str,
 ) -> None:
+    """Create a git commit for changed files when --git is enabled."""
     if not do_git or not changed_files:
         return
     n_functions = sum(len(v) for (fname, kind), v in changed_summary.items() if kind == "function")
@@ -87,14 +95,17 @@ def maybe_git_commit(
 
 
 def quote_cmd_arg(arg: str) -> str:
+    """Quote one shell argument for safe compiler command construction."""
     return fbuild.quote_cmd_arg(arg)
 
 
 def run_compiler_command(command: str, files: List[Path], phase: str) -> bool:
+    """Run the configured compiler command and report pass/fail status."""
     return fbuild.run_compiler_command(command, files, phase, fscan.display_path)
 
 
 def split_code_comment(line: str) -> Tuple[str, str]:
+    """Split a line into code and trailing comment parts."""
     in_single = False
     in_double = False
     for i, ch in enumerate(line):
@@ -108,6 +119,7 @@ def split_code_comment(line: str) -> Tuple[str, str]:
 
 
 def add_intent_attr(line: str, intent: str) -> Tuple[str, bool]:
+    """Insert an INTENT attribute into a declaration line when eligible."""
     code, comment = split_code_comment(line)
     if "::" not in code:
         return line, False
@@ -119,6 +131,7 @@ def add_intent_attr(line: str, intent: str) -> Tuple[str, bool]:
 
 
 def split_decl_entities(rhs: str) -> List[str]:
+    """Split declaration RHS entities on top-level commas."""
     parts: List[str] = []
     cur: List[str] = []
     depth = 0
@@ -138,11 +151,35 @@ def split_decl_entities(rhs: str) -> List[str]:
     return parts
 
 
+def parse_declared_names_any(code_line: str) -> Set[str]:
+    """Parse declared entity names from declaration lines with or without ::."""
+    if "::" in code_line:
+        return fscan.parse_declared_names_from_decl(code_line)
+    m = NO_COLON_DECL_RE.match(code_line.strip())
+    if not m:
+        return set()
+    out: Set[str] = set()
+    for ent in split_decl_entities(m.group("rhs").strip()):
+        mm = re.match(r"^\s*([a-z][a-z0-9_]*)", ent, re.IGNORECASE)
+        if mm:
+            out.add(mm.group(1).lower())
+    return out
+
+
 def rewrite_decl_line_with_intents(line: str, intents_by_name: Dict[str, str]) -> Tuple[List[str], bool]:
+    """Rewrite one declaration line to add intents to targeted entities."""
     code, comment = split_code_comment(line)
-    if "::" not in code:
-        return [line], False
-    lhs, rhs = code.split("::", 1)
+    lhs = ""
+    rhs = ""
+    if "::" in code:
+        lhs, rhs = code.split("::", 1)
+    else:
+        m_no = NO_COLON_DECL_RE.match(code.strip())
+        if not m_no:
+            return [line], False
+        lhs = m_no.group("spec")
+        rhs = m_no.group("rhs")
+
     lhs_low = lhs.lower()
     if "intent(" in lhs_low or re.search(r"\bvalue\b", lhs_low):
         return [line], False
@@ -189,6 +226,7 @@ def analyze_intent_suggestions(
     finfo: fscan.SourceFileInfo,
     target_intent: str = "in",
 ) -> List[IntentSuggestion]:
+    """Suggest dummy arguments that can be marked with the target intent."""
     out: List[IntentSuggestion] = []
 
     for proc in finfo.procedures:
@@ -205,11 +243,11 @@ def analyze_intent_suggestions(
 
         for ln, code in proc.body:
             low = code.lower().strip()
-            if not low or not TYPE_DECL_RE.match(low) or "::" not in low:
+            if not low or not TYPE_DECL_RE.match(low):
                 continue
             if low.startswith("procedure"):
                 continue
-            declared = fscan.parse_declared_names_from_decl(low)
+            declared = parse_declared_names_any(low)
             local_names.update(declared)
             has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None)
             has_alloc_ptr = ("allocatable" in low) or (re.search(r"\bpointer\b", low) is not None)
@@ -305,6 +343,7 @@ def analyze_intent_suggestions(
 
 
 def collect_missing_intent_args(finfo: fscan.SourceFileInfo) -> List[IntentSuggestion]:
+    """Collect dummies still lacking INTENT/VALUE annotations."""
     out: List[IntentSuggestion] = []
     for proc in finfo.procedures:
         if not proc.dummy_names:
@@ -312,11 +351,11 @@ def collect_missing_intent_args(finfo: fscan.SourceFileInfo) -> List[IntentSugge
         decl: Dict[str, Tuple[int, bool]] = {}
         for ln, code in proc.body:
             low = code.lower().strip()
-            if not low or not TYPE_DECL_RE.match(low) or "::" not in low:
+            if not low or not TYPE_DECL_RE.match(low):
                 continue
             if low.startswith("procedure"):
                 continue
-            declared = fscan.parse_declared_names_from_decl(low)
+            declared = parse_declared_names_any(low)
             has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None)
             for d in proc.dummy_names:
                 if d in declared and d not in decl:
@@ -349,6 +388,7 @@ def apply_fix(
     backup: bool,
     show_diff: bool,
 ) -> Tuple[int, Optional[Path], List[IntentSuggestion]]:
+    """Apply intent suggestions to a file and optionally create a backup."""
     if not suggestions:
         return 0, None, []
 
@@ -407,10 +447,12 @@ def apply_fix(
 
 
 def rollback_backups(backup_pairs: List[Tuple[Path, Path]]) -> None:
+    """Restore files from backups after compile validation fails."""
     fbuild.rollback_backups(backup_pairs, fscan.display_path)
 
 
 def main() -> int:
+    """Parse CLI arguments, run intent analysis/fixes, and print summaries."""
     parser = argparse.ArgumentParser(description="Suggest or add INTENT(IN) for dummy args")
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument(

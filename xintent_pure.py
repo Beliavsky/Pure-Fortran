@@ -11,6 +11,7 @@ import fortran_pipeline as fpipeline
 
 
 def main() -> int:
+    """Run intent then pure and optional elemental passes over ordered source files."""
     parser = argparse.ArgumentParser(
         description="Apply intent(in/out), then pure, then optional elemental passes"
     )

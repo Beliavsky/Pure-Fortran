@@ -11,6 +11,7 @@ import fortran_pipeline as fpipeline
 
 
 def main() -> int:
+    """Run intent, pure, optional elemental, then private passes in one pipeline."""
     parser = argparse.ArgumentParser(
         description="Apply intent(in/out), then pure, optional elemental, then private passes"
     )

@@ -41,10 +41,12 @@ class Procedure:
 
     @property
     def is_pure_or_elemental(self) -> bool:
+        """is pure or elemental."""
         return "pure" in self.attrs or "elemental" in self.attrs
 
     @property
     def selector(self) -> str:
+        """selector."""
         return f"{self.name}@{self.start}"
 
 
@@ -60,10 +62,12 @@ class SourceFileInfo:
 
 
 def display_path(path: Path) -> str:
+    """Return the short display form for a source path."""
     return path.name
 
 
 def apply_excludes(paths: Iterable[Path], exclude_patterns: Iterable[str]) -> List[Path]:
+    """Filter paths by glob-style exclusion patterns."""
     pats = [p for p in exclude_patterns if p]
     if not pats:
         return list(paths)
@@ -84,6 +88,7 @@ def apply_excludes(paths: Iterable[Path], exclude_patterns: Iterable[str]) -> Li
 
 
 def strip_comment(line: str) -> str:
+    """Remove trailing Fortran comments while respecting quoted strings."""
     if line.startswith("\ufeff"):
         line = line[1:]
     in_single = False
@@ -99,6 +104,7 @@ def strip_comment(line: str) -> str:
 
 
 def parse_arglist(arglist: Optional[str]) -> Set[str]:
+    """Parse procedure argument text into normalized dummy argument names."""
     if not arglist:
         return set()
     inner = arglist.strip()[1:-1].strip()
@@ -113,6 +119,7 @@ def parse_arglist(arglist: Optional[str]) -> Set[str]:
 
 
 def parse_declared_names_from_decl(line: str) -> Set[str]:
+    """Extract declared entity names from a Fortran declaration statement."""
     if "::" not in line:
         return set()
     rhs = line.split("::", 1)[1]
@@ -132,6 +139,7 @@ def parse_declared_names_from_decl(line: str) -> Set[str]:
 
 
 def parse_declared_entities(line: str) -> List[Tuple[str, bool]]:
+    """Extract declared names and whether each has an inline array spec."""
     if "::" not in line:
         return []
     rhs = line.split("::", 1)[1]
@@ -148,6 +156,7 @@ def parse_declared_entities(line: str) -> List[Tuple[str, bool]]:
 
 
 def base_identifier(expr: str) -> Optional[str]:
+    """Return the base identifier at the start of an expression, if present."""
     m = re.match(r"^\s*([a-z][a-z0-9_]*)", expr, re.IGNORECASE)
     if not m:
         return None
@@ -155,6 +164,7 @@ def base_identifier(expr: str) -> Optional[str]:
 
 
 def parse_procedures(lines: List[str]) -> List[Procedure]:
+    """Parse procedure blocks and metadata from preprocessed source lines."""
     stack: List[Procedure] = []
     out: List[Procedure] = []
     interface_depth = 0
@@ -223,6 +233,7 @@ def parse_procedures(lines: List[str]) -> List[Procedure]:
 
 
 def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Dict[str, Set[str]]]:
+    """Collect defined modules, used modules, and generic interface bindings."""
     defined: Set[str] = set()
     used: Set[str] = set()
     generics: Dict[str, Set[str]] = {}
@@ -271,6 +282,7 @@ def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Di
 
 
 def load_source_files(paths: Iterable[Path]) -> Tuple[List[SourceFileInfo], bool]:
+    """Load source files and return parsed metadata objects plus missing-file status."""
     infos: List[SourceFileInfo] = []
     any_missing = False
     for p in paths:
@@ -298,6 +310,7 @@ def load_source_files(paths: Iterable[Path]) -> Tuple[List[SourceFileInfo], bool
 
 
 def compute_file_dependencies(files: List[SourceFileInfo]) -> Dict[Path, Set[Path]]:
+    """Infer inter-file dependencies from USE statements and procedure calls."""
     proc_name_to_files: Dict[str, Set[Path]] = {}
     module_to_file: Dict[str, Path] = {}
 
@@ -330,6 +343,7 @@ def compute_file_dependencies(files: List[SourceFileInfo]) -> Dict[Path, Set[Pat
 
 
 def order_files_least_dependent(files: List[SourceFileInfo]) -> Tuple[List[SourceFileInfo], bool]:
+    """Topologically order files so independent providers are processed first."""
     if len(files) <= 1:
         return files[:], False
 
@@ -352,6 +366,7 @@ def order_files_least_dependent(files: List[SourceFileInfo]) -> Tuple[List[Sourc
 
 
 def build_compile_closure(requested_files: List[SourceFileInfo]) -> Tuple[List[Path], Set[str]]:
+    """Build ordered compile inputs by adding files that provide used modules."""
     candidate_paths: Set[Path] = {f.path.resolve() for f in requested_files}
     for finfo in requested_files:
         parent = finfo.path.resolve().parent

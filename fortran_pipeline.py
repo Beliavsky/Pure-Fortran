@@ -11,6 +11,7 @@ import fortran_scan as fscan
 
 
 def auto_files() -> List[Path]:
+    """Return all .f90/.F90 files in the current directory in stable name order."""
     return sorted(
         set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
         key=lambda p: p.name.lower(),
@@ -21,6 +22,7 @@ def resolve_ordered_files(
     files: Sequence[Path],
     exclude: Sequence[str],
 ) -> Tuple[List[Path], int]:
+    """Resolve input files, apply excludes, and return dependency-ordered paths."""
     selected = list(files) if files else auto_files()
     selected = fscan.apply_excludes(selected, exclude)
     if not selected:
@@ -35,6 +37,7 @@ def resolve_ordered_files(
 
 
 def build_edit_phase_flags(args: object) -> List[str]:
+    """Build common --fix phase CLI flags from parsed wrapper arguments."""
     flags: List[str] = ["--fix", "--iterate", "--max-iter", str(args.max_iter)]
     if args.compiler:
         flags += ["--compiler", args.compiler]
@@ -52,6 +55,7 @@ def build_edit_phase_flags(args: object) -> List[str]:
 
 
 def run_phase(label: str, cmd: List[str]) -> int:
+    """Execute one pipeline phase command and print a labeled header."""
     print(f"\n=== {label} ===", flush=True)
     print("Command:", " ".join(cmd), flush=True)
     proc = subprocess.run(cmd)
