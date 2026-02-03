@@ -27,9 +27,11 @@ Main programs:
 - `xpure.py` - suggest/apply `pure`, optionally upgrade to `elemental`.
 - `xprivate.py` - suggest/apply module-level `private :: name` restrictions.
 - `xprune.py` - compile-validated pruning of likely unused top-level procedures.
+- `ximplicit_none.py` - suggest/apply `implicit none` in program units.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
+- `xstrip_implicit_none.py` - strip `implicit none` statements for test-case generation.
 
 Shared support modules:
 
@@ -154,7 +156,25 @@ Notes:
 - The tool removes accepted procedures and updates matching `public` lists for removed names.
 - If a trial removal breaks compilation, it is reverted immediately.
 
-### 6) `xintent_pure_private.py`
+### 6) `ximplicit_none.py`
+
+Suggests and optionally inserts `implicit none` in:
+
+- each `program`
+- each `module` (inserted before `contains` when present)
+- external procedures outside modules
+
+It intentionally does not add `implicit none` to procedures contained inside modules, because module-level `implicit none` already covers them.
+
+Typical commands:
+
+```bash
+python ximplicit_none.py
+python ximplicit_none.py --fix
+python ximplicit_none.py --fix --compiler "gfortran -o foo.exe"
+```
+
+### 7) `xintent_pure_private.py`
 
 Full pipeline wrapper for:
 
@@ -169,7 +189,7 @@ Typical command:
 python xintent_pure_private.py --suggest-intent-out --suggest-elemental --compiler "gfortran -o foo.exe"
 ```
 
-### 7) `xstrip.py`
+### 8) `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -182,6 +202,17 @@ python xstrip.py --strip pure
 ```
 
 By default summary output is off; enable with `--summary`.
+
+### 9) `xstrip_implicit_none.py`
+
+Utility to remove `implicit none` statements for testing `ximplicit_none.py`.
+
+Typical commands:
+
+```bash
+python xstrip_implicit_none.py --fix
+python xstrip_implicit_none.py foo.f90 --fix --diff
+```
 
 ## Recommended Transformation Order
 
@@ -218,6 +249,7 @@ These are static heuristics, not full Fortran semantic compilers. Expect some fa
 python xintent.py
 python xpure.py
 python xprivate.py
+python ximplicit_none.py
 ```
 
 ### Prune to a separate source tree
