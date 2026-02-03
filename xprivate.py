@@ -182,7 +182,7 @@ def parse_module_block(path: Path, lines: List[str], start_idx: int) -> Tuple[Mo
     assert m_start is not None
     mod_name = m_start.group(1).lower()
 
-    i = start_idx + 1
+    i = start_idx
     contains_line: Optional[int] = None
     default_private = False
     explicit_public: Set[str] = set()
@@ -193,59 +193,62 @@ def parse_module_block(path: Path, lines: List[str], start_idx: int) -> Tuple[Mo
     proc_depth = 0
     while i < len(lines):
         code = fscan.strip_comment(lines[i]).rstrip("\r\n")
-        low = code.strip().lower()
-
-        if MODULE_END_RE.match(low):
-            break
-
-        if not in_contains:
-            if CONTAINS_RE.match(low):
-                in_contains = True
-                contains_line = i + 1
-                i += 1
+        for j, stmt in enumerate(fscan.split_fortran_statements(code)):
+            low = stmt.strip().lower()
+            if i == start_idx and j == 0 and MODULE_START_RE.match(low):
                 continue
 
-            names_public = parse_access_stmt_names(code, "public")
-            if names_public is not None:
-                if names_public:
-                    explicit_public.update(names_public)
-                    for n in names_public:
-                        entities.setdefault(n, Entity(n, "unknown"))
-                else:
-                    default_private = False
+            if MODULE_END_RE.match(low):
+                i = len(lines)
+                break
 
-            names_private = parse_access_stmt_names(code, "private")
-            if names_private is not None:
-                if names_private:
-                    explicit_private.update(names_private)
-                    for n in names_private:
-                        entities.setdefault(n, Entity(n, "unknown"))
-                else:
-                    default_private = True
+            if not in_contains:
+                if CONTAINS_RE.match(low):
+                    in_contains = True
+                    contains_line = i + 1
+                    continue
 
-            m_iface = INTERFACE_RE.match(low)
-            if m_iface:
-                n = m_iface.group(1).lower()
-                entities.setdefault(n, Entity(n, "interface"))
+                names_public = parse_access_stmt_names(stmt, "public")
+                if names_public is not None:
+                    if names_public:
+                        explicit_public.update(names_public)
+                        for n in names_public:
+                            entities.setdefault(n, Entity(n, "unknown"))
+                    else:
+                        default_private = False
 
-            if TYPE_DECL_RE.match(low) and "::" in low:
-                lhs, _rhs = low.split("::", 1)
-                declared = fscan.parse_declared_names_from_decl(low)
-                has_public_attr = DECL_PUBLIC_ATTR_RE.search(lhs) is not None
-                for n in declared:
-                    ent = entities.setdefault(n, Entity(n, "entity"))
-                    if has_public_attr:
-                        ent.decl_public_attr = True
-                        explicit_public.add(n)
-        else:
-            m_proc_start = PROC_START_RE.match(low)
-            if m_proc_start:
-                proc_depth += 1
-                if proc_depth == 1:
-                    n = m_proc_start.group(2).lower()
-                    entities.setdefault(n, Entity(n, m_proc_start.group(1).lower()))
-            elif proc_depth > 0 and PROC_END_RE.match(low):
-                proc_depth -= 1
+                names_private = parse_access_stmt_names(stmt, "private")
+                if names_private is not None:
+                    if names_private:
+                        explicit_private.update(names_private)
+                        for n in names_private:
+                            entities.setdefault(n, Entity(n, "unknown"))
+                    else:
+                        default_private = True
+
+                m_iface = INTERFACE_RE.match(low)
+                if m_iface:
+                    n = m_iface.group(1).lower()
+                    entities.setdefault(n, Entity(n, "interface"))
+
+                if TYPE_DECL_RE.match(low):
+                    lhs = low.split("::", 1)[0] if "::" in low else low
+                    declared = fscan.parse_declared_names_from_decl(low)
+                    has_public_attr = DECL_PUBLIC_ATTR_RE.search(lhs) is not None
+                    for n in declared:
+                        ent = entities.setdefault(n, Entity(n, "entity"))
+                        if has_public_attr:
+                            ent.decl_public_attr = True
+                            explicit_public.add(n)
+            else:
+                m_proc_start = PROC_START_RE.match(low)
+                if m_proc_start:
+                    proc_depth += 1
+                    if proc_depth == 1:
+                        n = m_proc_start.group(2).lower()
+                        entities.setdefault(n, Entity(n, m_proc_start.group(1).lower()))
+                elif proc_depth > 0 and PROC_END_RE.match(low):
+                    proc_depth -= 1
 
         i += 1
 
@@ -271,16 +274,21 @@ def parse_modules_in_file(path: Path, lines: List[str]) -> List[ModuleInfo]:
     modules: List[ModuleInfo] = []
     i = 0
     while i < len(lines):
-        code = fscan.strip_comment(lines[i]).strip().lower()
-        m_start = MODULE_START_RE.match(code)
-        if m_start:
-            toks = code.split()
-            if len(toks) >= 2 and toks[1] != "procedure":
-                mod, end_idx = parse_module_block(path, lines, i)
-                modules.append(mod)
-                i = end_idx + 1
-                continue
-        i += 1
+        code = fscan.strip_comment(lines[i]).rstrip("\r\n")
+        for stmt in fscan.split_fortran_statements(code):
+            low = stmt.strip().lower()
+            m_start = MODULE_START_RE.match(low)
+            if m_start:
+                toks = low.split()
+                if len(toks) >= 2 and toks[1] != "procedure":
+                    mod, end_idx = parse_module_block(path, lines, i)
+                    modules.append(mod)
+                    i = end_idx + 1
+                    break
+        else:
+            i += 1
+            continue
+        continue
     return modules
 
 
@@ -290,9 +298,8 @@ def parse_external_uses(paths: Iterable[Path]) -> Tuple[Dict[str, Set[str]], Set
     wildcard_uses: Set[str] = set()
     for p in paths:
         text = p.read_text(encoding="utf-8", errors="ignore")
-        for raw in text.splitlines():
-            code = fscan.strip_comment(raw).strip()
-            m = USE_RE.match(code)
+        for _lineno, stmt in fscan.iter_fortran_statements(text.splitlines()):
+            m = USE_RE.match(stmt)
             if not m:
                 continue
             mod = m.group(1).lower()
