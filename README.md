@@ -223,3 +223,88 @@ Examples:
 For tools that modify source, `--git` can auto-commit changed files with an informative message.
 
 Use this only when your working tree state is ready for automatic commits.
+
+## Sample Output
+
+`python xintent_pure_private.py --compiler "gfortran -o foo.exe" --suggest-intent-out --suggest-elemental`
+on the source files in the `original` directory gave the source code in the `revised` directory and the terminal
+output below.
+```
+=== Intent Phase ===
+Command: c:\Programs\Python313\python.exe xintent.py kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90 --fix --iterate --max-iter 10 --compiler gfortran -o foo.exe --backup --suggest-intent-out
+Processing order: kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): PASS
+Compile (after-fix): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): PASS
+
+=== Pure Phase ===
+Command: c:\Programs\Python313\python.exe xpure.py kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90 --fix --iterate --max-iter 10 --compiler gfortran -o foo.exe --backup
+Processing order: kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): PASS
+
+Backup written: util.f90.bak
+
+Applied PURE to 6 procedure declaration(s).
+
+Backup written: stats.f90.bak
+
+Applied PURE to 17 procedure declaration(s).
+Compile (after-fix): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): PASS
+Processing order: kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+
+Backup written: stats.f90.bak
+
+Applied PURE to 2 procedure declaration(s).
+Compile (after-fix): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): PASS
+Processing order: kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): PASS
+
+Summary of 12 functions and 1 subroutine marked pure in 2 source files:
+stats.f90 6 functions: arcoef loglik fit_lnorm fit_laplace hyperb_var hyperb_scale_from_sd
+stats.f90 1 subroutine: unpack_params
+util.f90 6 functions: arange grid replace rep_vec matrix reverse
+
+=== Elemental Phase ===
+Command: c:\Programs\Python313\python.exe xpure.py kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90 --fix --iterate --max-iter 10 --compiler gfortran -o foo.exe --backup --suggest-elemental
+Processing order: kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): PASS
+
+Backup written: stats.f90.bak
+
+Applied ELEMENTAL to 18 procedure declaration(s).
+
+Backup written: interpret.f90.bak
+
+Applied ELEMENTAL to 1 procedure declaration(s).
+Compile (after-fix): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): PASS
+Processing order: kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): PASS
+
+Summary of 19 functions and 0 subroutines marked elemental in 2 source files:
+interpret.f90 1 function: lower_str
+stats.f90 18 functions: hyperb_pdf_scalar hyperb_int inv_norm besseli0 besseli1 besselk0 besselk1 log1pexp log_beta hyperb_scale_from_sd hyperb_var tcdf betai chisq_cdf gammp gser gcf betacf
+
+=== Private Phase ===
+Command: c:\Programs\Python313\python.exe xprivate.py kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90 --fix --iterate --max-iter 10 --compiler gfortran -o foo.exe --backup
+Processing order: kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (baseline): PASS
+Backup written: constants.f90.bak
+Backup written: gnuplot.f90.bak
+Backup written: interpret.f90.bak
+Backup written: kind.f90.bak
+Backup written: qsort.f90.bak
+Backup written: random.f90.bak
+Backup written: stats.f90.bak
+Backup written: util.f90.bak
+Compile (after-fix): gfortran -o foo.exe kind.f90 constants.f90 qsort.f90 util.f90 gnuplot.f90 random.f90 stats.f90 interpret.f90 xinterpret.f90
+Compile (after-fix): PASS
+```
