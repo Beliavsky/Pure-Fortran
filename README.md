@@ -26,6 +26,7 @@ Main programs:
 - `xintent.py` - suggest/apply `intent(in)` and optional `intent(out)`.
 - `xpure.py` - suggest/apply `pure`, optionally upgrade to `elemental`.
 - `xprivate.py` - suggest/apply module-level `private :: name` restrictions.
+- `xprune.py` - compile-validated pruning of likely unused top-level procedures.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
@@ -132,7 +133,28 @@ Typical command:
 python xintent_pure.py --suggest-intent-out --suggest-elemental --compiler "gfortran -o foo.exe"
 ```
 
-### 5) `xintent_pure_private.py`
+### 5) `xprune.py`
+
+Compile-validated pruning tool that removes likely unused top-level procedures.
+
+By default, it writes a working copy of sources to `pruned/` and applies pruning there.
+Use `--in-place` only when you explicitly want to modify the current source tree.
+
+Typical commands:
+
+```bash
+python xprune.py --compiler "gfortran -o foo.exe"
+python xprune.py --compiler "gfortran -o foo.exe" --out-dir pruned_stats
+python xprune.py --compiler "gfortran -o foo.exe" --in-place
+```
+
+Notes:
+
+- Pruning is conservative and compile-validated (`baseline`, `trial`, `final` compile passes).
+- The tool removes accepted procedures and updates matching `public` lists for removed names.
+- If a trial removal breaks compilation, it is reverted immediately.
+
+### 6) `xintent_pure_private.py`
 
 Full pipeline wrapper for:
 
@@ -147,7 +169,7 @@ Typical command:
 python xintent_pure_private.py --suggest-intent-out --suggest-elemental --compiler "gfortran -o foo.exe"
 ```
 
-### 6) `xstrip.py`
+### 7) `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -197,6 +219,14 @@ python xintent.py
 python xpure.py
 python xprivate.py
 ```
+
+### Prune to a separate source tree
+
+```bash
+python xprune.py --compiler "gfortran -o foo.exe"
+```
+
+This writes pruned sources to `pruned/` by default.
 
 ### Aggressive iterative compile-validated modernization
 
