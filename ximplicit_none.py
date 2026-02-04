@@ -24,6 +24,7 @@ CONTAINS_RE = re.compile(r"^\s*contains\b", re.IGNORECASE)
 IMPLICIT_NONE_RE = re.compile(r"^\s*implicit\s+none\b", re.IGNORECASE)
 INTERFACE_START_RE = re.compile(r"^\s*(abstract\s+)?interface\b", re.IGNORECASE)
 END_INTERFACE_RE = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
+USE_OR_IMPORT_RE = re.compile(r"^\s*(use\b|import\b)", re.IGNORECASE)
 
 
 @dataclass
@@ -87,6 +88,39 @@ def header_end_index(lines: List[str], start_idx: int) -> int:
     return i
 
 
+def statement_end_index(lines: List[str], start_idx: int) -> int:
+    """Return the final line index of a continued free-form statement."""
+    i = start_idx
+    while i < len(lines):
+        code = fscan.strip_comment(lines[i].rstrip("\r\n")).rstrip()
+        cont = code.endswith("&")
+        if not cont:
+            if i + 1 < len(lines):
+                nxt = fscan.strip_comment(lines[i + 1].rstrip("\r\n")).lstrip()
+                if nxt.startswith("&"):
+                    i += 1
+                    continue
+            break
+        i += 1
+    return i
+
+
+def statement_text(lines: List[str], start_idx: int, end_idx: int) -> str:
+    """Join a continued statement block into a single normalized string."""
+    parts: List[str] = []
+    for j in range(start_idx, end_idx + 1):
+        code = fscan.strip_comment(lines[j].rstrip("\r\n")).rstrip()
+        if j > start_idx:
+            lead = code.lstrip()
+            if lead.startswith("&"):
+                code = lead[1:].lstrip()
+        if code.endswith("&"):
+            code = code[:-1].rstrip()
+        if code.strip():
+            parts.append(code.strip())
+    return " ".join(parts).strip().lower()
+
+
 def should_suggest(unit: UnitState) -> bool:
     """Return whether this unit should get an IMPLICIT NONE if missing."""
     if unit.has_implicit_none:
@@ -100,18 +134,68 @@ def should_suggest(unit: UnitState) -> bool:
 
 
 def module_contains_insert_index(lines: List[str], start_idx: int) -> int:
-    """Return index to insert IMPLICIT NONE in a module (just before CONTAINS when present)."""
-    i = start_idx + 1
+    """Return index to insert IMPLICIT NONE in a module, after USE/IMPORT and before CONTAINS."""
+    i = header_end_index(lines, start_idx) + 1
     while i < len(lines):
         low = fscan.strip_comment(lines[i].rstrip("\r\n")).strip().lower()
+        if not low:
+            i += 1
+            continue
         if CONTAINS_RE.match(low):
             return i
         if low.startswith("end"):
             toks = low.split()
             if len(toks) == 1 or (len(toks) >= 2 and toks[1] == "module"):
                 break
+        end_idx = statement_end_index(lines, i)
+        stmt_low = statement_text(lines, i, end_idx)
+        if USE_OR_IMPORT_RE.match(stmt_low):
+            i = end_idx + 1
+            continue
+        return i
         i += 1
     return header_end_index(lines, start_idx) + 1
+
+
+def unit_insert_index(lines: List[str], start_idx: int) -> int:
+    """Return insertion index for program/procedure units after header USE/IMPORT statements."""
+    i = header_end_index(lines, start_idx) + 1
+    while i < len(lines):
+        low = fscan.strip_comment(lines[i].rstrip("\r\n")).strip().lower()
+        if not low:
+            i += 1
+            continue
+        if CONTAINS_RE.match(low):
+            return i
+        if low.startswith("end"):
+            toks = low.split()
+            if len(toks) == 1 or (len(toks) >= 2 and toks[1] in {"program", "function", "subroutine"}):
+                return i
+        end_idx = statement_end_index(lines, i)
+        stmt_low = statement_text(lines, i, end_idx)
+        if USE_OR_IMPORT_RE.match(stmt_low):
+            i = end_idx + 1
+            continue
+        return i
+    return header_end_index(lines, start_idx) + 1
+
+
+def choose_indent(lines: List[str], start_idx: int, insert_at: int) -> str:
+    """Choose indentation for inserted IMPLICIT NONE based on nearby specification lines."""
+    # Prefer the nearest previous non-empty code line in the same unit.
+    for i in range(min(insert_at - 1, len(lines) - 1), start_idx, -1):
+        code = fscan.strip_comment(lines[i].rstrip("\r\n"))
+        if code.strip():
+            return re.match(r"^\s*", lines[i]).group(0)
+
+    # Otherwise use indentation of the insertion-point line, if present.
+    if 0 <= insert_at < len(lines):
+        code = fscan.strip_comment(lines[insert_at].rstrip("\r\n"))
+        if code.strip():
+            return re.match(r"^\s*", lines[insert_at]).group(0)
+
+    # Fallback: one level inside unit header.
+    return re.match(r"^\s*", lines[start_idx]).group(0) + "  "
 
 
 def scan_suggestions(path: Path, lines: List[str]) -> List[Suggestion]:
@@ -241,9 +325,8 @@ def apply_fix(path: Path, suggestions: List[Suggestion], show_diff: bool, backup
         if s.kind == "module":
             insert_at = module_contains_insert_index(lines, start_idx)
         else:
-            h_end = header_end_index(lines, start_idx)
-            insert_at = h_end + 1
-        indent = re.match(r"^\s*", lines[start_idx]).group(0) + "  "
+            insert_at = unit_insert_index(lines, start_idx)
+        indent = choose_indent(lines, start_idx, insert_at)
         new_line = f"{indent}implicit none{eol_of(lines[start_idx])}"
         inserts.append((insert_at, new_line))
 
