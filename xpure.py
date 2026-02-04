@@ -326,9 +326,8 @@ def parse_procedures(lines: List[str]) -> List[Procedure]:
     out: List[Procedure] = []
     interface_depth = 0
 
-    for lineno, raw in enumerate(lines, start=1):
-        code = strip_comment(raw).rstrip()
-        low = code.lower().strip()
+    for lineno, stmt in fscan.iter_fortran_statements(lines):
+        low = stmt.lower().strip()
 
         if re.match(r"^\s*(abstract\s+)?interface\b", low):
             interface_depth += 1
@@ -383,7 +382,7 @@ def parse_procedures(lines: List[str]) -> List[Procedure]:
                     continue
 
         if stack:
-            stack[-1].body.append((lineno, code))
+            stack[-1].body.append((lineno, stmt))
 
     # Best effort for malformed files.
     while stack:
@@ -409,9 +408,8 @@ def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Di
     interface_depth = 0
     current_generic: Optional[str] = None
     current_is_abstract = False
-    for raw in lines:
-        code = strip_comment(raw).strip()
-        low = code.lower()
+    for _lineno, stmt in fscan.iter_fortran_statements(lines):
+        low = stmt.strip().lower()
         if not low:
             continue
         m_if = INTERFACE_START_RE.match(low)
@@ -860,38 +858,56 @@ def suggest_elemental_candidates(result: AnalysisResult) -> List[Procedure]:
         is_pure_or_pure_candidate = ("pure" in proc.attrs) or (id(proc) in pure_candidate_ids)
         if not is_pure_or_pure_candidate:
             continue
+        if elemental_shape_compatible(proc):
+            out.append(proc)
+    return out
 
-        declared: Set[str] = set()
-        nonscalar: Set[str] = set()
-        result_name = (proc.result_name or proc.name).lower()
-        pointer_or_allocatable: Set[str] = set()
-        for _, code in proc.body:
-            low = code.lower()
-            if not TYPE_DECL_RE.match(low):
-                continue
-            declared_here = parse_declared_names_from_decl(low)
-            declared.update(declared_here)
-            if "allocatable" in low or re.search(r"\bpointer\b", low):
-                pointer_or_allocatable.update(declared_here)
-            line_has_dimension = "dimension" in low
-            for name, has_entity_paren in parse_declared_entities(low):
-                if line_has_dimension or has_entity_paren:
-                    nonscalar.add(name)
 
-        # Conservative: every dummy must be explicitly declared and scalar.
-        ok = True
-        for d in proc.dummy_names:
-            if d not in declared or d in nonscalar or d in pointer_or_allocatable:
-                ok = False
-                break
-        # Elemental function result must be scalar as well.
-        if ok and proc.kind == "function":
-            if result_name not in declared or result_name in nonscalar:
-                ok = False
-            # Elemental function results cannot be ALLOCATABLE/POINTER.
-            if result_name in pointer_or_allocatable:
-                ok = False
-        if ok:
+def elemental_shape_compatible(proc: Procedure) -> bool:
+    """Check scalar dummy/result constraints required for elemental procedures."""
+    declared: Set[str] = set()
+    nonscalar: Set[str] = set()
+    result_name = (proc.result_name or proc.name).lower()
+    pointer_or_allocatable: Set[str] = set()
+    for _, code in proc.body:
+        low = code.lower()
+        if not TYPE_DECL_RE.match(low):
+            continue
+        declared_here = parse_declared_names_any(low)
+        declared.update(declared_here)
+        if "allocatable" in low or re.search(r"\bpointer\b", low):
+            pointer_or_allocatable.update(declared_here)
+        line_has_dimension = "dimension" in low
+        for name, has_entity_paren in parse_declared_entities(low):
+            if line_has_dimension or has_entity_paren:
+                nonscalar.add(name)
+
+    for d in proc.dummy_names:
+        if d not in declared or d in nonscalar or d in pointer_or_allocatable:
+            return False
+    if proc.kind == "function":
+        if result_name not in declared or result_name in nonscalar:
+            return False
+        if result_name in pointer_or_allocatable:
+            return False
+    return True
+
+
+def suggest_impure_elemental_candidates(result: AnalysisResult) -> List[Procedure]:
+    """Suggest non-pure procedures that appear eligible to be IMPURE ELEMENTAL."""
+    pure_candidate_ids = {id(p) for p in result.candidates}
+    out: List[Procedure] = []
+    for proc in result.procedures:
+        if "elemental" in proc.attrs:
+            continue
+        if proc.kind not in {"function", "subroutine"}:
+            continue
+        if len(proc.dummy_names) == 0:
+            continue
+        is_pure_or_pure_candidate = ("pure" in proc.attrs) or (id(proc) in pure_candidate_ids)
+        if is_pure_or_pure_candidate:
+            continue
+        if elemental_shape_compatible(proc):
             out.append(proc)
     return out
 
@@ -1237,6 +1253,11 @@ def main() -> int:
         help="Suggest procedures that could be marked ELEMENTAL (heuristic, conservative)",
     )
     parser.add_argument(
+        "--suggest-impure-elemental",
+        action="store_true",
+        help="Suggest procedures that could be marked IMPURE ELEMENTAL (advisory only)",
+    )
+    parser.add_argument(
         "--iterate",
         action="store_true",
         help="With --fix, repeat analyze/fix passes until no more changes",
@@ -1270,6 +1291,12 @@ def main() -> int:
 
     if args.iterate and not args.fix:
         print("--iterate requires --fix.")
+        return 3
+    if args.suggest_elemental and args.suggest_impure_elemental:
+        print("Use only one of --suggest-elemental or --suggest-impure-elemental.")
+        return 3
+    if args.fix and args.suggest_impure_elemental:
+        print("--suggest-impure-elemental is advisory only and cannot be combined with --fix.")
         return 3
     if args.max_iter < 1:
         print("--max-iter must be >= 1.")
@@ -1333,8 +1360,11 @@ def main() -> int:
             any_analyzed = True
 
             elemental_suggestions: List[Procedure] = []
+            impure_elemental_suggestions: List[Procedure] = []
             if args.suggest_elemental:
                 elemental_suggestions = suggest_elemental_candidates(result)
+            elif args.suggest_impure_elemental:
+                impure_elemental_suggestions = suggest_impure_elemental_candidates(result)
 
             if verbose:
                 if args.suggest_elemental:
@@ -1343,11 +1373,22 @@ def main() -> int:
                         "Likely ELEMENTAL candidates (not currently marked elemental)",
                         elemental_suggestions,
                     )
+                elif args.suggest_impure_elemental:
+                    print_suggestion_list(
+                        finfo.path,
+                        "Likely IMPURE ELEMENTAL candidates (advisory only)",
+                        impure_elemental_suggestions,
+                    )
                 else:
                     print_analysis(finfo.path, result, show_rejections=args.show_rejections)
             update_external_name_status(external_name_status, result)
             if not args.fix:
-                base_for_summary = elemental_suggestions if args.suggest_elemental else result.candidates
+                if args.suggest_elemental:
+                    base_for_summary = elemental_suggestions
+                elif args.suggest_impure_elemental:
+                    base_for_summary = impure_elemental_suggestions
+                else:
+                    base_for_summary = result.candidates
                 subroutine_names = unique_names_by_kind(base_for_summary, "subroutine")
                 function_names = unique_names_by_kind(base_for_summary, "function")
                 if subroutine_names:

@@ -24,7 +24,7 @@ Pure-Fortran focuses on practical improvements that are:
 Main programs:
 
 - `xintent.py` - suggest/apply `intent(in)` and optional `intent(out)`.
-- `xpure.py` - suggest/apply `pure`, optionally upgrade to `elemental`.
+- `xpure.py` - suggest/apply `pure`, optionally upgrade to `elemental`, and advisory-suggest `impure elemental`.
 - `xprivate.py` - suggest/apply module-level `private :: name` restrictions.
 - `xprune.py` - compile-validated pruning of likely unused top-level procedures.
 - `ximplicit_none.py` - suggest/apply `implicit none` in program units.
@@ -92,6 +92,7 @@ Suggests and optionally applies `pure` to procedures not currently marked `pure`
 Optional elemental mode:
 
 - `--suggest-elemental` suggests/upgrades eligible `pure` procedures to `elemental`.
+- `--suggest-impure-elemental` advisories procedures that may be markable `impure elemental` (no fix mode).
 
 Typical commands:
 
@@ -99,6 +100,7 @@ Typical commands:
 python xpure.py
 python xpure.py --fix --iterate --compiler "gfortran -o foo.exe"
 python xpure.py --fix --iterate --suggest-elemental --compiler "gfortran -o foo.exe"
+python xpure.py --suggest-impure-elemental
 ```
 
 Notes:
@@ -106,6 +108,7 @@ Notes:
 - Uses conservative purity checks (calls, assignments, I/O, control statements, etc.).
 - Internal I/O is treated differently from external I/O.
 - On compile failure after fix, modified files can be rolled back from backups.
+- `--suggest-impure-elemental` is advisory-only and cannot be combined with `--fix`.
 
 ### 3) `xprivate.py`
 
