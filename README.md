@@ -300,7 +300,8 @@ If applying all transformations, use this order:
 3. `pure` (`xpure.py`)
 4. `elemental` (`xpure.py --suggest-elemental`)
 5. `private` (`xprivate.py`)
-6. optional cleanup: prune/tighten imports (`xprune.py`, `xuse_only.py`)
+6. optional structural cleanup: tighten imports/prune (`xuse_only.py`, `xprune.py`)
+7. final cleanup/audit: unused values/dead stores (`xunused.py`)
 
 `xintent_pure_private.py` implements the intent/pure/elemental/private subset of this sequence.
 
