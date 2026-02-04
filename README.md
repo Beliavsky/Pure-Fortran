@@ -29,6 +29,8 @@ Main programs:
 - `xprune.py` - compile-validated pruning of likely unused top-level procedures.
 - `ximplicit_none.py` - suggest/apply `implicit none` in program units.
 - `xuse_only.py` - suggest/apply `use ..., only: ...` imports from broad `use` statements.
+- `xunset.py` - advisory checker for likely use-before-set variables.
+- `xunused.py` - advisory checker for likely unused set variables/constants, with optional conservative fix mode.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
@@ -215,7 +217,45 @@ Typical command:
 python xintent_pure_private.py --suggest-intent-out --suggest-elemental --compiler "gfortran -o foo.exe"
 ```
 
-### 9) `xstrip.py`
+### 9) `xunset.py`
+
+Advisory checker for likely use-before-set variables in procedures/program units.
+
+Typical commands:
+
+```bash
+python xunset.py
+python xunset.py stats.f90 --verbose
+```
+
+Notes:
+
+- Advisory only (no `--fix`).
+- Conservative static analysis; best used with manual review.
+
+### 10) `xunused.py`
+
+Advisory checker for likely unused set variables/constants.
+
+Optional modes:
+
+- `--fix`: apply conservative declaration/assignment removals when safe
+- `--warn-dead-store`: also report likely dead stores (overwritten-before-read / final unread write)
+
+Typical commands:
+
+```bash
+python xunused.py
+python xunused.py --warn-dead-store --verbose
+python xunused.py --fix --backup
+```
+
+Notes:
+
+- `--fix` is conservative by design and skips unsafe edits.
+- Dead-store warnings are advisory and branch-aware for `if/else` flows.
+
+### 11) `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -229,7 +269,7 @@ python xstrip.py --strip pure
 
 By default summary output is off; enable with `--summary`.
 
-### 10) `xstrip_implicit_none.py`
+### 12) `xstrip_implicit_none.py`
 
 Utility to remove `implicit none` statements for testing `ximplicit_none.py`.
 
@@ -240,7 +280,7 @@ python xstrip_implicit_none.py --fix
 python xstrip_implicit_none.py foo.f90 --fix --diff
 ```
 
-### 11) `xstrip_use_only.py`
+### 13) `xstrip_use_only.py`
 
 Utility to remove `only:` clauses from `use` statements for testing `xuse_only.py`.
 
