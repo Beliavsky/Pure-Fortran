@@ -36,6 +36,7 @@ Main programs:
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
 - `xstrip_implicit_none.py` - strip `implicit none` statements for test-case generation.
 - `xstrip_use_only.py` - strip `use ..., only: ...` back to broad `use` for testing.
+- `xdiff.py` compares two versions of a Fortran module and reports structural differences, documented [here](/xdiff.md)
 
 Shared support modules:
 
