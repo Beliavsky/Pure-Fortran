@@ -118,6 +118,15 @@ def split_code_comment(line: str) -> Tuple[str, str]:
     return line, ""
 
 
+def get_eol(line: str) -> str:
+    """Return the end-of-line sequence used by a line."""
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\n"):
+        return "\n"
+    return ""
+
+
 def add_intent_attr(line: str, intent: str) -> Tuple[str, bool]:
     """Insert an INTENT attribute into a declaration line when eligible."""
     code, comment = split_code_comment(line)
@@ -164,6 +173,65 @@ def parse_declared_names_any(code_line: str) -> Set[str]:
         if mm:
             out.add(mm.group(1).lower())
     return out
+
+
+def rewrite_semicolon_line_with_intents(line: str, intents_by_name: Dict[str, str]) -> Tuple[List[str], bool]:
+    """Rewrite declaration statements on a semicolon line by expanding into separate lines."""
+    eol = "\n"
+    if line.endswith("\r\n"):
+        eol = "\r\n"
+    elif line.endswith("\n"):
+        eol = "\n"
+    code, comment = split_code_comment(line.rstrip("\r\n"))
+    stmts = fscan.split_fortran_statements(code)
+    if len(stmts) <= 1:
+        return [line], False
+
+    out_lines: List[str] = []
+    changed = False
+    for stmt in stmts:
+        new_lines, ok = rewrite_decl_line_with_intents(stmt, intents_by_name)
+        if ok:
+            changed = True
+            for nl in new_lines:
+                out_lines.append(nl.rstrip("\r\n") + eol)
+        else:
+            out_lines.append(stmt.rstrip() + eol)
+
+    if changed and comment:
+        out_lines[-1] = out_lines[-1].rstrip("\r\n") + comment + eol
+    return out_lines, changed
+
+
+def collect_continued_statement(lines: List[str], start_idx: int) -> Tuple[int, str, bool]:
+    """Collect a continuation statement block and return (end_idx, joined_code, used_continuation)."""
+    parts: List[str] = []
+    i = start_idx
+    used = False
+    while i < len(lines):
+        raw = lines[i].rstrip("\r\n")
+        code, _comment = split_code_comment(raw)
+        seg = code.rstrip()
+        if i > start_idx:
+            lead = seg.lstrip()
+            if lead.startswith("&"):
+                seg = lead[1:].lstrip()
+        has_cont = seg.endswith("&")
+        if has_cont:
+            seg = seg[:-1].rstrip()
+            used = True
+        if seg.strip():
+            parts.append(seg.strip())
+        i += 1
+        if has_cont:
+            continue
+        if i < len(lines):
+            next_code, _ = split_code_comment(lines[i].rstrip("\r\n"))
+            if next_code.lstrip().startswith("&"):
+                used = True
+                continue
+        break
+    return i, " ".join(parts).strip(), used
 
 
 def rewrite_decl_line_with_intents(line: str, intents_by_name: Dict[str, str]) -> Tuple[List[str], bool]:
@@ -414,6 +482,20 @@ def apply_fix(
             continue
         intents_by_name = {s.dummy.lower(): s.intent for s in slist}
         new_lines, ok = rewrite_decl_line_with_intents(updated[idx_adj], intents_by_name)
+        if not ok and ";" in updated[idx_adj]:
+            new_lines, ok = rewrite_semicolon_line_with_intents(updated[idx_adj], intents_by_name)
+        if not ok:
+            end_idx, joined, used_cont = collect_continued_statement(updated, idx_adj)
+            if used_cont and joined:
+                new_lines, ok = rewrite_decl_line_with_intents(joined, intents_by_name)
+                if ok:
+                    eol = get_eol(updated[idx_adj])
+                    repl = [ln.rstrip("\r\n") + eol for ln in new_lines]
+                    updated[idx_adj:end_idx] = repl
+                    line_offset += len(repl) - (end_idx - idx_adj)
+                    changed += len(intents_by_name)
+                    changed_items.extend(slist)
+                    continue
         if ok:
             updated[idx_adj:idx_adj + 1] = new_lines
             line_offset += len(new_lines) - 1
@@ -515,6 +597,7 @@ def main() -> int:
     suggest_summary_last: Dict[Tuple[str, str], List[str]] = {}
     max_passes = args.max_iter if args.iterate else 1
     did_baseline_compile = False
+    baseline_failed = False
 
     for it in range(1, max_passes + 1):
         source_files, any_missing = fscan.load_source_files(args.fortran_files)
@@ -530,7 +613,8 @@ def main() -> int:
             compile_paths, _ = fscan.build_compile_closure(ordered_files)
             if args.fix and not did_baseline_compile:
                 if not run_compiler_command(args.compiler, compile_paths, phase="baseline"):
-                    return 5
+                    baseline_failed = True
+                    print("Baseline compile failed; continuing to attempt intent fixes.")
                 did_baseline_compile = True
 
         pass_suggest_summary: Dict[Tuple[str, str], List[str]] = {}
@@ -603,6 +687,8 @@ def main() -> int:
             print_summary(changed_summary, label="with arguments marked intent(in/out)")
         else:
             print_summary(changed_summary, label="with arguments marked intent(in)")
+        if baseline_failed:
+            print("\nNote: baseline compile failed before fixes; after-fix compile checks passed.")
     else:
         if args.suggest_intent_out:
             print_summary(suggest_summary_last, label="likely needing intent(in/out)")

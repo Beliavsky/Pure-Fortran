@@ -163,15 +163,102 @@ def base_identifier(expr: str) -> Optional[str]:
     return m.group(1).lower()
 
 
+def split_fortran_statements(code: str) -> List[str]:
+    """Split code into semicolon-delimited statements, respecting quoted strings."""
+    out: List[str] = []
+    cur: List[str] = []
+    in_single = False
+    in_double = False
+    for ch in code:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        if ch == ";" and not in_single and not in_double:
+            seg = "".join(cur).strip()
+            if seg:
+                out.append(seg)
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def join_continued_lines(lines: Iterable[str]) -> List[Tuple[int, str]]:
+    """Join free-form continuation lines and keep the originating start line."""
+    out: List[Tuple[int, str]] = []
+    cur_parts: List[str] = []
+    cur_start: Optional[int] = None
+    need_more = False
+
+    for lineno, raw in enumerate(lines, start=1):
+        code = strip_comment(raw).rstrip("\r\n")
+        seg = code.rstrip()
+        if not seg and not need_more:
+            continue
+
+        if cur_start is None:
+            cur_start = lineno
+
+        if cur_parts:
+            lead = seg.lstrip()
+            if lead.startswith("&"):
+                seg = lead[1:].lstrip()
+
+        seg = seg.rstrip()
+        has_trailing_cont = seg.endswith("&")
+        if has_trailing_cont:
+            seg = seg[:-1].rstrip()
+
+        if seg:
+            cur_parts.append(seg)
+
+        need_more = has_trailing_cont
+        if need_more:
+            continue
+
+        joined = " ".join(cur_parts).strip()
+        if joined:
+            out.append((cur_start, joined))
+        cur_parts = []
+        cur_start = None
+
+    if cur_parts and cur_start is not None:
+        joined = " ".join(cur_parts).strip()
+        if joined:
+            out.append((cur_start, joined))
+    return out
+
+
+def iter_fortran_statements(lines: Iterable[str]) -> List[Tuple[int, str]]:
+    """Return semicolon-split statements as (start_line, statement_text)."""
+    out: List[Tuple[int, str]] = []
+    for lineno, joined in join_continued_lines(lines):
+        for stmt in split_fortran_statements(joined):
+            if stmt:
+                out.append((lineno, stmt))
+    return out
+
+
+def split_statements_to_lines(lines: Iterable[str]) -> List[str]:
+    """Expand semicolon-delimited statements so each returned item is one statement."""
+    out: List[str] = []
+    for _lineno, stmt in iter_fortran_statements(lines):
+        out.append(stmt)
+    return out
+
+
 def parse_procedures(lines: List[str]) -> List[Procedure]:
     """Parse procedure blocks and metadata from preprocessed source lines."""
     stack: List[Procedure] = []
     out: List[Procedure] = []
     interface_depth = 0
 
-    for lineno, raw in enumerate(lines, start=1):
-        code = strip_comment(raw).rstrip()
-        low = code.lower().strip()
+    for lineno, stmt in iter_fortran_statements(lines):
+        low = stmt.lower().strip()
 
         if re.match(r"^\s*(abstract\s+)?interface\b", low):
             interface_depth += 1
@@ -221,7 +308,7 @@ def parse_procedures(lines: List[str]) -> List[Procedure]:
                     continue
 
         if stack:
-            stack[-1].body.append((lineno, code))
+            stack[-1].body.append((lineno, stmt))
 
     while stack:
         top = stack.pop()
@@ -240,9 +327,8 @@ def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Di
     interface_depth = 0
     current_generic: Optional[str] = None
     current_is_abstract = False
-    for raw in lines:
-        code = strip_comment(raw).strip()
-        low = code.lower()
+    for _lineno, stmt in iter_fortran_statements(lines):
+        low = stmt.strip().lower()
         if not low:
             continue
         m_if = INTERFACE_START_RE.match(low)
