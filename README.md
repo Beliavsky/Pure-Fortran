@@ -33,6 +33,8 @@ Main programs:
 - `xunused.py` - advisory checker for likely unused set variables/constants, with optional conservative fix mode.
 - `xparam.py` - advisory checker for variables that can be made named constants (`parameter`), with optional fix modes.
 - `xrepeated_if.py` - advisory checker/fixer for consecutive repeated IF conditions.
+- `xfunc_print.py` - advisory checker/fixer for external output statements inside functions.
+- `xnotrim.py` - advisory checker/fixer for likely needless `trim(...)` in string equality/inequality comparisons.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
@@ -309,7 +311,56 @@ python xrepeated_if.py foo.f90 --fix
 python xrepeated_if.py foo.f90 --fix --diff
 ```
 
-### 13) `xstrip.py`
+### 13) `xfunc_print.py`
+
+Warns when functions contain external output statements (`print`, `write(*,...)`).
+
+Fix strategy options (mutually exclusive):
+
+- `--fix-msg`
+- `--fix-msg-error-stop`
+- `--fix-msg-error-stop-block`
+- `--fix-unit`
+- `--fix-unit-error-stop`
+- `--fix-suppress`
+- `--fix-error-stop`
+- `--diff`: print unified diffs for changed files
+
+Typical commands:
+
+```bash
+python xfunc_print.py
+python xfunc_print.py foo.f90 --verbose
+python xfunc_print.py foo.f90 --fix-msg --diff
+python xfunc_print.py foo.f90 --fix-msg-error-stop-block --diff
+python xfunc_print.py foo.f90 --fix-unit-error-stop --diff
+python xfunc_print.py foo.f90 --fix-suppress --diff
+```
+
+Notes:
+
+- Fix strategies are intentionally explicit and mutually exclusive.
+- Detailed strategy behavior and caveats are documented in [func_print.md](func_print.md).
+
+### 14) `xnotrim.py`
+
+Warns about likely needless `trim(...)` in string `==`/`/=` (`.eq.`/`.ne.`) comparisons.
+
+Optional modes:
+
+- `--fix`: remove needless `trim(var)` wrappers in high-confidence comparison forms
+- `--diff`: with `--fix`, print unified diffs for changed files
+
+Typical commands:
+
+```bash
+python xnotrim.py
+python xnotrim.py foo.f90 --verbose
+python xnotrim.py foo.f90 --fix
+python xnotrim.py foo.f90 --fix --diff
+```
+
+### 15) `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -323,7 +374,7 @@ python xstrip.py --strip pure
 
 By default summary output is off; enable with `--summary`.
 
-### 14) `xstrip_implicit_none.py`
+### 16) `xstrip_implicit_none.py`
 
 Utility to remove `implicit none` statements for testing `ximplicit_none.py`.
 
@@ -334,7 +385,7 @@ python xstrip_implicit_none.py --fix
 python xstrip_implicit_none.py foo.f90 --fix --diff
 ```
 
-### 15) `xstrip_use_only.py`
+### 17) `xstrip_use_only.py`
 
 Utility to remove `only:` clauses from `use` statements for testing `xuse_only.py`.
 

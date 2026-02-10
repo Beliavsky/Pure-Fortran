@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+import cli_paths as cpaths
 import fortran_scan as fscan
 
 
@@ -1353,6 +1354,7 @@ def main() -> int:
     )
 
     args = ap.parse_args()
+    args.files = cpaths.expand_path_args(args.files)
 
     if len(args.files) not in (1, 2):
         raise SystemExit("provide one file (compare vs HEAD) or two files (direct compare)")
