@@ -38,6 +38,11 @@ Main programs:
 - `xdealloc.py` - advisory checker for early `deallocate(...)` opportunities, with annotation/fix workflows.
 - `xformat.py` - advisory checker/fixer for format literals that can be shortened with repeat edit descriptors.
 - `xadvance.py` - advisory checker for non-advancing `write` loops that can be collapsed.
+- `xset_array.py` - advisory checker for replacing consecutive scalar array-element assignments with one array assignment.
+- `xarray.py` - advisory checker for simple loops replaceable by array operations (`sum/product/count` and elementwise forms).
+- `xpower.py` - advisory checker/fixer for repeated multiplication terms (`x*x`) that can be written as powers (`x**2`).
+- `xno_variable.py` - advisory checker/fixer for single-use local scalar temporaries that can be inlined.
+- `xdealloc_tail.py` - advisory checker for redundant tail `deallocate(...)` of local allocatables.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
@@ -468,6 +473,119 @@ Notes:
 
 - Suggestions use single-write forms with unlimited-repeat formats when a literal format is available (for example `"(*(1x,f12.6))"`).
 - Array-section output is suggested when possible; otherwise implied-do output is suggested.
+- `--annotate` creates backups before edits.
+
+### 21) `xset_array.py`
+
+Advisory checker for runs of consecutive scalar element assignments that can be replaced by one array-constructor assignment.
+
+Optional mode:
+
+- `--annotate`: insert suggestion comments after the candidate lines.
+
+Typical commands:
+
+```bash
+python xset_array.py
+python xset_array.py foo.f90 --verbose
+python xset_array.py foo.f90 --annotate
+```
+
+Notes:
+
+- By default, suggestions use explicit section LHS (for example `x(1:4) = [...]`).
+- When full bounds are clearly covered, suggestions use whole-array LHS (for example `x = [...]`).
+- Detects vectorizable forms such as `f(a(i))` and suggests `f(a)`/`f(a(lo:hi))` when safe.
+
+### 22) `xarray.py`
+
+Advisory checker for simple `do` loops that can be replaced with array operations.
+
+Optional mode:
+
+- `--annotate`: insert marked replacement blocks and suggested array-operation lines.
+
+Typical commands:
+
+```bash
+python xarray.py
+python xarray.py foo.f90 --verbose
+python xarray.py foo.f90 --annotate
+```
+
+Notes:
+
+- Current conservative patterns include:
+  - elementwise loops (`c(i)=...`),
+  - `sum` reductions,
+  - `product` reductions,
+  - masked `sum` reductions,
+  - `count` patterns.
+- Supports simple strided loops (`do i=lb,ub,step`) in supported reduction patterns.
+- Avoids recurrence-style false positives (for example `y(i)=y(i-1)+...`).
+- `--annotate` creates backups before edits.
+
+### 23) `xpower.py`
+
+Advisory checker/fixer for repeated multiplication of the same operand (for example `x*x`) that can be rewritten as power form (`x**2`).
+
+Optional modes:
+
+- `--fix`: apply in-place rewrites.
+- `--annotate`: with `--fix`, append `!! changed by xpower.py` on changed lines.
+- `--diff`: with `--fix`, print unified diffs for changed files.
+
+Typical commands:
+
+```bash
+python xpower.py
+python xpower.py foo.f90 --verbose
+python xpower.py foo.f90 --fix
+python xpower.py foo.f90 --fix --annotate --diff
+```
+
+### 24) `xno_variable.py`
+
+Advisory checker/fixer for single-use local scalar temporaries that can be inlined.
+
+Optional modes:
+
+- `--fix`: inline safe candidates and remove now-unused declaration entities.
+- `--annotate`: with `--fix`, add declaration comments such as `!! x, y removed by xno_variable.py`.
+
+Typical commands:
+
+```bash
+python xno_variable.py
+python xno_variable.py foo.f90 --verbose
+python xno_variable.py foo.f90 --fix
+python xno_variable.py foo.f90 --fix --annotate --verbose
+```
+
+Notes:
+
+- Includes a safety check that blocks invalid inlining when RHS dependencies are reassigned between temp definition and use (for example swap patterns).
+- Fix mode creates backups before edits.
+
+### 25) `xdealloc_tail.py`
+
+Advisory checker for redundant `deallocate(...)` statements on local allocatables near program-unit end.
+
+Optional mode:
+
+- `--annotate`: append inline comments such as `!! xdealloc_tail.py suggests deleting this line`.
+
+Typical commands:
+
+```bash
+python xdealloc_tail.py
+python xdealloc_tail.py foo.f90 --verbose
+python xdealloc_tail.py foo.f90 --annotate
+```
+
+Notes:
+
+- Focuses on local allocatables and tail-position deallocations with no meaningful trailing work.
 - `--annotate` creates backups before edits.
 
 ## Recommended Transformation Order
