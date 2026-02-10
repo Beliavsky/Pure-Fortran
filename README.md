@@ -31,6 +31,7 @@ Main programs:
 - `xuse_only.py` - suggest/apply `use ..., only: ...` imports from broad `use` statements.
 - `xunset.py` - advisory checker for likely use-before-set variables.
 - `xunused.py` - advisory checker for likely unused set variables/constants, with optional conservative fix mode.
+- `xparam.py` - advisory checker for variables that can be made named constants (`parameter`), with optional fix modes.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
@@ -259,7 +260,30 @@ Notes:
 - `--fix` is conservative by design and skips unsafe edits.
 - Dead-store warnings are advisory and branch-aware for `if/else` flows.
 
-### 11) `xstrip.py`
+### 11) `xparam.py`
+
+Advisory checker for variables that may be converted to named constants (`parameter`).
+
+Optional modes:
+
+- `--fix`: conservative auto-fix for single-entity declarations
+- `--fix-all`: more aggressive auto-fix that may split multi-entity declarations
+
+Typical commands:
+
+```bash
+python xparam.py
+python xparam.py foo.f90 --verbose
+python xparam.py foo.f90 --fix
+python xparam.py foo.f90 --fix-all
+```
+
+Notes:
+
+- Fix modes create backups before editing (`.bak`, `.bak1`, ...).
+- Full rule details are documented in [param.md](param.md).
+
+### 12) `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -273,7 +297,7 @@ python xstrip.py --strip pure
 
 By default summary output is off; enable with `--summary`.
 
-### 12) `xstrip_implicit_none.py`
+### 13) `xstrip_implicit_none.py`
 
 Utility to remove `implicit none` statements for testing `ximplicit_none.py`.
 
@@ -284,7 +308,7 @@ python xstrip_implicit_none.py --fix
 python xstrip_implicit_none.py foo.f90 --fix --diff
 ```
 
-### 13) `xstrip_use_only.py`
+### 14) `xstrip_use_only.py`
 
 Utility to remove `only:` clauses from `use` statements for testing `xuse_only.py`.
 
