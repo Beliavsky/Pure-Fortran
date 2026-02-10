@@ -35,6 +35,9 @@ Main programs:
 - `xrepeated_if.py` - advisory checker/fixer for consecutive repeated IF conditions.
 - `xfunc_print.py` - advisory checker/fixer for external output statements inside functions.
 - `xnotrim.py` - advisory checker/fixer for likely needless `trim(...)` in string equality/inequality comparisons.
+- `xdealloc.py` - advisory checker for early `deallocate(...)` opportunities, with annotation/fix workflows.
+- `xformat.py` - advisory checker/fixer for format literals that can be shortened with repeat edit descriptors.
+- `xadvance.py` - advisory checker for non-advancing `write` loops that can be collapsed.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
@@ -395,6 +398,77 @@ Typical commands:
 python xstrip_use_only.py --fix
 python xstrip_use_only.py foo.f90 --fix --diff
 ```
+
+### 18) `xdealloc.py`
+
+Advisory checker for local allocatables that may be safely deallocated earlier.
+
+Optional modes:
+
+- `--annotate`: insert suggestions from current findings.
+- `--fix`: convert existing `! deallocate (...) !! suggested by xdealloc.py` comments to active `deallocate (...)` statements.
+- `--annotate --fix`: insert active `deallocate (...) !! suggested by xdealloc.py` lines directly from findings.
+
+Typical commands:
+
+```bash
+python xdealloc.py
+python xdealloc.py foo.f90 --verbose
+python xdealloc.py foo.f90 --annotate
+python xdealloc.py foo.f90 --fix
+python xdealloc.py foo.f90 --annotate --fix
+```
+
+Notes:
+
+- Suggestions are conservative and skip common unsafe cases (for example function result variables, loop-local last uses, near-unit-end structural-only tails).
+- Edit modes create backups before modifying files (`.bak`, `.bak1`, ...).
+
+### 19) `xformat.py`
+
+Advisory checker/fixer for shorten-able Fortran format literals in `print`/`write` statements.
+
+Optional modes:
+
+- `--fix`: apply conservative rewrites (for example `(a,a,a,i0,a,i0,a)` -> `(3a,2(i0,a))`).
+- `--diff`: with `--fix`, print unified diffs for changed files.
+
+Typical commands:
+
+```bash
+python xformat.py
+python xformat.py foo.f90 --verbose
+python xformat.py foo.f90 --fix
+python xformat.py foo.f90 --fix --diff
+```
+
+Notes:
+
+- Current matching is conservative and focuses on string-literal format specs.
+- Fix mode rewrites only unambiguous matches and creates backups before edits.
+
+### 20) `xadvance.py`
+
+Advisory checker for simple indexed `do` loops that perform one non-advancing `write(..., advance="no")` per iteration and can be collapsed.
+
+Optional mode:
+
+- `--annotate`: add suggestion comments after matching loops:
+  `! write (...) ...  !! suggested by xadvance.py`
+
+Typical commands:
+
+```bash
+python xadvance.py
+python xadvance.py foo.f90 --verbose
+python xadvance.py foo.f90 --annotate
+```
+
+Notes:
+
+- Suggestions use single-write forms with unlimited-repeat formats when a literal format is available (for example `"(*(1x,f12.6))"`).
+- Array-section output is suggested when possible; otherwise implied-do output is suggested.
+- `--annotate` creates backups before edits.
 
 ## Recommended Transformation Order
 
