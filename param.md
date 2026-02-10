@@ -27,9 +27,13 @@ A declared local is excluded immediately if any of the following holds:
 - It is already declared with `parameter`.
 - It is not a simple scalar declaration, including:
   - explicit entity shape (e.g. `x(10)`),
-  - `allocatable`,
   - `pointer`,
   - `target`.
+
+Allocatable arrays are handled separately:
+
+- Default behavior: excluded.
+- With `--fix-alloc`: rank-1 deferred-shape form (`(:)`) may be considered.
 
 ## What Counts as a Write
 
@@ -108,10 +112,12 @@ Example: host variable `m` assigned in internal `bar` => cannot be `parameter`.
 ### `--fix` (conservative)
 
 - Creates backup before first change in a file (`.bak`, `.bak1`, ...).
+- Runs to a fixed point by default: re-analyzes and reapplies until no additional safe conversions remain.
 - Rewrites only safe candidates where declaration line contains exactly one entity.
 - Moves first assignment expression to declaration as `parameter` initializer.
 - Removes the moved assignment statement line.
 - Skips multi-entity declaration lines (e.g. `integer :: i, n`).
+- Reorders generated `parameter` declarations within the unit as needed so referenced declarations appear earlier.
 
 ### `--fix-all` (aggressive)
 
@@ -123,6 +129,20 @@ Example transformation:
 
 - Before: `integer :: i, n` and `n = 3`
 - After: `integer :: i` and `integer, parameter :: n = 3`
+
+### `--fix-alloc` (opt-in gate)
+
+- Enables promotion of eligible `allocatable` arrays to `parameter`.
+- Currently limited to rank-1 deferred-shape declarations (`(:)`), when:
+  - write count is exactly one,
+  - initializer is deterministic and parameter-safe,
+  - fixed size can be inferred from initializer (currently rank-1 `[ ... ]` constructor length).
+- During rewrite, incompatible attributes are removed and shape is made explicit.
+
+Example transformation:
+
+- Before: `integer, allocatable :: w(:)` and `w = [30, 40]`
+- After: `integer, parameter :: w(2) = [30, 40]`
 
 ## Important Limitations
 

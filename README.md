@@ -268,6 +268,7 @@ Optional modes:
 
 - `--fix`: conservative auto-fix for single-entity declarations
 - `--fix-all`: more aggressive auto-fix that may split multi-entity declarations
+- `--fix-alloc`: allow eligible `allocatable` arrays to be promoted to `parameter`
 
 Typical commands:
 
@@ -276,11 +277,15 @@ python xparam.py
 python xparam.py foo.f90 --verbose
 python xparam.py foo.f90 --fix
 python xparam.py foo.f90 --fix-all
+python xparam.py foo.f90 --fix-all --fix-alloc
 ```
 
 Notes:
 
 - Fix modes create backups before editing (`.bak`, `.bak1`, ...).
+- `--fix` and `--fix-all` run recursively by default (re-analyze and re-apply) until no more variables can be converted.
+- During fixes, generated `parameter` declarations are reordered as needed so dependencies are declared before use.
+- By default, `allocatable` declarations are excluded; use `--fix-alloc` to opt in.
 - Full rule details are documented in [param.md](param.md).
 
 ### 12) `xstrip.py`

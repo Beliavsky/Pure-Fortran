@@ -21,6 +21,7 @@ ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*(?:\s*(?:\([^)]*\)|%\s*[a-z][a-z0-9
 POINTER_ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=>", re.IGNORECASE)
 ALLOCATE_RE = re.compile(r"^\s*(allocate|deallocate|nullify)\s*\((.*)\)\s*$", re.IGNORECASE)
 READ_RE = re.compile(r"^\s*read\b", re.IGNORECASE)
+DATA_ITEM_RE = re.compile(r"([a-z][a-z0-9_]*(?:\([^/]*\))?)\s*/([^/]*)/", re.IGNORECASE)
 CALL_RE = re.compile(r"^\s*call\s+([a-z][a-z0-9_]*)\s*(\((.*)\))?\s*$", re.IGNORECASE)
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 INTENT_RE = re.compile(r"\bintent\s*\(\s*(inout|out|in)\s*\)", re.IGNORECASE)
@@ -65,6 +66,9 @@ class Candidate:
     first_write_line: int
     first_write_detail: str
     first_write_expr: str
+    expr_refs: List[str]
+    unit_start: int
+    unit_end: int
 
 
 @dataclass
@@ -130,12 +134,12 @@ def split_top_level_commas(text: str) -> List[str]:
     return out
 
 
-def parse_decl_entities(stmt: str) -> List[Tuple[str, bool, bool, str]]:
-    """Parse declaration entities as (name, has_init, has_shape, init_expr)."""
+def parse_decl_entities(stmt: str) -> List[Tuple[str, bool, bool, str, str]]:
+    """Parse declaration entities as (name, has_init, has_shape, init_expr, shape_text)."""
     if "::" not in stmt:
         return []
     rhs = stmt.split("::", 1)[1]
-    out: List[Tuple[str, bool, bool, str]] = []
+    out: List[Tuple[str, bool, bool, str, str]] = []
     for chunk in split_top_level_commas(rhs):
         text = chunk.strip()
         if not text:
@@ -144,7 +148,8 @@ def parse_decl_entities(stmt: str) -> List[Tuple[str, bool, bool, str]]:
         if not m:
             continue
         name = m.group(1).lower()
-        has_shape = m.group(2) is not None
+        shape_text = (m.group(2) or "").strip()
+        has_shape = bool(shape_text)
         rest = m.group(3).strip()
         init_expr = ""
         has_init = False
@@ -154,7 +159,7 @@ def parse_decl_entities(stmt: str) -> List[Tuple[str, bool, bool, str]]:
         elif "=" in rest:
             has_init = True
             init_expr = rest.split("=", 1)[1].strip()
-        out.append((name, has_init, has_shape, init_expr))
+        out.append((name, has_init, has_shape, init_expr, shape_text))
     return out
 
 
@@ -202,6 +207,18 @@ def strip_quoted_text(text: str) -> str:
     return "".join(out)
 
 
+def expr_refs(expr: str) -> Set[str]:
+    """Extract identifier references from an expression, excluding literals/implied-do vars."""
+    text = strip_quoted_text((expr or "").strip().lower())
+    implied_do_vars: Set[str] = set(m.group(1).lower() for m in re.finditer(r"(?:\(|,)\s*([a-z][a-z0-9_]*)\s*=", text))
+    refs: Set[str] = set()
+    for m in IDENT_RE.finditer(text):
+        n = m.group(1).lower()
+        if n not in LITERAL_WORDS and n not in implied_do_vars:
+            refs.add(n)
+    return refs
+
+
 def is_parameter_safe_expr(expr: str, known_params: Set[str]) -> Tuple[bool, str]:
     """Conservative check for RHS suitability as a PARAMETER initializer."""
     text = strip_quoted_text((expr or "").strip().lower())
@@ -211,11 +228,7 @@ def is_parameter_safe_expr(expr: str, known_params: Set[str]) -> Tuple[bool, str
     if CALL_LIKE_RE.search(text):
         return False, "contains function call"
 
-    refs: Set[str] = set()
-    for m in IDENT_RE.finditer(text):
-        n = m.group(1).lower()
-        if n not in LITERAL_WORDS:
-            refs.add(n)
+    refs = expr_refs(text)
     bad = sorted(n for n in refs if n not in known_params)
     if bad:
         return False, f"depends on non-parameter name(s): {', '.join(bad)}"
@@ -286,6 +299,21 @@ def add_parameter_attr(left_spec: str) -> str:
     return ", ".join([parts[0].strip(), "parameter"] + [p.strip() for p in parts[1:] if p.strip()])
 
 
+def remove_nonparameter_attrs(left_spec: str) -> str:
+    """Remove attributes incompatible with PARAMETER."""
+    parts = split_top_level_commas(left_spec)
+    banned = {"allocatable", "pointer", "target", "save"}
+    kept: List[str] = []
+    for p in parts:
+        t = p.strip()
+        if not t:
+            continue
+        if t.lower() in banned:
+            continue
+        kept.append(t)
+    return ", ".join(kept)
+
+
 def parse_decl_chunks(rhs: str) -> List[Tuple[str, str]]:
     """Parse declaration RHS into (name, original_chunk) entities."""
     out: List[Tuple[str, str]] = []
@@ -298,6 +326,39 @@ def parse_decl_chunks(rhs: str) -> List[Tuple[str, str]]:
             continue
         out.append((m.group(1).lower(), text))
     return out
+
+
+def find_decl_line_for_name(lines: List[str], start_idx: int, end_idx: int, name: str) -> Optional[int]:
+    """Find declaration line index for one name inside the given span."""
+    lo = max(0, start_idx)
+    hi = min(len(lines) - 1, end_idx)
+    target = name.lower()
+    for idx in range(lo, hi + 1):
+        code, _comment = split_code_comment(lines[idx])
+        low = code.strip().lower()
+        if not low or "::" not in low:
+            continue
+        if not TYPE_DECL_RE.match(low):
+            continue
+        _left, rhs = low.split("::", 1)
+        entities = parse_decl_chunks(rhs)
+        if any(n == target for n, _chunk in entities):
+            return idx
+    return None
+
+
+def infer_rank1_constructor_len(expr: str) -> Optional[int]:
+    """Infer element count for a rank-1 array constructor like [1,2,3]."""
+    s = (expr or "").strip()
+    if not (s.startswith("[") and s.endswith("]")):
+        return None
+    inner = s[1:-1].strip()
+    if not inner:
+        return 0
+    items = split_top_level_commas(inner)
+    if any(":" in it for it in items):
+        return None
+    return len(items)
 
 
 def make_backup_path(path: Path) -> Path:
@@ -388,7 +449,7 @@ def collect_descendant_writes(
                 continue
             active_stmt, _ = unwrap_single_line_if(low)
             if TYPE_DECL_RE.match(active_stmt) and "::" in active_stmt:
-                for name, _has_init, _has_shape, _init in parse_decl_entities(active_stmt):
+                for name, _has_init, _has_shape, _init, _shape_text in parse_decl_entities(active_stmt):
                     declared.add(name)
                 continue
             m_assign = ASSIGN_RE.match(active_stmt)
@@ -446,6 +507,7 @@ def analyze_unit(
     unit: xunset.Unit,
     proc_sigs: Dict[str, List[ProcSignature]],
     descendant_writes: Optional[Dict[str, int]] = None,
+    allow_alloc_promotion: bool = False,
 ) -> Tuple[List[Candidate], List[Exclusion]]:
     """Analyze one unit and return candidates and exclusions."""
     locals_decl_line: Dict[str, int] = {}
@@ -458,6 +520,7 @@ def analyze_unit(
     first_write_expr: Dict[str, str] = {}
     first_write_in_control: Dict[str, bool] = {}
     declared_parameters: Set[str] = set()
+    parameter_decl_line: Dict[str, int] = {}
     control_depth = 0
 
     for d in unit.dummy_names:
@@ -475,15 +538,29 @@ def analyze_unit(
         if TYPE_DECL_RE.match(active_stmt) and "::" in active_stmt:
             attrs = parse_decl_attrs(active_stmt)
             declared = parse_decl_entities(active_stmt)
-            for name, has_init, has_shape, init_expr in declared:
+            for name, has_init, has_shape, init_expr, shape_text in declared:
                 if name not in locals_decl_line:
                     locals_decl_line[name] = ln
                 if "parameter" in attrs:
                     exclusions[name] = "already PARAMETER"
                     local_ok[name] = False
                     declared_parameters.add(name)
-                elif has_shape or "allocatable" in attrs or "pointer" in attrs or "target" in attrs:
-                    exclusions[name] = "non-scalar or pointer/allocatable declaration"
+                    parameter_decl_line[name] = ln
+                elif "pointer" in attrs or "target" in attrs:
+                    exclusions[name] = "pointer/target declaration"
+                    local_ok[name] = False
+                elif "allocatable" in attrs:
+                    # Optional promotion path, gated by CLI flag.
+                    if not allow_alloc_promotion:
+                        exclusions[name] = "allocatable declaration (enable with --fix-alloc)"
+                        local_ok[name] = False
+                    elif not (has_shape and shape_text == "(:)"):
+                        exclusions[name] = "allocatable declaration is not rank-1 deferred-shape"
+                        local_ok[name] = False
+                    else:
+                        local_ok.setdefault(name, True)
+                elif has_shape and (":" in shape_text or "*" in shape_text):
+                    exclusions[name] = "array declaration is not explicit-shape"
                     local_ok[name] = False
                 else:
                     local_ok.setdefault(name, True)
@@ -501,6 +578,25 @@ def analyze_unit(
             continue
 
         if active_stmt.startswith("use ") or active_stmt.startswith("implicit ") or active_stmt.startswith("contains"):
+            if BLOCK_START_RE.match(low):
+                control_depth += 1
+            continue
+
+        if active_stmt.startswith("data "):
+            tail = active_stmt[4:].strip()
+            for m_data in DATA_ITEM_RE.finditer(tail):
+                var_spec = m_data.group(1).strip()
+                data_vals = m_data.group(2).strip()
+                n = first_identifier(var_spec)
+                if not n:
+                    continue
+                writes[n] = writes.get(n, 0) + 1
+                if n not in first_write_line:
+                    first_write_line[n] = ln
+                    first_write_detail[n] = "data statement"
+                    first_write_deterministic[n] = True
+                    first_write_expr[n] = f"[{data_vals}]"
+                    first_write_in_control[n] = is_conditional_stmt
             if BLOCK_START_RE.match(low):
                 control_depth += 1
             continue
@@ -647,16 +743,20 @@ def analyze_unit(
     accepted: Set[str] = set()
     known_params = set(declared_parameters)
     pending = sorted(prelim_ok, key=lambda n: first_write_line.get(n, locals_decl_line.get(n, 10**9)))
+    pending_reason: Dict[str, str] = {}
     while True:
         progressed = False
         next_pending: List[str] = []
         for name in pending:
-            ok, _ = is_parameter_safe_expr(first_write_expr.get(name, ""), known_params)
+            expr = first_write_expr.get(name, "")
+            ok, why = is_parameter_safe_expr(expr, known_params)
             if ok:
                 accepted.add(name)
                 known_params.add(name)
+                parameter_decl_line[name] = locals_decl_line.get(name, 10**9)
                 progressed = True
             else:
+                pending_reason[name] = why
                 next_pending.append(name)
         pending = next_pending
         if not progressed:
@@ -674,12 +774,15 @@ def analyze_unit(
                     first_write_line=first_write_line.get(name, decl_line),
                     first_write_detail=first_write_detail.get(name, "assignment"),
                     first_write_expr=first_write_expr.get(name, ""),
+                    expr_refs=sorted(expr_refs(first_write_expr.get(name, ""))),
+                    unit_start=unit.start,
+                    unit_end=unit.end,
                 )
             )
 
     for name in pending:
         decl_line = locals_decl_line[name]
-        _, why = is_parameter_safe_expr(first_write_expr.get(name, ""), known_params)
+        why = pending_reason.get(name, "unknown reason")
         out_exclusions.append(
             Exclusion(
                 path=unit.path,
@@ -704,8 +807,8 @@ def apply_fixes_for_file(
     applied = 0
     skipped: List[FixSkip] = []
 
-    # Process bottom-up so inserted lines do not invalidate yet-to-run line references.
-    ordered = sorted(candidates, key=lambda c: (c.decl_line, c.first_write_line, c.name), reverse=True)
+    # Process by descending first-write line to keep assignment/data line references stable.
+    ordered = sorted(candidates, key=lambda c: (c.first_write_line, c.decl_line, c.name), reverse=True)
     for c in ordered:
         d_idx = c.decl_line - 1
         if d_idx < 0 or d_idx >= len(lines):
@@ -765,31 +868,67 @@ def apply_fixes_for_file(
                 continue
 
         indent = re.match(r"^\s*", decl_raw).group(0) if decl_raw else ""
-        left_new = add_parameter_attr(left.strip())
+        left_clean = remove_nonparameter_attrs(left.strip())
+        left_new = add_parameter_attr(left_clean)
         target_new = re.sub(r"=\s*.*$", "", target_chunk).strip()
         target_new = re.sub(r"=>\s*.*$", "", target_new).strip()
-        if "(" in target_new or "%" in target_new:
+        if "%" in target_new:
             skipped.append(FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "declaration entity is not a simple scalar name"))
             continue
-        param_decl_line = f"{indent}{left_new} :: {c.name} = {expr}"
+        if "(:)" in target_new:
+            nlen = infer_rank1_constructor_len(expr)
+            if nlen is None:
+                skipped.append(
+                    FixSkip(
+                        c.path,
+                        c.unit_kind,
+                        c.unit_name,
+                        c.name,
+                        "cannot infer fixed size for allocatable array initializer",
+                    )
+                )
+                continue
+            target_new = target_new.replace("(:)", f"({nlen})")
+        param_decl_line = f"{indent}{left_new} :: {target_new} = {expr}"
 
         if backup_path is None:
             backup_path = make_backup_path(path)
             shutil.copy2(path, backup_path)
 
         inserted_line = False
+        cand_idx = d_idx
         if len(entities) == 1:
             lines[d_idx] = f"{param_decl_line}{decl_comment}"
         else:
             lines[d_idx] = f"{indent}{left.strip()} :: {', '.join(other_chunks)}{decl_comment}"
             lines.insert(d_idx + 1, param_decl_line)
             inserted_line = True
-        if c.first_write_detail == "assignment":
+            cand_idx = d_idx + 1
+        if c.first_write_detail in {"assignment", "data statement"}:
             a_idx = c.first_write_line - 1
             if inserted_line and a_idx > d_idx:
                 a_idx += 1
             if a_idx != d_idx:
                 del lines[a_idx]
+                if a_idx < cand_idx:
+                    cand_idx -= 1
+
+        # Reorder generated declaration so referenced names are declared first.
+        if c.expr_refs:
+            span_start = max(0, c.unit_start - 1)
+            span_end = min(len(lines) - 1, c.unit_end - 1)
+            max_dep_idx = -1
+            for ref in c.expr_refs:
+                if ref == c.name:
+                    continue
+                ridx = find_decl_line_for_name(lines, span_start, span_end, ref)
+                if ridx is not None:
+                    max_dep_idx = max(max_dep_idx, ridx)
+            if max_dep_idx >= cand_idx:
+                moved = lines.pop(cand_idx)
+                if max_dep_idx > cand_idx:
+                    max_dep_idx -= 1
+                lines.insert(max_dep_idx + 1, moved)
         edited = True
         applied += 1
 
@@ -799,6 +938,29 @@ def apply_fixes_for_file(
             text += "\n"
         path.write_text(text, encoding="utf-8")
     return applied, skipped, backup_path
+
+
+def analyze_file(path: Path, allow_alloc_promotion: bool) -> Tuple[List[Candidate], List[Exclusion]]:
+    """Analyze one source file and return candidates/exclusions."""
+    infos, any_missing = fscan.load_source_files([path])
+    if not infos or any_missing:
+        return [], []
+    finfo = infos[0]
+    proc_sigs = parse_proc_signatures(finfo)
+    desc_writes_map = collect_descendant_writes(finfo)
+    candidates: List[Candidate] = []
+    exclusions: List[Exclusion] = []
+    for unit in xunset.collect_units(finfo):
+        dkey = unit_key(unit.kind, unit.name, unit.start)
+        cands, excls = analyze_unit(
+            unit,
+            proc_sigs,
+            descendant_writes=desc_writes_map.get(dkey),
+            allow_alloc_promotion=allow_alloc_promotion,
+        )
+        candidates.extend(cands)
+        exclusions.extend(excls)
+    return candidates, exclusions
 
 
 def main() -> int:
@@ -815,6 +977,11 @@ def main() -> int:
         action="store_true",
         help="Aggressive fix mode: also split multi-entity declarations when rewriting PARAMETER candidates",
     )
+    parser.add_argument(
+        "--fix-alloc",
+        action="store_true",
+        help="Allow allocatable rank-1 deferred-shape arrays to be promoted to PARAMETER when safe",
+    )
     args = parser.parse_args()
 
     files = choose_files(args.fortran_files, args.exclude)
@@ -830,15 +997,10 @@ def main() -> int:
 
     all_candidates: List[Candidate] = []
     all_exclusions: List[Exclusion] = []
-
     for finfo in ordered_infos:
-        proc_sigs = parse_proc_signatures(finfo)
-        desc_writes_map = collect_descendant_writes(finfo)
-        for unit in xunset.collect_units(finfo):
-            dkey = unit_key(unit.kind, unit.name, unit.start)
-            cands, excls = analyze_unit(unit, proc_sigs, descendant_writes=desc_writes_map.get(dkey))
-            all_candidates.extend(cands)
-            all_exclusions.extend(excls)
+        cands, excls = analyze_file(finfo.path, allow_alloc_promotion=args.fix_alloc)
+        all_candidates.extend(cands)
+        all_exclusions.extend(excls)
 
     if not all_candidates:
         print("No constant candidates found.")
@@ -866,15 +1028,29 @@ def main() -> int:
         total_applied = 0
         total_skipped = 0
         for path in sorted(by_file.keys(), key=lambda p: p.name.lower()):
-            applied, skipped, backup = apply_fixes_for_file(path, by_file[path], aggressive=args.fix_all)
-            total_applied += applied
-            total_skipped += len(skipped)
-            if backup is not None:
-                print(f"\nFixed {path.name}: applied {applied}, backup {backup.name}")
-            elif applied == 0:
+            file_applied = 0
+            file_skipped: List[FixSkip] = []
+            backup_name = ""
+            max_iter = 100
+            for _iter in range(max_iter):
+                iter_candidates, _iter_exclusions = analyze_file(path, allow_alloc_promotion=args.fix_alloc)
+                if not iter_candidates:
+                    break
+                applied, skipped, backup = apply_fixes_for_file(path, iter_candidates, aggressive=args.fix_all)
+                file_applied += applied
+                file_skipped.extend(skipped)
+                if backup is not None and not backup_name:
+                    backup_name = backup.name
+                if applied == 0:
+                    break
+            total_applied += file_applied
+            total_skipped += len(file_skipped)
+            if backup_name:
+                print(f"\nFixed {path.name}: applied {file_applied}, backup {backup_name}")
+            elif file_applied == 0:
                 print(f"\nNo fixes applied to {path.name}")
-            if args.verbose and skipped:
-                for s in skipped:
+            if args.verbose and file_skipped:
+                for s in file_skipped:
                     print(f"{path.name} {s.unit_kind} {s.unit_name} {s.name} - fix skipped: {s.reason}")
         mode = "--fix-all" if args.fix_all else "--fix"
         print(f"\n{mode} summary: applied {total_applied}, skipped {total_skipped}")
