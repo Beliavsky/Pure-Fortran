@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import shutil
 from dataclasses import dataclass
@@ -982,6 +983,7 @@ def main() -> int:
         action="store_true",
         help="Allow allocatable rank-1 deferred-shape arrays to be promoted to PARAMETER when safe",
     )
+    parser.add_argument("--diff", action="store_true", help="With fix modes, print unified diffs for changed files")
     args = parser.parse_args()
 
     files = choose_files(args.fortran_files, args.exclude)
@@ -1028,6 +1030,7 @@ def main() -> int:
         total_applied = 0
         total_skipped = 0
         for path in sorted(by_file.keys(), key=lambda p: p.name.lower()):
+            original_text = path.read_text(encoding="utf-8")
             file_applied = 0
             file_skipped: List[FixSkip] = []
             backup_name = ""
@@ -1049,6 +1052,18 @@ def main() -> int:
                 print(f"\nFixed {path.name}: applied {file_applied}, backup {backup_name}")
             elif file_applied == 0:
                 print(f"\nNo fixes applied to {path.name}")
+            if args.diff and file_applied > 0:
+                updated_text = path.read_text(encoding="utf-8")
+                diff_lines = difflib.unified_diff(
+                    original_text.splitlines(),
+                    updated_text.splitlines(),
+                    fromfile=f"a/{path.name}",
+                    tofile=f"b/{path.name}",
+                    lineterm="",
+                )
+                print("")
+                for line in diff_lines:
+                    print(line)
             if args.verbose and file_skipped:
                 for s in file_skipped:
                     print(f"{path.name} {s.unit_kind} {s.unit_name} {s.name} - fix skipped: {s.reason}")

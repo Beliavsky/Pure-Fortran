@@ -32,6 +32,7 @@ Main programs:
 - `xunset.py` - advisory checker for likely use-before-set variables.
 - `xunused.py` - advisory checker for likely unused set variables/constants, with optional conservative fix mode.
 - `xparam.py` - advisory checker for variables that can be made named constants (`parameter`), with optional fix modes.
+- `xrepeated_if.py` - advisory checker/fixer for consecutive repeated IF conditions.
 - `xintent_pure.py` - pipeline wrapper (`intent -> pure -> optional elemental`).
 - `xintent_pure_private.py` - full pipeline wrapper (`intent -> pure -> optional elemental -> private`).
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
@@ -269,6 +270,7 @@ Optional modes:
 - `--fix`: conservative auto-fix for single-entity declarations
 - `--fix-all`: more aggressive auto-fix that may split multi-entity declarations
 - `--fix-alloc`: allow eligible `allocatable` arrays to be promoted to `parameter`
+- `--diff`: with fix modes, print unified diffs for changed files
 
 Typical commands:
 
@@ -278,6 +280,7 @@ python xparam.py foo.f90 --verbose
 python xparam.py foo.f90 --fix
 python xparam.py foo.f90 --fix-all
 python xparam.py foo.f90 --fix-all --fix-alloc
+python xparam.py foo.f90 --fix --diff
 ```
 
 Notes:
@@ -288,7 +291,25 @@ Notes:
 - By default, `allocatable` declarations are excluded; use `--fix-alloc` to opt in.
 - Full rule details are documented in [param.md](param.md).
 
-### 12) `xstrip.py`
+### 12) `xrepeated_if.py`
+
+Warns about consecutive lines of code (optionally separated by comments) that test the same `if` condition.
+
+Optional mode:
+
+- `--fix`: rewrite repeated single-line IF pairs into one `if (...) then ... end if` block
+- `--diff`: with `--fix`, print unified diffs for changed files
+
+Typical commands:
+
+```bash
+python xrepeated_if.py
+python xrepeated_if.py foo.f90 --verbose
+python xrepeated_if.py foo.f90 --fix
+python xrepeated_if.py foo.f90 --fix --diff
+```
+
+### 13) `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -302,7 +323,7 @@ python xstrip.py --strip pure
 
 By default summary output is off; enable with `--summary`.
 
-### 13) `xstrip_implicit_none.py`
+### 14) `xstrip_implicit_none.py`
 
 Utility to remove `implicit none` statements for testing `ximplicit_none.py`.
 
@@ -313,7 +334,7 @@ python xstrip_implicit_none.py --fix
 python xstrip_implicit_none.py foo.f90 --fix --diff
 ```
 
-### 14) `xstrip_use_only.py`
+### 15) `xstrip_use_only.py`
 
 Utility to remove `only:` clauses from `use` statements for testing `xuse_only.py`.
 
