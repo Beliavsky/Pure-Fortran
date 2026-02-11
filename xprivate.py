@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+import cli_paths as cpaths
 import fortran_build as fbuild
 import fortran_scan as fscan
 
@@ -314,7 +315,7 @@ def parse_external_uses(paths: Iterable[Path]) -> Tuple[Dict[str, Set[str]], Set
 def choose_files(args_files: List[Path], exclude: List[str]) -> List[Path]:
     """Choose input files from CLI args or current-directory defaults with excludes."""
     if args_files:
-        files = args_files
+        files = cpaths.expand_path_args(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),

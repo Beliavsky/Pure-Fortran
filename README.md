@@ -38,8 +38,14 @@ Main programs:
 - `xdealloc.py` - advisory checker for early `deallocate(...)` opportunities, with annotation/fix workflows.
 - `xformat.py` - advisory checker/fixer for format literals that can be shortened with repeat edit descriptors.
 - `xadvance.py` - advisory checker for non-advancing `write` loops that can be collapsed.
+- `xnames.py` - advisory checker for variable/procedure names that collide with Fortran keywords/intrinsics.
+- `xkind.py` - advisory checker/fixer for hard-coded kind numbers (`_8`, `kind=8`, etc.).
+- `xalloc_assign.py` - advisory checker/fixer for redundant `allocate(...)` immediately before whole-array assignment.
 - `xset_array.py` - advisory checker for replacing consecutive scalar array-element assignments with one array assignment.
 - `xarray.py` - advisory checker for simple loops replaceable by array operations (`sum/product/count` and elementwise forms).
+- `xbounds.py` - advisory checker for likely out-of-bounds indexing/slicing patterns.
+- `xone_line_if.py` - advisory checker/fixer for collapsible three-line IF blocks (and reverse expansion mode).
+- `xlong_lines.py` - advisory checker/fixer for overlong Fortran lines via continuation wrapping.
 - `xpower.py` - advisory checker/fixer for repeated multiplication terms (`x*x`) that can be written as powers (`x**2`).
 - `xno_variable.py` - advisory checker/fixer for single-use local scalar temporaries that can be inlined.
 - `xdealloc_tail.py` - advisory checker for redundant tail `deallocate(...)` of local allocatables.
@@ -278,6 +284,7 @@ Advisory checker for variables that may be converted to named constants (`parame
 Optional modes:
 
 - `--fix`: conservative auto-fix for single-entity declarations
+- `--annotate`: insert suggestion comments (or tag changed declarations with `--fix`)
 - `--fix-all`: more aggressive auto-fix that may split multi-entity declarations
 - `--fix-alloc`: allow eligible `allocatable` arrays to be promoted to `parameter`
 - `--diff`: with fix modes, print unified diffs for changed files
@@ -288,9 +295,10 @@ Typical commands:
 python xparam.py
 python xparam.py foo.f90 --verbose
 python xparam.py foo.f90 --fix
+python xparam.py foo.f90 --annotate
 python xparam.py foo.f90 --fix-all
 python xparam.py foo.f90 --fix-all --fix-alloc
-python xparam.py foo.f90 --fix --diff
+python xparam.py foo.f90 --fix --annotate --diff
 ```
 
 Notes:
@@ -481,7 +489,10 @@ Advisory checker for runs of consecutive scalar element assignments that can be 
 
 Optional mode:
 
-- `--annotate`: insert suggestion comments after the candidate lines.
+- `--fix`: apply suggested rewrites in-place.
+- `--annotate`: insert suggestion comments after the candidate lines (or tag changed lines with `--fix`).
+- `--diff`: with `--fix`, print unified diffs for changed files.
+- `--vector-subscript`: also suggest/fix non-consecutive element assignments using vector subscripts.
 
 Typical commands:
 
@@ -489,6 +500,8 @@ Typical commands:
 python xset_array.py
 python xset_array.py foo.f90 --verbose
 python xset_array.py foo.f90 --annotate
+python xset_array.py foo.f90 --vector-subscript --verbose
+python xset_array.py foo.f90 --fix --annotate --diff
 ```
 
 Notes:
@@ -503,7 +516,9 @@ Advisory checker for simple `do` loops that can be replaced with array operation
 
 Optional mode:
 
-- `--annotate`: insert marked replacement blocks and suggested array-operation lines.
+- `--fix`: apply suggested rewrites in-place.
+- `--annotate`: insert marked replacement blocks and suggested array-operation lines (or tag changed lines with `--fix`).
+- `--diff`: with `--fix`, print unified diffs for changed files.
 
 Typical commands:
 
@@ -511,6 +526,7 @@ Typical commands:
 python xarray.py
 python xarray.py foo.f90 --verbose
 python xarray.py foo.f90 --annotate
+python xarray.py foo.f90 --fix --annotate --diff
 ```
 
 Notes:
@@ -520,10 +536,12 @@ Notes:
   - `sum` reductions,
   - `product` reductions,
   - masked `sum` reductions,
-  - `count` patterns.
+  - `count` patterns,
+  - `minval` / `maxval` reductions,
+  - `minloc` / `maxloc` index-tracking reductions (strict `<`/`>` patterns).
 - Supports simple strided loops (`do i=lb,ub,step`) in supported reduction patterns.
 - Avoids recurrence-style false positives (for example `y(i)=y(i-1)+...`).
-- `--annotate` creates backups before edits.
+- Edit modes create backups before edits.
 
 ### 23) `xpower.py`
 
@@ -587,6 +605,130 @@ Notes:
 
 - Focuses on local allocatables and tail-position deallocations with no meaningful trailing work.
 - `--annotate` creates backups before edits.
+
+### 26) `xnames.py`
+
+Advisory checker for identifiers that collide with Fortran keywords or intrinsic names.
+
+Optional mode:
+
+- `--verbose`: print full offending statements/contexts.
+
+Typical commands:
+
+```bash
+python xnames.py
+python xnames.py foo.f90 --verbose
+```
+
+Notes:
+
+- Advisory only (no `--fix`).
+
+### 27) `xkind.py`
+
+Advisory checker/fixer for hard-coded kind numbers.
+
+Optional modes:
+
+- `--fix`: apply in-place rewrites.
+- `--annotate`: with `--fix`, append `!! changed by xkind.py` on changed lines.
+- `--diff`: with `--fix`, print unified diffs for changed files.
+
+Typical commands:
+
+```bash
+python xkind.py
+python xkind.py foo.f90 --verbose
+python xkind.py foo.f90 --fix --annotate --diff
+```
+
+Notes:
+
+- Handles suffix kinds (`0_8`, `1.0_8`), selector kinds (`kind=8`, `real(8)`), and kind-parameter constants (for example `dp = 8` when used in kind selectors).
+- In module scope, fix mode can introduce module-level `xkind_*` named kind constants and rewrite literals/selectors to use them.
+
+### 28) `xalloc_assign.py`
+
+Advisory checker/fixer for redundant `allocate(...)` immediately before whole-array assignment.
+
+Optional modes:
+
+- `--fix`: comment out redundant allocate lines.
+- `--annotate`: annotate findings; with `--fix`, append `!! commented out by xalloc_assign.py`.
+- `--diff`: with `--fix`, print unified diffs for changed files.
+
+Typical commands:
+
+```bash
+python xalloc_assign.py
+python xalloc_assign.py foo.f90 --verbose
+python xalloc_assign.py foo.f90 --fix --annotate --diff
+```
+
+Notes:
+
+- Conservative by design (skips unsafe patterns).
+- When shape would be lost after removing `allocate(var(1))`, fix mode can rewrite scalar assignment to singleton constructor form (for example `var = [0.0_dp]`).
+
+### 29) `xbounds.py`
+
+Advisory checker for likely out-of-bounds array index/slice patterns.
+
+Optional mode:
+
+- `--verbose`: print statements and diagnostic details.
+
+Typical commands:
+
+```bash
+python xbounds.py
+python xbounds.py foo.f90 --verbose
+```
+
+Notes:
+
+- Advisory only (no `--fix`).
+- Uses conservative guard inference (for example `size(...)` checks, alias guards, loop bounds).
+
+### 30) `xone_line_if.py`
+
+Advisory checker/fixer for three-line IF blocks that can be collapsed to one-line IF, with optional reverse expansion.
+
+Optional modes:
+
+- `--fix`: apply rewrite.
+- `--annotate`: insert suggestion comments.
+- `--diff`: with edits, print unified diffs.
+- `--reverse`: operate in reverse (one-line IF -> 3-line block).
+
+Typical commands:
+
+```bash
+python xone_line_if.py
+python xone_line_if.py foo.f90 --verbose
+python xone_line_if.py foo.f90 --fix --diff
+python xone_line_if.py foo.f90 --reverse --fix --diff
+```
+
+### 31) `xlong_lines.py`
+
+Advisory checker/fixer for lines longer than a configurable maximum (default 100).
+
+Optional modes:
+
+- `--max-len N`: set length threshold (default `100`).
+- `--fix`: wrap long lines with continuation (`&`) where safe.
+- `--diff` / `-diff`: with `--fix`, print unified diffs.
+- `--verbose`: print full overlong lines.
+
+Typical commands:
+
+```bash
+python xlong_lines.py
+python xlong_lines.py foo.f90 --max-len 100 --verbose
+python xlong_lines.py foo.f90 --fix --diff
+```
 
 ## Recommended Transformation Order
 

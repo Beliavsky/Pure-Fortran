@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
+import cli_paths as cpaths
 import fortran_scan as fscan
 
 
@@ -23,7 +24,7 @@ def resolve_ordered_files(
     exclude: Sequence[str],
 ) -> Tuple[List[Path], int]:
     """Resolve input files, apply excludes, and return dependency-ordered paths."""
-    selected = list(files) if files else auto_files()
+    selected = cpaths.expand_path_args(files) if files else auto_files()
     selected = fscan.apply_excludes(selected, exclude)
     if not selected:
         print("No source files provided (or all were excluded).")

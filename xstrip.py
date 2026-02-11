@@ -11,6 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import cli_paths as cpaths
 import fortran_scan as fscan
 
 INTENT_ATTR_RE = re.compile(r"(?i),?\s*intent\s*\(\s*(?:inout|out|in)\s*\)")
@@ -155,7 +156,7 @@ def process_file(
 def choose_files(args_files: List[Path], exclude: List[str]) -> List[Path]:
     """Resolve input files from arguments or current directory defaults."""
     if args_files:
-        files = args_files
+        files = cpaths.expand_path_args(args_files)
     else:
         files = sorted(
         set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),

@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
+import cli_paths as cpaths
 import fortran_scan as fscan
 
 IMPLICIT_NONE_RE = re.compile(r"^\s*implicit\s+none\b", re.IGNORECASE)
@@ -41,7 +42,7 @@ def get_eol(line: str) -> str:
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve source files from args or current-directory defaults."""
     if args_files:
-        files = args_files
+        files = cpaths.expand_path_args(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),

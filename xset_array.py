@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import shutil
 from dataclasses import dataclass
@@ -187,33 +188,51 @@ def maybe_build_finding(
     run_name: str,
     run_idxs: List[int],
     run_rhs: List[str],
+    *,
+    allow_vector_subscript: bool,
 ) -> Optional[Finding]:
     """Validate one assignment run and build replacement suggestion."""
     if len(run_lines) < 2:
         return None
     if len(run_idxs) != len(set(run_idxs)):
         return None
+    is_consecutive = True
     for i in range(1, len(run_idxs)):
         if run_idxs[i] != run_idxs[i - 1] + 1:
-            return None
+            is_consecutive = False
+            break
+
+    if not is_consecutive and not allow_vector_subscript:
+        return None
 
     lo = run_idxs[0]
     hi = run_idxs[-1]
     rhs_joined = ", ".join(r.strip() for r in run_rhs)
+    rhs_same = len({normalize_expr(r) for r in run_rhs}) == 1
+    rhs_scalar = run_rhs[0].strip() if rhs_same else ""
     lhs = f"{run_name}({lo}:{hi})"
     target_full = False
 
-    b = decl_bounds.get(run_name)
-    if b is not None:
-        if normalize_expr(b.lb) == normalize_expr(str(lo)) and normalize_expr(b.ub) == normalize_expr(str(hi)):
-            lhs = run_name
-            target_full = True
+    if is_consecutive:
+        b = decl_bounds.get(run_name)
+        if b is not None:
+            if normalize_expr(b.lb) == normalize_expr(str(lo)) and normalize_expr(b.ub) == normalize_expr(str(hi)):
+                lhs = run_name
+                target_full = True
 
-    rhs_expr = maybe_vectorized_rhs(run_rhs, run_idxs, lo, hi, decl_bounds, target_full=target_full)
-    if rhs_expr is not None:
-        suggestion = f"{lhs} = {rhs_expr}"
+        rhs_expr = maybe_vectorized_rhs(run_rhs, run_idxs, lo, hi, decl_bounds, target_full=target_full)
+        if rhs_expr is not None:
+            suggestion = f"{lhs} = {rhs_expr}"
+        elif rhs_same:
+            suggestion = f"{lhs} = {rhs_scalar}"
+        else:
+            suggestion = f"{lhs} = [{rhs_joined}]"
     else:
-        suggestion = f"{lhs} = [{rhs_joined}]"
+        idxs = ", ".join(str(i) for i in run_idxs)
+        if rhs_same:
+            suggestion = f"{run_name}([{idxs}]) = {rhs_scalar}"
+        else:
+            suggestion = f"{run_name}([{idxs}]) = [{rhs_joined}]"
     return Finding(
         path=path,
         unit_kind=unit.kind,
@@ -290,7 +309,7 @@ def maybe_vectorized_rhs(
     return f"{func_name}({src_ref})"
 
 
-def analyze_unit(unit: xunset.Unit) -> List[Finding]:
+def analyze_unit(unit: xunset.Unit, *, allow_vector_subscript: bool = False) -> List[Finding]:
     """Find candidate consecutive scalar assignments in one unit."""
     decl_bounds = collect_decl_bounds(unit)
     findings: List[Finding] = []
@@ -311,6 +330,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 run_name,
                 run_idxs,
                 run_rhs,
+                allow_vector_subscript=allow_vector_subscript,
             )
             if f is not None:
                 findings.append(f)
@@ -357,7 +377,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     return findings
 
 
-def analyze_file(path: Path) -> List[Finding]:
+def analyze_file(path: Path, *, allow_vector_subscript: bool = False) -> List[Finding]:
     """Analyze one source file."""
     infos, any_missing = fscan.load_source_files([path])
     if not infos or any_missing:
@@ -365,7 +385,7 @@ def analyze_file(path: Path) -> List[Finding]:
     finfo = infos[0]
     out: List[Finding] = []
     for unit in xunset.collect_units(finfo):
-        out.extend(analyze_unit(unit))
+        out.extend(analyze_unit(unit, allow_vector_subscript=allow_vector_subscript))
     return out
 
 
@@ -399,6 +419,34 @@ def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Pa
     return len(inserts), backup
 
 
+def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = False) -> Tuple[int, Optional[Path]]:
+    """Replace assignment runs with suggested array-assignment lines."""
+    if not findings:
+        return 0, None
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    changed = 0
+
+    for f in sorted(findings, key=lambda x: (x.start_line, x.end_line), reverse=True):
+        sidx = f.start_line - 1
+        eidx = f.end_line - 1
+        if sidx < 0 or eidx < 0 or sidx >= len(lines) or eidx >= len(lines) or sidx > eidx:
+            continue
+        raw = lines[sidx]
+        indent = re.match(r"^\s*", raw).group(0) if raw else ""
+        eol = "\r\n" if raw.endswith("\r\n") else ("\n" if raw.endswith("\n") else "\n")
+        suffix = "  !! changed by xset_array.py" if annotate else ""
+        repl = f"{indent}{f.suggestion}{suffix}{eol}"
+        lines[sidx : eidx + 1] = [repl]
+        changed += 1
+
+    if changed == 0:
+        return 0, None
+    backup = make_backup_path(path)
+    shutil.copy2(path, backup)
+    path.write_text("".join(lines), encoding="utf-8")
+    return changed, backup
+
+
 def main() -> int:
     """Run advisory check across selected files."""
     parser = argparse.ArgumentParser(
@@ -407,8 +455,18 @@ def main() -> int:
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print suggestions per finding")
+    parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
     parser.add_argument("--annotate", action="store_true", help="Insert suggestion comments into source files")
+    parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
+    parser.add_argument(
+        "--vector-subscript",
+        action="store_true",
+        help="Also suggest vector-subscript rewrites for non-consecutive element assignments",
+    )
     args = parser.parse_args()
+    if args.diff and not args.fix:
+        print("--diff requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
@@ -417,7 +475,7 @@ def main() -> int:
 
     findings: List[Finding] = []
     for p in files:
-        findings.extend(analyze_file(p))
+        findings.extend(analyze_file(p, allow_vector_subscript=args.vector_subscript))
 
     if not findings:
         print("No set-array replacement candidates found.")
@@ -430,7 +488,35 @@ def main() -> int:
         if args.verbose:
             print(f"  suggest: {f.suggestion}")
 
-    if args.annotate:
+    if args.fix:
+        by_file: Dict[Path, List[Finding]] = {}
+        for f in findings:
+            by_file.setdefault(f.path, []).append(f)
+        touched = 0
+        total = 0
+        for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
+            before = p.read_text(encoding="utf-8")
+            n, backup = apply_fix_file(p, by_file[p], annotate=args.annotate)
+            total += n
+            if n > 0:
+                touched += 1
+                print(f"\nFixed {p.name}: replaced {n}, backup {backup.name if backup else '(none)'}")
+                if args.diff:
+                    after = p.read_text(encoding="utf-8")
+                    diff_lines = difflib.unified_diff(
+                        before.splitlines(),
+                        after.splitlines(),
+                        fromfile=f"a/{p.name}",
+                        tofile=f"b/{p.name}",
+                        lineterm="",
+                    )
+                    print("")
+                    for dl in diff_lines:
+                        print(dl)
+            elif args.verbose:
+                print(f"\nNo fixes applied in {p.name}")
+        print(f"\n--fix summary: files changed {touched}, replaced {total}")
+    elif args.annotate:
         by_file: Dict[Path, List[Finding]] = {}
         for f in findings:
             by_file.setdefault(f.path, []).append(f)

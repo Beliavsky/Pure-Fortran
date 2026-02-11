@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+import cli_paths as cpaths
 import fortran_build as fbuild
 import fortran_scan as fscan
 
@@ -145,7 +146,7 @@ def parse_access_names(rest: str) -> Optional[List[str]]:
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve input file paths from CLI args or current directory defaults."""
     if args_files:
-        files = args_files
+        files = cpaths.expand_path_args(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),

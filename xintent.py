@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+import cli_paths as cpaths
 import fortran_scan as fscan
 
 TYPE_DECL_RE = re.compile(
@@ -579,6 +580,7 @@ def main() -> int:
         print("--max-iter must be >= 1.")
         return 3
 
+    args.fortran_files = cpaths.expand_path_args(args.fortran_files)
     if not args.fortran_files:
         args.fortran_files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),

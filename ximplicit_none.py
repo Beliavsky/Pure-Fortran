@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 import re
 
+import cli_paths as cpaths
 import fortran_build as fbuild
 import fortran_scan as fscan
 
@@ -53,7 +54,7 @@ class Suggestion:
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve source file list from args or current-directory defaults."""
     if args_files:
-        files = args_files
+        files = cpaths.expand_path_args(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),

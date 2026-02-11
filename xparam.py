@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+import cli_paths as cpaths
 import fortran_scan as fscan
 import xunset
 
@@ -36,6 +37,8 @@ NONDET_TOKEN_RE = re.compile(
 )
 CALL_LIKE_RE = re.compile(r"\b([a-z][a-z0-9_]*)\s*\(", re.IGNORECASE)
 LITERAL_WORDS = {"true", "false", "null"}
+ANNOTATE_SUGGEST_SUFFIX = "!! suggested by xparam.py"
+ANNOTATE_CHANGED_SUFFIX = "!! changed by xparam.py"
 BLOCK_START_RE = re.compile(
     r"^\s*(if\s*\(.*\)\s*then\b|do\b|select\s+(case|type|rank)\b|where\b|forall\b|associate\b|block\b|critical\b)",
     re.IGNORECASE,
@@ -98,7 +101,7 @@ class FixSkip:
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve source files from args or current-directory defaults."""
     if args_files:
-        files = args_files
+        files = cpaths.expand_path_args(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
@@ -799,7 +802,7 @@ def analyze_unit(
 
 
 def apply_fixes_for_file(
-    path: Path, candidates: List[Candidate], aggressive: bool = False
+    path: Path, candidates: List[Candidate], aggressive: bool = False, annotate: bool = False
 ) -> Tuple[int, List[FixSkip], Optional[Path]]:
     """Apply PARAMETER fixes to one file and return stats."""
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -891,6 +894,8 @@ def apply_fixes_for_file(
                 continue
             target_new = target_new.replace("(:)", f"({nlen})")
         param_decl_line = f"{indent}{left_new} :: {target_new} = {expr}"
+        if annotate:
+            param_decl_line = f"{param_decl_line}  {ANNOTATE_CHANGED_SUFFIX}"
 
         if backup_path is None:
             backup_path = make_backup_path(path)
@@ -941,6 +946,76 @@ def apply_fixes_for_file(
     return applied, skipped, backup_path
 
 
+def build_param_decl_suggestion(lines: List[str], c: Candidate) -> Optional[str]:
+    """Build suggested PARAMETER declaration text for one candidate."""
+    d_idx = c.decl_line - 1
+    if d_idx < 0 or d_idx >= len(lines):
+        return None
+    decl_raw = lines[d_idx]
+    decl_code, _decl_comment = split_code_comment(decl_raw)
+    if "::" not in decl_code:
+        return None
+    left, rhs = decl_code.split("::", 1)
+    entities = parse_decl_chunks(rhs)
+    if not entities:
+        return None
+    target_chunk = ""
+    for n, chunk in entities:
+        if n == c.name and not target_chunk:
+            target_chunk = chunk
+    if not target_chunk:
+        return None
+    expr = c.first_write_expr.strip()
+    if not expr:
+        return None
+
+    indent = re.match(r"^\s*", decl_raw).group(0) if decl_raw else ""
+    left_clean = remove_nonparameter_attrs(left.strip())
+    left_new = add_parameter_attr(left_clean)
+    target_new = re.sub(r"=\s*.*$", "", target_chunk).strip()
+    target_new = re.sub(r"=>\s*.*$", "", target_new).strip()
+    if "%" in target_new:
+        return None
+    if "(:)" in target_new:
+        nlen = infer_rank1_constructor_len(expr)
+        if nlen is None:
+            return None
+        target_new = target_new.replace("(:)", f"({nlen})")
+    return f"{indent}! {left_new} :: {target_new} = {expr}  {ANNOTATE_SUGGEST_SUFFIX}"
+
+
+def apply_annotations_for_file(path: Path, candidates: List[Candidate]) -> Tuple[int, Optional[Path]]:
+    """Insert suggestion comments for candidates without rewriting code."""
+    if not candidates:
+        return 0, None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    inserted = 0
+    backup_path: Optional[Path] = None
+
+    ordered = sorted(candidates, key=lambda c: (c.first_write_line, c.decl_line, c.name), reverse=True)
+    for c in ordered:
+        suggestion = build_param_decl_suggestion(lines, c)
+        if not suggestion:
+            continue
+        ins_idx = max(0, min(len(lines), c.first_write_line))
+        if ins_idx > 0 and lines[ins_idx - 1].strip().lower() == suggestion.strip().lower():
+            continue
+        if ins_idx < len(lines) and lines[ins_idx].strip().lower() == suggestion.strip().lower():
+            continue
+        if backup_path is None:
+            backup_path = make_backup_path(path)
+            shutil.copy2(path, backup_path)
+        lines.insert(ins_idx, suggestion)
+        inserted += 1
+
+    if inserted > 0:
+        text = "\n".join(lines)
+        if path.read_text(encoding="utf-8").endswith("\n"):
+            text += "\n"
+        path.write_text(text, encoding="utf-8")
+    return inserted, backup_path
+
+
 def analyze_file(path: Path, allow_alloc_promotion: bool) -> Tuple[List[Candidate], List[Exclusion]]:
     """Analyze one source file and return candidates/exclusions."""
     infos, any_missing = fscan.load_source_files([path])
@@ -974,6 +1049,11 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="Also print excluded locals and reasons")
     parser.add_argument("--fix", action="store_true", help="Rewrite safe candidates as PARAMETER with file backups")
     parser.add_argument(
+        "--annotate",
+        action="store_true",
+        help="Insert suggested PARAMETER declaration comments in source files",
+    )
+    parser.add_argument(
         "--fix-all",
         action="store_true",
         help="Aggressive fix mode: also split multi-entity declarations when rewriting PARAMETER candidates",
@@ -985,6 +1065,9 @@ def main() -> int:
     )
     parser.add_argument("--diff", action="store_true", help="With fix modes, print unified diffs for changed files")
     args = parser.parse_args()
+    if args.diff and not (args.fix or args.fix_all):
+        print("--diff requires --fix or --fix-all.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
@@ -1039,7 +1122,9 @@ def main() -> int:
                 iter_candidates, _iter_exclusions = analyze_file(path, allow_alloc_promotion=args.fix_alloc)
                 if not iter_candidates:
                     break
-                applied, skipped, backup = apply_fixes_for_file(path, iter_candidates, aggressive=args.fix_all)
+                applied, skipped, backup = apply_fixes_for_file(
+                    path, iter_candidates, aggressive=args.fix_all, annotate=args.annotate
+                )
                 file_applied += applied
                 file_skipped.extend(skipped)
                 if backup is not None and not backup_name:
@@ -1069,6 +1154,20 @@ def main() -> int:
                     print(f"{path.name} {s.unit_kind} {s.unit_name} {s.name} - fix skipped: {s.reason}")
         mode = "--fix-all" if args.fix_all else "--fix"
         print(f"\n{mode} summary: applied {total_applied}, skipped {total_skipped}")
+    elif args.annotate and all_candidates:
+        by_file: Dict[Path, List[Candidate]] = {}
+        for c in all_candidates:
+            by_file.setdefault(c.path, []).append(c)
+        total_inserted = 0
+        touched = 0
+        for path in sorted(by_file.keys(), key=lambda p: p.name.lower()):
+            inserted, backup = apply_annotations_for_file(path, by_file[path])
+            total_inserted += inserted
+            if inserted > 0:
+                touched += 1
+                bname = backup.name if backup is not None else "none"
+                print(f"\nAnnotated {path.name}: inserted {inserted} suggestion(s), backup {bname}")
+        print(f"\n--annotate summary: files changed {touched}, inserted {total_inserted}")
 
     return 0
 

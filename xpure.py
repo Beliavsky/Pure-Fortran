@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+import cli_paths as cpaths
 
 PROC_START_RE = re.compile(
     r"^\s*(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
@@ -1271,6 +1272,7 @@ def main() -> int:
     args = parser.parse_args()
     verbose = args.verbose or args.show_rejections
 
+    args.fortran_files = cpaths.expand_path_args(args.fortran_files)
     if not args.fortran_files:
         auto_files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
