@@ -35,6 +35,8 @@ Main programs:
 - `xrepeated_if.py` - advisory checker/fixer for consecutive repeated IF conditions.
 - `xfunc_print.py` - advisory checker/fixer for external output statements inside functions.
 - `xnotrim.py` - advisory checker/fixer for likely needless `trim(...)` in string equality/inequality comparisons.
+- `xoptval.py` - advisory checker/fixer for optional-argument defaulting patterns replaceable with `stdlib` `optval(...)`.
+- `xmerge.py` - advisory checker/fixer for simple `if/else` assignment blocks replaceable with `merge(...)`.
 - `xdealloc.py` - advisory checker for early `deallocate(...)` opportunities, with annotation/fix workflows.
 - `xformat.py` - advisory checker/fixer for format literals that can be shortened with repeat edit descriptors.
 - `xadvance.py` - advisory checker for non-advancing `write` loops that can be collapsed.
@@ -729,6 +731,61 @@ python xlong_lines.py
 python xlong_lines.py foo.f90 --max-len 100 --verbose
 python xlong_lines.py foo.f90 --fix --diff
 ```
+
+### 32) `xoptval.py`
+
+Advisory checker/fixer for optional-defaulting idioms that can be rewritten with `optval(...)` from `stdlib_optval`.
+
+Optional modes:
+
+- `--fix`: apply in-place rewrites and insert `use stdlib_optval, only: optval` where needed.
+- `--annotate`: insert suggestion comments (or add `!! changed by xoptval.py` on changed lines with `--fix`).
+- `--diff`: with `--fix`, print unified diffs for changed files.
+- `--verbose`: print full findings with source context.
+
+Typical commands:
+
+```bash
+python xoptval.py
+python xoptval.py foo.f90 --verbose
+python xoptval.py foo.f90 --fix --diff
+python xoptval.py foo.f90 --fix --annotate --diff
+```
+
+Notes:
+
+- Handles common patterns such as:
+  - `x = default; if (present(arg)) x = arg`
+  - `if (present(arg)) then; x = arg; else; x = default; end if`
+- In fix mode, required `use stdlib_optval, only: optval` import is kept in the module/specification part (before `implicit none`).
+
+### 33) `xmerge.py`
+
+Advisory checker/fixer for simple `if/else` assignment blocks that can be replaced by `merge(...)`.
+
+Optional modes:
+
+- `--fix`: apply conservative in-place rewrites.
+- `--annotate`: insert suggestion comments (or add `!! changed by xmerge.py` on changed lines with `--fix`).
+- `--diff` / `-diff`: with `--fix`, print unified diffs for changed files.
+- `--verbose`: print full suggestions.
+
+Typical commands:
+
+```bash
+python xmerge.py
+python xmerge.py foo.f90 --verbose
+python xmerge.py foo.f90 --annotate
+python xmerge.py foo.f90 --fix --annotate --diff
+```
+
+Notes:
+
+- Matching is intentionally strict: one-statement-per-line, contiguous 5-line `if/else/end if` blocks assigning the same LHS in both branches.
+- Rewrites are skipped for known unsafe cases, including:
+  - `present(...)`-guarded optionals referenced in either source expression,
+  - string-literal branch values with unequal character lengths,
+  - complex branch expressions outside the supported simple-source subset.
 
 ## Recommended Transformation Order
 

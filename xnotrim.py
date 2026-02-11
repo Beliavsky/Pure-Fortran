@@ -37,6 +37,15 @@ FIX_RHS_RE = re.compile(
     rf"({LITERAL_RE}\s*{OP_TOKEN_RE}\s*)trim\s*\(\s*([a-z][a-z0-9_]*)\s*\)",
     re.IGNORECASE,
 )
+SELECT_CASE_TRIM_RE = re.compile(
+    r"^\s*select\s+case\s*\(\s*trim\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*\)\s*$",
+    re.IGNORECASE,
+)
+FIX_SELECT_CASE_TRIM_RE = re.compile(
+    r"^(\s*select\s+case\s*\(\s*)trim\s*\(\s*([a-z][a-z0-9_]*)\s*\)(\s*\)\s*)$",
+    re.IGNORECASE,
+)
+ANNOTATE_TAG = "!! changed by xnotrim.py"
 
 
 @dataclass
@@ -45,6 +54,7 @@ class Finding:
 
     path: Path
     line: int
+    kind: str
     var: str
     op: str
     literal: str
@@ -80,6 +90,7 @@ def analyze_file(path: Path) -> List[Finding]:
                 Finding(
                     path=path,
                     line=lineno,
+                    kind="comparison",
                     var=m.group(1),
                     op=m.group(2),
                     literal=m.group(3),
@@ -91,9 +102,23 @@ def analyze_file(path: Path) -> List[Finding]:
                 Finding(
                     path=path,
                     line=lineno,
+                    kind="comparison",
                     var=m.group(3),
                     op=m.group(2),
                     literal=m.group(1),
+                    stmt=stmt.strip(),
+                )
+            )
+        m_sel = SELECT_CASE_TRIM_RE.match(stmt.strip())
+        if m_sel:
+            out.append(
+                Finding(
+                    path=path,
+                    line=lineno,
+                    kind="select_case",
+                    var=m_sel.group(1),
+                    op="select case",
+                    literal="",
                     stmt=stmt.strip(),
                 )
             )
@@ -127,7 +152,7 @@ def make_backup_path(path: Path) -> Path:
         idx += 1
 
 
-def apply_fix_file(path: Path) -> tuple[int, Path | None]:
+def apply_fix_file(path: Path, *, annotate: bool = False) -> tuple[int, Path | None]:
     """Apply needless-TRIM rewrites in one file."""
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     changed = 0
@@ -143,9 +168,16 @@ def apply_fix_file(path: Path) -> tuple[int, Path | None]:
         code, comment = split_code_comment(body)
         new_code, c1 = FIX_LHS_RE.subn(r"\1\2", code)
         new_code, c2 = FIX_RHS_RE.subn(r"\1\2", new_code)
-        if c1 + c2 > 0:
-            changed += c1 + c2
-            lines[i] = f"{new_code}{comment}{eol}"
+        new_code, c3 = FIX_SELECT_CASE_TRIM_RE.subn(r"\1\2\3", new_code)
+        if c1 + c2 + c3 > 0:
+            changed += c1 + c2 + c3
+            new_comment = comment
+            if annotate and ANNOTATE_TAG.lower() not in comment.lower():
+                if new_comment:
+                    new_comment = f"{new_comment}  {ANNOTATE_TAG}"
+                else:
+                    new_comment = f"  {ANNOTATE_TAG}"
+            lines[i] = f"{new_code}{new_comment}{eol}"
 
     if changed == 0:
         return 0, None
@@ -164,8 +196,15 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print every finding with offending statement line")
     parser.add_argument("--fix", action="store_true", help="Rewrite needless trim(var) wrappers in comparisons")
+    parser.add_argument("--annotate", action="store_true", help="With --fix, append change tag comments")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
     args = parser.parse_args()
+    if args.annotate and not args.fix:
+        print("--annotate requires --fix.")
+        return 2
+    if args.diff and not args.fix:
+        print("--diff requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
@@ -184,10 +223,13 @@ def main() -> int:
     print(f"{len(findings)} needless TRIM() finding(s).")
     if args.verbose:
         for f in findings:
-            print(
-                f"{f.path.name}:{f.line} needless trim in string comparison: "
-                f"trim({f.var}) {f.op} {f.literal}"
-            )
+            if f.kind == "select_case":
+                print(f"{f.path.name}:{f.line} needless trim in select case selector: trim({f.var})")
+            else:
+                print(
+                    f"{f.path.name}:{f.line} needless trim in string comparison: "
+                    f"trim({f.var}) {f.op} {f.literal}"
+                )
             print(f"  {f.stmt}")
     else:
         by_file = {}
@@ -196,10 +238,13 @@ def main() -> int:
         for fname in sorted(by_file.keys(), key=str.lower):
             print(f"{fname}: {by_file[fname]}")
         first = findings[0]
-        print(
-            f"\nFirst finding: {first.path.name}:{first.line} "
-            f"trim({first.var}) {first.op} {first.literal}"
-        )
+        if first.kind == "select_case":
+            print(f"\nFirst finding: {first.path.name}:{first.line} trim({first.var}) in select case selector")
+        else:
+            print(
+                f"\nFirst finding: {first.path.name}:{first.line} "
+                f"trim({first.var}) {first.op} {first.literal}"
+            )
         print("Run with --verbose to list all findings and offending lines.")
 
     if args.fix:
@@ -207,7 +252,7 @@ def main() -> int:
         changed_files = sorted({f.path for f in findings}, key=lambda p: p.name.lower())
         for p in changed_files:
             before = p.read_text(encoding="utf-8")
-            nrewrites, backup = apply_fix_file(p)
+            nrewrites, backup = apply_fix_file(p, annotate=args.annotate)
             total_rewrites += nrewrites
             if nrewrites > 0 and backup is not None:
                 print(f"\nFixed {p.name}: rewrites {nrewrites}, backup {backup.name}")

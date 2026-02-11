@@ -9,7 +9,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
 import fortran_scan as fscan
@@ -22,9 +22,11 @@ DO_RE = re.compile(
 END_DO_RE = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
 IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
 END_IF_RE = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
+ELSE_RE = re.compile(r"^\s*else\b", re.IGNORECASE)
 ONE_LINE_IF_RE = re.compile(r"^\s*if\s*\((.+)\)\s*(.+)$", re.IGNORECASE)
 ASSIGN_RE = re.compile(r"^\s*(.+?)\s*=\s*(.+)$", re.IGNORECASE)
 ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
+TYPE_DECL_RE = re.compile(r"^\s*(integer|real|logical|character|complex|type\b|class\b)", re.IGNORECASE)
 SIMPLE_NAME_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*$", re.IGNORECASE)
 INDEXED_NAME_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*$", re.IGNORECASE)
 ADD_ACC_RE = re.compile(
@@ -39,6 +41,13 @@ ADD_ONE_RE = re.compile(
     r"^\s*([a-z][a-z0-9_]*)\s*\+\s*1(?:\.0+)?(?:_[a-z0-9]+)?\s*$",
     re.IGNORECASE,
 )
+ZERO_LITERAL_RE = re.compile(r"^\s*[+-]?0(?:\.0+)?(?:_[a-z0-9_]+)?\s*$", re.IGNORECASE)
+NUM_LITERAL_RE = re.compile(
+    r"^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[deq][+-]?\d+)?(?:_[a-z0-9_]+)?\s*$",
+    re.IGNORECASE,
+)
+LOGICAL_LITERAL_RE = re.compile(r"^\s*\.(?:true|false)\.\s*$", re.IGNORECASE)
+CHAR_LITERAL_RE = re.compile(r"^\s*(['\"]).*\1\s*$", re.IGNORECASE)
 
 BEGIN_TAG = "!! beginning of code that xarray.py suggests replacing"
 END_TAG = "!! end of code that xarray.py suggests replacing"
@@ -59,6 +68,8 @@ class Finding:
 
 
 CMP_RE = re.compile(r"^\s*(.+?)\s*(<=|>=|<|>)\s*(.+?)\s*$", re.IGNORECASE)
+IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+CALL_LIKE_RE = re.compile(r"\b([a-z][a-z0-9_]*)\s*\(", re.IGNORECASE)
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -130,6 +141,64 @@ def split_top_level_commas(text: str) -> List[str]:
     if tail:
         out.append(tail)
     return out
+
+
+def split_code_comment(line: str) -> Tuple[str, str]:
+    """Split one line into code and trailing comment, respecting quotes."""
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < len(line) and line[i + 1] == "'":
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < len(line) and line[i + 1] == '"':
+                i += 2
+                continue
+            in_double = not in_double
+            i += 1
+            continue
+        if ch == "!" and not in_single and not in_double:
+            return line[:i], line[i:]
+        i += 1
+    return line, ""
+
+
+def strip_quoted_text(text: str) -> str:
+    """Replace quoted contents with spaces for token scanning."""
+    out: List[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < len(text) and text[i + 1] == "'":
+                out.append("  ")
+                i += 2
+                continue
+            in_single = not in_single
+            out.append(" ")
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < len(text) and text[i + 1] == '"':
+                out.append("  ")
+                i += 2
+                continue
+            in_double = not in_double
+            out.append(" ")
+            i += 1
+            continue
+        out.append(" " if (in_single or in_double) else ch)
+        i += 1
+    return "".join(out)
 
 
 def replace_index_with_slice(expr: str, idx_var: str, lb: str, ub: str) -> str:
@@ -219,6 +288,48 @@ def parse_rank1_decl_bounds(unit: xunset.Unit) -> Dict[str, str]:
                 if not d:
                     continue
                 out.setdefault(name, f"1:{d}")
+    return out
+
+
+def collect_rank1_array_names(unit: xunset.Unit) -> Set[str]:
+    """Collect rank-1 array names (including assumed/deferred shape) declared in one unit."""
+    out: Set[str] = set()
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low or "::" not in low:
+            continue
+        if not re.match(r"^\s*(integer|real|logical|character|complex|type\b|class\b)", low, re.IGNORECASE):
+            continue
+        rhs = low.split("::", 1)[1]
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            if not dims or "," in dims:
+                continue
+            out.add(name)
     return out
 
 
@@ -312,6 +423,71 @@ def maybe_elementwise(
     return f"{lhs_expr} = {rhs_sliced}"
 
 
+def maybe_temp_then_elementwise(
+    loop_var: str,
+    rng: str,
+    stmt_temp: str,
+    stmt_body: str,
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+) -> Optional[str]:
+    """Detect temp-scalar then elementwise assignment and inline temp expression."""
+    m1 = ASSIGN_RE.match(stmt_temp.strip())
+    m2 = ASSIGN_RE.match(stmt_body.strip())
+    if not m1 or not m2:
+        return None
+
+    temp_name_m = SIMPLE_NAME_RE.match(m1.group(1).strip())
+    if not temp_name_m:
+        return None
+    temp_name = temp_name_m.group(1)
+    rhs1 = m1.group(2).strip()
+
+    lhs2 = m2.group(1).strip()
+    rhs2 = m2.group(2).strip()
+    m_lhs2 = INDEXED_NAME_RE.match(lhs2)
+    if not m_lhs2:
+        return None
+    lhs_name = m_lhs2.group(1)
+    lhs_idx = m_lhs2.group(2).lower()
+    if lhs_idx != loop_var.lower():
+        return None
+    if lhs_name.lower() == temp_name.lower():
+        return None
+    if not re.search(rf"\b{re.escape(temp_name)}\b", rhs2, re.IGNORECASE):
+        return None
+
+    lb, ubtxt = split_range(rng)
+    rhs1_s = replace_index_with_slice(rhs1, loop_var, lb, ubtxt)
+    if has_loop_var(rhs1_s, loop_var):
+        return None
+    rhs2_s = replace_index_with_slice(rhs2, loop_var, lb, ubtxt)
+    rhs2_s = re.sub(
+        rf"\b{re.escape(temp_name)}\b\s*\*\s*\b{re.escape(temp_name)}\b",
+        f"(({rhs1_s})**2)",
+        rhs2_s,
+        flags=re.IGNORECASE,
+    )
+    rhs2_inlined = re.sub(
+        rf"\b{re.escape(temp_name)}\b",
+        f"({rhs1_s})",
+        rhs2_s,
+        flags=re.IGNORECASE,
+    )
+    if has_loop_var(rhs2_inlined, loop_var):
+        return None
+
+    lhs_expr = f"{lhs_name}({rng})"
+    bnd = decl_bounds.get(lhs_name.lower())
+    if bnd is not None and normalize_expr(rng) == normalize_expr(bnd):
+        lhs_expr = lhs_name
+    elif can_collapse_lhs_alloc(lhs_name, rng, alloc_map):
+        lhs_expr = lhs_name
+
+    rhs2_inlined = simplify_section_expr(rhs2_inlined, decl_bounds)
+    return f"{lhs_expr} = {rhs2_inlined}"
+
+
 def maybe_reduction_sum(
     loop_var: str,
     rng: str,
@@ -386,6 +562,104 @@ def maybe_reduction_product(
         return None
     expr_sliced = simplify_section_expr(expr_sliced, decl_bounds={})
     return f"{acc_name_lhs} = product({expr_sliced})"
+
+
+def maybe_nested_inner_sum(
+    outer_loop_var: str,
+    init_stmt: str,
+    inner_do_stmt: str,
+    inner_body_stmt: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect y(i)=0; do j...; y(i)=y(i)+expr(j,...); end do -> y(i)=sum(expr(...))."""
+    m_init = ASSIGN_RE.match(init_stmt.strip())
+    if not m_init:
+        return None
+    lhs = m_init.group(1).strip()
+    rhs0 = m_init.group(2).strip()
+    m_lhs = INDEXED_NAME_RE.match(lhs)
+    if not m_lhs:
+        return None
+    if m_lhs.group(2).lower() != outer_loop_var.lower():
+        return None
+    if not ZERO_LITERAL_RE.match(rhs0):
+        return None
+
+    m_do = DO_RE.match(inner_do_stmt.strip())
+    if not m_do:
+        return None
+    inner_var = m_do.group(1)
+    inner_rng = build_range(m_do.group(2), m_do.group(3), m_do.group(4))
+    lb, ubtxt = split_range(inner_rng)
+
+    m_acc = ASSIGN_RE.match(inner_body_stmt.strip())
+    if not m_acc:
+        return None
+    lhs2 = m_acc.group(1).strip()
+    if normalize_expr(lhs2) != normalize_expr(lhs):
+        return None
+    m_add = re.match(r"^\s*(.+?)\s*\+\s*(.+)$", m_acc.group(2).strip(), re.IGNORECASE)
+    if not m_add:
+        return None
+    if normalize_expr(m_add.group(1)) != normalize_expr(lhs):
+        return None
+    expr = m_add.group(2).strip()
+
+    expr_s = replace_index_with_slice(expr, inner_var, lb, ubtxt)
+    if has_loop_var(expr_s, inner_var):
+        return None
+    if expr_s == expr:
+        return None
+    expr_s = simplify_section_expr(expr_s, decl_bounds)
+    return f"{lhs} = sum({expr_s})"
+
+
+def has_nonarray_call(expr: str, array_names: Set[str]) -> bool:
+    """Conservative call detector: true when expr has call-like name(...) not known as array."""
+    s = strip_quoted_text(expr.lower())
+    for m in CALL_LIKE_RE.finditer(s):
+        name = m.group(1).lower()
+        if name in array_names:
+            continue
+        return True
+    return False
+
+
+def maybe_loop_to_concurrent_or_forall(
+    loop_var: str,
+    rng: str,
+    body_stmt: str,
+    *,
+    allow_concurrent: bool,
+    allow_forall: bool,
+    array_names: Set[str],
+) -> Optional[Tuple[str, str]]:
+    """Detect simple one-statement loop and suggest one-line DO CONCURRENT or FORALL."""
+    m = ASSIGN_RE.match(body_stmt.strip())
+    if not m:
+        return None
+    lhs = m.group(1).strip()
+    rhs = m.group(2).strip()
+    m_lhs = INDEXED_NAME_RE.match(lhs)
+    if not m_lhs:
+        return None
+    lhs_name = m_lhs.group(1).lower()
+    lhs_idx = m_lhs.group(2).lower()
+    if lhs_idx != loop_var.lower():
+        return None
+
+    # Conservative dependence block: if rhs references lhs at all, skip.
+    if re.search(rf"\b{re.escape(lhs_name)}\s*\(", rhs, re.IGNORECASE):
+        return None
+
+    if allow_concurrent:
+        # Conservative purity proxy for concurrent mode: reject non-array calls.
+        if not has_nonarray_call(rhs, array_names):
+            return f"do concurrent ({loop_var} = {rng}) {body_stmt.strip()}", "one_line_do_concurrent"
+
+    if allow_forall:
+        return f"forall ({loop_var} = {rng}) {body_stmt.strip()}", "one_line_forall"
+    return None
 
 
 def maybe_masked_sum(
@@ -696,6 +970,84 @@ def maybe_extreme_loc_block(
     return f"{val_stmt}; {idx_stmt}"
 
 
+def is_simple_merge_source(expr: str) -> bool:
+    """True when expression is a simple scalar literal/name safe for MERGE sources."""
+    s = expr.strip()
+    if SIMPLE_NAME_RE.match(s):
+        return True
+    if NUM_LITERAL_RE.match(s):
+        return True
+    if LOGICAL_LITERAL_RE.match(s):
+        return True
+    if CHAR_LITERAL_RE.match(s):
+        return True
+    return False
+
+
+def maybe_conditional_set(
+    loop_var: str,
+    rng: str,
+    if_stmt: str,
+    true_stmt: str,
+    false_stmt: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[Tuple[str, str]]:
+    """Detect elementwise IF/ELSE assignment and suggest MERGE or WHERE/ELSEWHERE."""
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    if not mif:
+        return None
+    mt = ASSIGN_RE.match(true_stmt.strip())
+    mf = ASSIGN_RE.match(false_stmt.strip())
+    if not mt or not mf:
+        return None
+
+    mlt = INDEXED_NAME_RE.match(mt.group(1).strip())
+    mlf = INDEXED_NAME_RE.match(mf.group(1).strip())
+    if not mlt or not mlf:
+        return None
+    if mlt.group(1).lower() != mlf.group(1).lower():
+        return None
+    if mlt.group(2).lower() != loop_var.lower() or mlf.group(2).lower() != loop_var.lower():
+        return None
+    lhs_name = mlt.group(1)
+
+    lb, ubtxt = split_range(rng)
+    cond = mif.group(1).strip()
+    rhs_t = mt.group(2).strip()
+    rhs_f = mf.group(2).strip()
+
+    cond_s = replace_index_with_slice(cond, loop_var, lb, ubtxt)
+    rhs_t_s = replace_index_with_slice(rhs_t, loop_var, lb, ubtxt)
+    rhs_f_s = replace_index_with_slice(rhs_f, loop_var, lb, ubtxt)
+    if has_loop_var(cond_s, loop_var) or has_loop_var(rhs_t_s, loop_var) or has_loop_var(rhs_f_s, loop_var):
+        return None
+    if cond_s == cond:
+        return None
+
+    lhs_expr = f"{lhs_name}({rng})"
+    bnd = decl_bounds.get(lhs_name.lower())
+    if bnd is not None and normalize_expr(rng) == normalize_expr(bnd):
+        lhs_expr = lhs_name
+
+    cond_s = simplify_section_expr(cond_s, decl_bounds)
+    rhs_t_s = simplify_section_expr(rhs_t_s, decl_bounds)
+    rhs_f_s = simplify_section_expr(rhs_f_s, decl_bounds)
+
+    if is_simple_merge_source(rhs_t_s) and is_simple_merge_source(rhs_f_s):
+        return f"{lhs_expr} = merge({rhs_t_s}, {rhs_f_s}, {cond_s})", "elementwise_conditional_merge"
+
+    where_s = "\n".join(
+        [
+            f"where ({cond_s})",
+            f"   {lhs_expr} = {rhs_t_s}",
+            "elsewhere",
+            f"   {lhs_expr} = {rhs_f_s}",
+            "end where",
+        ]
+    )
+    return where_s, "elementwise_conditional_where"
+
+
 def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     """Analyze one unit for simple loop-to-array opportunities."""
     findings: List[Finding] = []
@@ -799,6 +1151,96 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     i += 3
                     continue
 
+        # Form A2: two-statement loop body (temp + elementwise assignment).
+        if i + 3 < len(body):
+            _ln_s1, stmt_s1 = body[i + 1]
+            _ln_s2, stmt_s2 = body[i + 2]
+            ln_end, stmt_end = body[i + 3]
+            if END_DO_RE.match(stmt_end.strip()):
+                sugg_temp_elem = maybe_temp_then_elementwise(loop_var, rng, stmt_s1, stmt_s2, decl_bounds, alloc_map)
+                if sugg_temp_elem is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="elementwise_inline_temp",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_temp_elem,
+                        )
+                    )
+                    i += 4
+                    continue
+
+        # Form A3: nested inner reduction inside outer loop:
+        # do i=...
+        #    y(i)=0
+        #    do j=...
+        #       y(i)=y(i)+expr
+        #    end do
+        # end do
+        if i + 5 < len(body):
+            _ln_init, stmt_init = body[i + 1]
+            _ln_ido, stmt_ido = body[i + 2]
+            _ln_ibody, stmt_ibody = body[i + 3]
+            ln_iend, stmt_iend = body[i + 4]
+            ln_oend, stmt_oend = body[i + 5]
+            if END_DO_RE.match(stmt_iend.strip()) and END_DO_RE.match(stmt_oend.strip()):
+                sugg_nested = maybe_nested_inner_sum(loop_var, stmt_init, stmt_ido, stmt_ibody, decl_bounds)
+                if sugg_nested is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="nested_reduction_sum",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=_ln_init,
+                            end_line=ln_iend,
+                            suggestion=sugg_nested,
+                        )
+                    )
+                    i += 6
+                    continue
+
+        # Form D: IF/ELSE block inside loop body:
+        # do ...
+        #    if (cond) then
+        #       lhs(i) = tsource
+        #    else
+        #       lhs(i) = fsource
+        #    end if
+        # end do
+        if i + 6 < len(body):
+            _ln_if, stmt_if = body[i + 1]
+            _ln_t, stmt_t = body[i + 2]
+            _ln_else, stmt_else = body[i + 3]
+            _ln_f, stmt_f = body[i + 4]
+            _ln_eif, stmt_eif = body[i + 5]
+            ln_end, stmt_end = body[i + 6]
+            if (
+                IF_THEN_RE.match(stmt_if.strip())
+                and ELSE_RE.match(stmt_else.strip())
+                and END_IF_RE.match(stmt_eif.strip())
+                and END_DO_RE.match(stmt_end.strip())
+            ):
+                sugg_cond = maybe_conditional_set(loop_var, rng, stmt_if, stmt_t, stmt_f, decl_bounds)
+                if sugg_cond is not None:
+                    suggestion, rule = sugg_cond
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule=rule,
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=suggestion,
+                        )
+                    )
+                    i += 7
+                    continue
+
         # Form B: IF-block inside loop body:
         # do ...
         #    if (cond) then
@@ -891,6 +1333,88 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     return findings
 
 
+def analyze_unit_concurrent_forall(
+    unit: xunset.Unit,
+    *,
+    allow_concurrent: bool,
+    allow_forall: bool,
+) -> List[Finding]:
+    """Analyze one unit for one-line DO CONCURRENT / FORALL rewrites."""
+    findings: List[Finding] = []
+    body = unit.body
+    decl_bounds = parse_rank1_decl_bounds(unit)
+    array_names = collect_rank1_array_names(unit)
+    i = 0
+    while i < len(body):
+        ln, stmt = body[i]
+        mdo = DO_RE.match(stmt.strip())
+        if not mdo:
+            i += 1
+            continue
+        if i + 2 >= len(body):
+            i += 1
+            continue
+        _ln_body, stmt_body = body[i + 1]
+        ln_end, stmt_end = body[i + 2]
+        if not END_DO_RE.match(stmt_end.strip()):
+            i += 1
+            continue
+        loop_var = mdo.group(1)
+        rng = build_range(mdo.group(2), mdo.group(3), mdo.group(4))
+        sug = maybe_loop_to_concurrent_or_forall(
+            loop_var,
+            rng,
+            stmt_body,
+            allow_concurrent=allow_concurrent,
+            allow_forall=allow_forall,
+            array_names=array_names,
+        )
+        if sug is not None:
+            suggestion, rule = sug
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule=rule,
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end,
+                    suggestion=suggestion,
+                )
+            )
+            i += 3
+            continue
+        # Also allow converted expression forms from existing elementwise detector
+        # before wrapping, if the one-line body itself is not directly eligible.
+        sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, {})
+        if sugg_elem is not None:
+            sug2 = maybe_loop_to_concurrent_or_forall(
+                loop_var,
+                rng,
+                sugg_elem,
+                allow_concurrent=allow_concurrent,
+                allow_forall=allow_forall,
+                array_names=array_names,
+            )
+            if sug2 is not None:
+                suggestion, rule = sug2
+                findings.append(
+                    Finding(
+                        path=unit.path,
+                        rule=rule,
+                        unit_kind=unit.kind,
+                        unit_name=unit.name,
+                        start_line=ln,
+                        end_line=ln_end,
+                        suggestion=suggestion,
+                    )
+                )
+                i += 3
+                continue
+        i += 1
+    return findings
+
+
 def analyze_file(path: Path) -> List[Finding]:
     """Analyze one file."""
     infos, any_missing = fscan.load_source_files([path])
@@ -901,6 +1425,146 @@ def analyze_file(path: Path) -> List[Finding]:
     for unit in xunset.collect_units(finfo):
         out.extend(analyze_unit(unit))
     return out
+
+
+def analyze_file_concurrent_forall(
+    path: Path,
+    *,
+    allow_concurrent: bool,
+    allow_forall: bool,
+) -> List[Finding]:
+    """Analyze one source file for one-line DO CONCURRENT / FORALL rewrites."""
+    infos, any_missing = fscan.load_source_files([path])
+    if not infos or any_missing:
+        return []
+    finfo = infos[0]
+    out: List[Finding] = []
+    for unit in xunset.collect_units(finfo):
+        out.extend(
+            analyze_unit_concurrent_forall(
+                unit,
+                allow_concurrent=allow_concurrent,
+                allow_forall=allow_forall,
+            )
+        )
+    return out
+
+
+def parse_decl_entities(chunk_rhs: str) -> List[Tuple[str, str]]:
+    """Parse declaration RHS into (name, raw_chunk)."""
+    out: List[Tuple[str, str]] = []
+    for chunk in split_top_level_commas(chunk_rhs):
+        txt = chunk.strip()
+        if not txt:
+            continue
+        m = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+        if not m:
+            continue
+        out.append((m.group(1).lower(), txt))
+    return out
+
+
+def remove_unused_locals_from_lines(lines: List[str], path: Path) -> Tuple[List[str], List[str]]:
+    """Remove clearly unused local scalar declaration entities; return (lines, removed_names)."""
+    temp_text = "".join(lines)
+    # Parse via scanner on synthetic lines.
+    parsed_lines = temp_text.splitlines()
+    finfo = fscan.SourceFileInfo(
+        path=path,
+        lines=parsed_lines,
+        parsed_lines=parsed_lines,
+        procedures=fscan.parse_procedures(parsed_lines),
+        defined_modules=set(),
+        used_modules=set(),
+        generic_interfaces={},
+    )
+    units = xunset.collect_units(finfo)
+    if not units:
+        return lines, []
+
+    remove_by_line: Dict[int, Set[str]] = {}
+    removed_names: List[str] = []
+
+    for unit in units:
+        declared: Dict[str, int] = {}
+        decl_chunks_by_line: Dict[int, List[Tuple[str, str]]] = {}
+        used: Set[str] = set()
+
+        for ln, stmt in unit.body:
+            low = stmt.strip().lower()
+            if not low:
+                continue
+            if TYPE_DECL_RE.match(low) and "::" in low:
+                attrs = low.split("::", 1)[0]
+                # Keep declaration classes that are risky or special.
+                if any(
+                    a in attrs
+                    for a in ("parameter", "allocatable", "pointer", "target", "save", "intent", "optional")
+                ):
+                    continue
+                rhs = low.split("::", 1)[1]
+                ents = parse_decl_entities(rhs)
+                if not ents:
+                    continue
+                kept_ents: List[Tuple[str, str]] = []
+                for n, raw_chunk in ents:
+                    # Conservative: only simple scalar entities without init/dims/pointer-assoc.
+                    if "(" in raw_chunk or "=" in raw_chunk or "=>" in raw_chunk:
+                        continue
+                    declared[n] = ln
+                    kept_ents.append((n, raw_chunk))
+                if kept_ents:
+                    decl_chunks_by_line[ln] = kept_ents
+                continue
+
+            txt = strip_quoted_text(low)
+            for m in IDENT_RE.finditer(txt):
+                used.add(m.group(1).lower())
+
+        # Dummies should never be removed.
+        used.update(unit.dummy_names)
+        for n, ln in declared.items():
+            if n in used:
+                continue
+            remove_by_line.setdefault(ln, set()).add(n)
+            removed_names.append(f"{unit.name}:{n}")
+
+    if not remove_by_line:
+        return lines, []
+
+    # Apply declaration-entity removals by physical line.
+    new_lines = list(lines)
+    for ln in sorted(remove_by_line.keys(), reverse=True):
+        idx = ln - 1
+        if idx < 0 or idx >= len(new_lines):
+            continue
+        raw = new_lines[idx]
+        eol = ""
+        body = raw
+        if body.endswith("\r\n"):
+            body, eol = body[:-2], "\r\n"
+        elif body.endswith("\n"):
+            body, eol = body[:-1], "\n"
+        code, comment = split_code_comment(body)
+        low = code.strip().lower()
+        if "::" not in low or not TYPE_DECL_RE.match(low):
+            continue
+        left, rhs = code.split("::", 1)
+        ents = parse_decl_entities(rhs)
+        keep_raw: List[str] = []
+        for n, raw_chunk in ents:
+            if n in remove_by_line.get(ln, set()):
+                continue
+            keep_raw.append(raw_chunk.strip())
+        if not keep_raw:
+            # Drop full declaration line.
+            new_lines.pop(idx)
+            continue
+        new_code = f"{left.strip()} :: {', '.join(keep_raw)}"
+        prefix = re.match(r"^\s*", body).group(0) if body else ""
+        new_lines[idx] = f"{prefix}{new_code}{comment}{eol}"
+
+    return new_lines, sorted(set(removed_names))
 
 
 def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Path]]:
@@ -923,15 +1587,19 @@ def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Pa
 
         begin_msg = f"{indent_s}{BEGIN_TAG}{eol_s}"
         end_msg = f"{indent_e}{END_TAG}{eol_e}"
-        sugg_msg = f"{indent_e}! {f.suggestion} !! suggested replacement by xarray.py{eol_e}"
+        sug_lines = f.suggestion.splitlines() if "\n" in f.suggestion else [f.suggestion]
+        sugg_msgs = [f"{indent_e}! {sl} !! suggested replacement by xarray.py{eol_e}" for sl in sug_lines]
 
         # Skip if already annotated around this range.
         if sidx - 1 >= 0 and lines[sidx - 1].strip().lower() == BEGIN_TAG.lower():
             continue
         lines.insert(eidx + 1, end_msg)
-        lines.insert(eidx + 2, sugg_msg)
+        insert_at = eidx + 2
+        for sm in sugg_msgs:
+            lines.insert(insert_at, sm)
+            insert_at += 1
         lines.insert(sidx, begin_msg)
-        inserted += 3
+        inserted += 2 + len(sugg_msgs)
 
     if inserted == 0:
         return 0, None
@@ -941,10 +1609,12 @@ def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Pa
     return inserted, backup
 
 
-def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = False) -> Tuple[int, Optional[Path]]:
-    """Replace suggested blocks with array-operation statements."""
+def apply_fix_file(
+    path: Path, findings: List[Finding], *, annotate: bool = False
+) -> Tuple[int, Optional[Path], List[str]]:
+    """Replace suggested blocks with array-operation statements and prune unused locals."""
     if not findings:
-        return 0, None
+        return 0, None, []
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     changed = 0
     for f in sorted(findings, key=lambda x: (x.start_line, x.end_line), reverse=True):
@@ -955,16 +1625,20 @@ def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = Fals
         raw_s = lines[sidx]
         eol = "\r\n" if raw_s.endswith("\r\n") else ("\n" if raw_s.endswith("\n") else "\n")
         indent = re.match(r"^\s*", raw_s).group(0) if raw_s else ""
-        comment = f"  {CHANGED_TAG}" if annotate else ""
-        repl = f"{indent}{f.suggestion}{comment}{eol}"
-        lines[sidx : eidx + 1] = [repl]
+        sug_lines = f.suggestion.splitlines() if "\n" in f.suggestion else [f.suggestion]
+        repl_lines: List[str] = []
+        for j, sl in enumerate(sug_lines):
+            suffix = f"  {CHANGED_TAG}" if (annotate and j == len(sug_lines) - 1) else ""
+            repl_lines.append(f"{indent}{sl}{suffix}{eol}")
+        lines[sidx : eidx + 1] = repl_lines
         changed += 1
     if changed == 0:
-        return 0, None
+        return 0, None, []
+    lines, removed_locals = remove_unused_locals_from_lines(lines, path)
     backup = make_backup_path(path)
     shutil.copy2(path, backup)
     path.write_text("".join(lines), encoding="utf-8")
-    return changed, backup
+    return changed, backup, removed_locals
 
 
 def main() -> int:
@@ -978,6 +1652,16 @@ def main() -> int:
     parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
+    parser.add_argument(
+        "--concurrent",
+        action="store_true",
+        help="Use one-line DO CONCURRENT rewrite mode for eligible simple loops",
+    )
+    parser.add_argument(
+        "--forall",
+        action="store_true",
+        help="Use one-line FORALL rewrite mode for eligible simple loops",
+    )
     args = parser.parse_args()
     if args.diff and not args.fix:
         print("--diff requires --fix.")
@@ -990,7 +1674,16 @@ def main() -> int:
 
     findings: List[Finding] = []
     for p in files:
-        findings.extend(analyze_file(p))
+        if args.concurrent or args.forall:
+            findings.extend(
+                analyze_file_concurrent_forall(
+                    p,
+                    allow_concurrent=args.concurrent,
+                    allow_forall=args.forall,
+                )
+            )
+        else:
+            findings.extend(analyze_file(p))
 
     if not findings:
         print("No array-operation replacement candidates found.")
@@ -1014,11 +1707,13 @@ def main() -> int:
         total = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding="utf-8")
-            n, backup = apply_fix_file(p, by_file[p], annotate=args.annotate)
+            n, backup, removed_locals = apply_fix_file(p, by_file[p], annotate=args.annotate)
             total += n
             if n > 0:
                 touched += 1
                 print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
+                if args.verbose and removed_locals:
+                    print(f"  removed unused locals: {', '.join(removed_locals)}")
                 if args.diff:
                     after = p.read_text(encoding="utf-8")
                     diff_lines = difflib.unified_diff(
