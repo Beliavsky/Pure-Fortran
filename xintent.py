@@ -525,6 +525,24 @@ def collect_proc_call_signatures(ordered_files: List[fscan.SourceFileInfo]) -> D
     return global_map
 
 
+def collect_provisional_proc_intents(ordered_files: List[fscan.SourceFileInfo]) -> Dict[str, Dict[str, str]]:
+    """Collect provisional per-procedure dummy intents inferred in current source state."""
+    out: Dict[str, Dict[str, str]] = {}
+    for finfo in ordered_files:
+        sug_in = analyze_intent_suggestions(finfo, target_intent="in", call_sigs=None, interproc=False)
+        sug_out = analyze_intent_suggestions(finfo, target_intent="out", call_sigs=None, interproc=False)
+        for s in sug_in + sug_out:
+            pkey = s.proc_name.lower()
+            bucket = out.setdefault(pkey, {})
+            cur = bucket.get(s.dummy.lower())
+            if cur is None:
+                bucket[s.dummy.lower()] = s.intent
+            elif cur != s.intent:
+                # Conflicting provisional intents are treated as unknown.
+                bucket.pop(s.dummy.lower(), None)
+    return out
+
+
 def parse_call_name_and_args(stmt: str) -> Optional[Tuple[str, List[str]]]:
     """Parse CALL name and top-level actual argument list."""
     m = re.search(r"\bcall\s+([a-z][a-z0-9_]*)\b", stmt, re.IGNORECASE)
@@ -1027,6 +1045,8 @@ def apply_fix(
     if changed == 0:
         return 0, None, []
 
+    updated = reorder_arg_decls_before_locals(updated)
+
     if show_diff:
         diff_to = str(out_path) if out_path is not None else str(finfo.path)
         diff = difflib.unified_diff(
@@ -1050,6 +1070,66 @@ def apply_fix(
     with target.open("w", encoding="utf-8", newline="") as f:
         f.write("".join(updated))
     return changed, backup_path, changed_items
+
+
+def reorder_arg_decls_before_locals(lines: List[str]) -> List[str]:
+    """Reorder simple declaration lines so dummy-arg declarations come before locals."""
+    parsed_lines = [ln.rstrip("\r\n") for ln in lines]
+    procs = sorted(fscan.parse_procedures(parsed_lines), key=lambda p: p.start)
+    if not procs:
+        return lines
+    stmts = fscan.iter_fortran_statements(parsed_lines)
+    out = lines[:]
+
+    for pidx, proc in enumerate(procs):
+        if not proc.dummy_names:
+            continue
+        ordered_dummies = parse_proc_header_ordered_dummies(parsed_lines[proc.start - 1])
+        if not ordered_dummies:
+            ordered_dummies = sorted(proc.dummy_names)
+        dummy_pos = {name: i for i, name in enumerate(ordered_dummies)}
+        next_start = procs[pidx + 1].start if pidx + 1 < len(procs) else (len(parsed_lines) + 1)
+        body = statements_in_range(stmts, proc.start, next_start)
+        decl_idxs: List[int] = []
+        arg_line_keys: Dict[int, int] = {}
+        local_idxs: List[int] = []
+
+        for ln, stmt in body:
+            low = stmt.lower().strip()
+            if not low or not TYPE_DECL_RE.match(low) or low.startswith("procedure"):
+                continue
+            idx = ln - 1
+            if idx < 0 or idx >= len(out):
+                continue
+            raw = out[idx].rstrip("\r\n")
+            # Skip complex physical lines; keep reordering conservative.
+            if ";" in raw or raw.rstrip().endswith("&") or raw.lstrip().startswith("&"):
+                continue
+            declared = parse_declared_names_any(low)
+            if not declared:
+                continue
+            decl_idxs.append(idx)
+            arg_names = [d for d in declared if d in dummy_pos]
+            if arg_names:
+                arg_line_keys[idx] = min(dummy_pos[d] for d in arg_names)
+            else:
+                local_idxs.append(idx)
+
+        if not arg_line_keys:
+            continue
+        arg_idxs = [idx for idx in decl_idxs if idx in arg_line_keys]
+
+        # Keep relative order for lines with the same argument position key.
+        arg_sorted = sorted(arg_idxs, key=lambda idx: (arg_line_keys[idx], idx))
+        want_order = arg_sorted + [idx for idx in decl_idxs if idx not in arg_line_keys]
+        have_order = decl_idxs
+        if want_order == have_order:
+            continue
+        repl = [out[i] for i in want_order]
+        for i, idx in enumerate(have_order):
+            out[idx] = repl[i]
+
+    return out
 
 
 def rollback_backups(backup_pairs: List[Tuple[Path, Path]]) -> None:
@@ -1180,6 +1260,14 @@ def main() -> int:
         backup_pairs: List[Tuple[Path, Path]] = []
         pass_changed = 0
         call_sigs = collect_proc_call_signatures(ordered_files) if args.interproc else None
+        if args.interproc and call_sigs is not None:
+            provisional = collect_provisional_proc_intents(ordered_files)
+            for pname, pints in provisional.items():
+                sig = call_sigs.get(pname)
+                if not isinstance(sig, CallSignature):
+                    continue
+                for dname, dint in pints.items():
+                    sig.intent_by_dummy.setdefault(dname, dint)
 
         for finfo in ordered_files:
             suggestions_in = analyze_intent_suggestions(
