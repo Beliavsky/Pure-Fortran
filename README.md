@@ -132,6 +132,7 @@ Notes:
 
 - Conservative analysis; ambiguous cases are left unchanged.
 - Handles multi-entity declarations (for example `integer :: i, j`) when adding intents.
+- Detailed inference rules are documented in [intent.md](intent.md).
 
 ### 2) `xpure.py`
 
