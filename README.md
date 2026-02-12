@@ -56,6 +56,18 @@ Main programs:
 - `xstrip.py` - strip annotations (`intent`, `pure/elemental/impure`, or both) for testing.
 - `xstrip_implicit_none.py` - strip `implicit none` statements for test-case generation.
 - `xstrip_use_only.py` - strip `use ..., only: ...` back to broad `use` for testing.
+- `xdecl.py` - advisory checker/fixer for declarations missing `::`.
+- `xend_name.py` - advisory checker/fixer for plain `end` statements, replacing with named forms (`end subroutine foo`, etc.).
+- `xspace.py` - advisory checker/fixer for spacing/layout normalization rules.
+- `xburkardt.py` - infer/apply `intent(in/out)` from Burkardt-style argument comment blocks.
+- `xmodule.py` - informational wrapper-checker for procedures outside modules, with compile test via temporary module wrapping.
+- `xfree.py` - fixed-form (`.f`) to free-form (`.f90`) converter with optional compile regression checks.
+- `xtest.py` - transform regression harness (baseline compile -> transform -> post-compile) over file lists.
+- `xcompile.py` - compile-only batch harness over file lists with resume/loop controls.
+- `xerror.py` - summarize warning/error kinds from compile logs (files/lines/hits per diagnostic kind).
+- `xsort_size.py` - sort a file list (such as `codes.txt`) by source file size.
+- `xoptions.py` - list option counts and option names for `x*.py` scripts.
+- `xrepeat.py` - utility helper for repeated harness execution workflows.
 - `xdiff.py` compares two versions of a Fortran module and reports structural differences, documented [here](/xdiff.md)
 
 Shared support modules:
@@ -80,6 +92,21 @@ Across tools:
 - `--backup` (default in fixing tools) writes `.bak` files before first modification.
 - `--compiler` enables compile checks; for fix pipelines this is strongly recommended.
 - `--git` commits changed files with an auto-generated message.
+
+## Common CLI Options
+
+Many fixer/checker scripts follow a shared CLI pattern.
+
+- `--fix`: apply edits instead of advisory reporting.
+- `--diff`: show unified diff for applied edits.
+- `--out <file>`: with `--fix`, write transformed output to a separate file (single-input mode).
+- `--backup` / `--no-backup`: control `.bak` backup creation when editing in place.
+- `--exclude <glob>`: skip matching files; repeatable.
+- `--compiler "<cmd>"`: run compile validation (`baseline`/`after-fix` where supported).
+- `--verbose`: print per-file details and/or full suggestions.
+- `--limit <n>`: cap number of files processed in a run (where supported).
+- `--resume`: continue from prior state for harness-style scripts (where supported).
+- `--loop`, `--max-loop`: rerun harness cycles with bounded retries (where supported).
 
 ## Tool-by-Tool
 
@@ -786,6 +813,147 @@ Notes:
   - `present(...)`-guarded optionals referenced in either source expression,
   - string-literal branch values with unequal character lengths,
   - complex branch expressions outside the supported simple-source subset.
+
+### 34) `xdecl.py`
+
+Advisory checker/fixer for declaration statements that omit `::`.
+
+Typical commands:
+
+```bash
+python xdecl.py
+python xdecl.py foo.f90 --verbose
+python xdecl.py foo.f90 --fix --diff
+```
+
+### 35) `xend_name.py`
+
+Advisory checker/fixer that replaces plain `end` with named forms such as `end subroutine foo`, `end function bar`, `end module m`.
+
+Typical commands:
+
+```bash
+python xend_name.py
+python xend_name.py foo.f90 --verbose
+python xend_name.py foo.f90 --fix --diff
+```
+
+### 36) `xspace.py`
+
+Advisory checker/fixer for spacing/layout normalization rules (parenthesis spacing, blank-line normalization, procedure separation, and related formatting cleanup).
+
+Typical commands:
+
+```bash
+python xspace.py
+python xspace.py foo.f90 --verbose
+python xspace.py foo.f90 --fix --diff
+python xspace.py foo.f90 --fix --disable 2,4
+```
+
+### 37) `xburkardt.py`
+
+Reads Burkardt-style argument comment blocks and applies matching `intent(in)`, `intent(out)`, or `intent(in out)` to declarations.
+
+Typical commands:
+
+```bash
+python xburkardt.py
+python xburkardt.py starpac.f90 --verbose
+```
+
+### 38) `xmodule.py`
+
+Informational checker: detects procedures outside modules, wraps them into a temporary generated module in `temp.f90`, and compile-checks the wrapped file.
+
+Typical commands:
+
+```bash
+python xmodule.py foo.f90
+python xmodule.py --codes codes.txt --compile-cmd "gfortran -c {file}"
+python xmodule.py c:\fortran\**\*.f90 --verbose
+```
+
+### 39) `xfree.py`
+
+Converts fixed-form `.f` sources to free-form `.f90` in the same directory, with optional compile regression checks.
+
+Typical commands:
+
+```bash
+python xfree.py foo.f
+python xfree.py c:\fortran\lapack --recursive --overwrite
+python xfree.py c:\fortran\lapack --recursive --overwrite --check --fail-fast
+```
+
+### 40) `xtest.py`
+
+Transform harness: copy source to `temp.f90`, baseline compile, run transform command, post-transform compile, and stop/report on transform or post-compile failure.
+
+Typical commands:
+
+```bash
+python xtest.py --transform-cmd "python xintent.py --fix"
+python xtest.py --transform-cmd "python xpure.py --fix" --compile-cmd "gfortran -c -w -fmax-errors=1 {file}" --codes codes.txt
+python xtest.py --transform-cmd "python xintent.py --fix" --resume --loop --max-loop 20
+```
+
+### 41) `xcompile.py`
+
+Compile-only harness for file lists/globs, with resume/loop controls and optional fast-fail mode.
+
+Typical commands:
+
+```bash
+python xcompile.py --codes codes.txt
+python xcompile.py --codes codes.txt --compile-cmd "gfortran -c -O0 -Wall {file}"
+python xcompile.py --codes codes.txt --resume --limit 500
+python xcompile.py --codes codes.txt --fast-fail
+```
+
+### 42) `xerror.py`
+
+Parses `xcompile.py` output logs and summarizes warning/error kinds by file count, source-line count, and total hits.
+
+Typical commands:
+
+```bash
+python xerror.py
+python xerror.py burkardt_errors.txt
+```
+
+### 43) `xsort_size.py`
+
+Sorts a newline-delimited source list (for example `codes.txt`) by file size ascending.
+
+Typical commands:
+
+```bash
+python xsort_size.py codes.txt
+python xsort_size.py codes.txt --output codes_size_sorted.txt
+```
+
+### 44) `xoptions.py`
+
+Reports long-option inventories for `x*.py` scripts (option count plus names).
+
+Typical commands:
+
+```bash
+python xoptions.py
+python xoptions.py xintent.py xpure.py xarray.py
+```
+
+### 45) `xrepeat.py`
+
+Advisory finder for repeated IF conditions and repeated expressions in straight-line blocks.
+
+Typical commands:
+
+```bash
+python xrepeat.py
+python xrepeat.py foo.f90 --verbose
+```
 
 ## Recommended Transformation Order
 
