@@ -34,6 +34,11 @@ CALL_RE = re.compile(r"\bcall\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 EXTERNAL_STMT_RE = re.compile(r"^\s*external\b(.*)$", re.IGNORECASE)
 WRITE_START_RE = re.compile(r"^\s*write\s*\(", re.IGNORECASE)
 DO_ITER_RE = re.compile(r"^\s*do\b(?:\s+\d+\s+)?\s*([a-z][a-z0-9_]*)\s*=", re.IGNORECASE)
+PROC_HEADER_ARGS_RE = re.compile(
+    r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\s+"
+    r"[a-z][a-z0-9_]*\s*\(([^)]*)\)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -46,6 +51,14 @@ class IntentSuggestion:
     decl_line: int
     fixable: bool
     intent: str
+
+
+@dataclass
+class CallSignature:
+    """Interprocedural call signature for one procedure name."""
+
+    ordered_dummies: List[str]
+    intent_by_dummy: Dict[str, str]  # in/out/inout
 
 
 def add_summary_item(summary: Dict[Tuple[str, str], List[str]], s: IntentSuggestion) -> None:
@@ -432,6 +445,144 @@ def parse_declared_array_flags(code_line: str) -> Dict[str, bool]:
     return out
 
 
+def parse_decl_intent(code_line: str) -> Optional[str]:
+    """Extract intent from declaration attributes; value implies read-only."""
+    low = code_line.lower()
+    if re.search(r"\bvalue\b", low):
+        return "in"
+    m = re.search(r"\bintent\s*\(\s*(in\s*out|inout|in|out)\s*\)", low)
+    if not m:
+        return None
+    tok = re.sub(r"\s+", "", m.group(1).lower())
+    if tok == "in":
+        return "in"
+    if tok == "out":
+        return "out"
+    return "inout"
+
+
+def parse_proc_header_ordered_dummies(stmt: str) -> List[str]:
+    """Parse ordered dummy names from a procedure header statement."""
+    m = PROC_HEADER_ARGS_RE.match(stmt.strip())
+    if not m:
+        return []
+    raw = m.group(1).strip()
+    if not raw:
+        return []
+    out: List[str] = []
+    for tok in split_decl_entities(raw):
+        mm = re.match(r"^\s*([a-z][a-z0-9_]*)\s*$", tok, re.IGNORECASE)
+        if mm:
+            out.append(mm.group(1).lower())
+    return out
+
+
+def collect_proc_call_signatures(ordered_files: List[fscan.SourceFileInfo]) -> Dict[str, Optional[CallSignature]]:
+    """Collect callee dummy intent signatures; mark ambiguous names as None."""
+    global_map: Dict[str, Optional[CallSignature]] = {}
+    for finfo in ordered_files:
+        sorted_procs = sorted(finfo.procedures, key=lambda p: p.start)
+        all_stmts = fscan.iter_fortran_statements(finfo.parsed_lines)
+        for pidx, proc in enumerate(sorted_procs):
+            if not proc.dummy_names:
+                continue
+            next_start = sorted_procs[pidx + 1].start if pidx + 1 < len(sorted_procs) else (len(finfo.parsed_lines) + 1)
+            body_stmts = statements_in_range(all_stmts, proc.start, next_start)
+            start_stmt = ""
+            for ln, stmt in body_stmts:
+                if ln == proc.start:
+                    start_stmt = stmt
+                    break
+            ordered_dummies = parse_proc_header_ordered_dummies(start_stmt)
+            if not ordered_dummies:
+                ordered_dummies = sorted(proc.dummy_names)
+
+            intent_by_dummy: Dict[str, str] = {}
+            for _ln, code in body_stmts:
+                low = code.lower().strip()
+                if not low or not TYPE_DECL_RE.match(low):
+                    continue
+                declared = parse_declared_names_any(low)
+                if not declared:
+                    continue
+                intent = parse_decl_intent(low)
+                if intent is None:
+                    continue
+                for d in ordered_dummies:
+                    if d in declared and d not in intent_by_dummy:
+                        intent_by_dummy[d] = intent
+
+            sig = CallSignature(ordered_dummies=ordered_dummies, intent_by_dummy=intent_by_dummy)
+            key = proc.name.lower()
+            prev = global_map.get(key)
+            if prev is None and key in global_map:
+                continue
+            if prev is None:
+                global_map[key] = sig
+                continue
+            if prev.ordered_dummies != sig.ordered_dummies or prev.intent_by_dummy != sig.intent_by_dummy:
+                global_map[key] = None
+    return global_map
+
+
+def parse_call_name_and_args(stmt: str) -> Optional[Tuple[str, List[str]]]:
+    """Parse CALL name and top-level actual argument list."""
+    m = re.search(r"\bcall\s+([a-z][a-z0-9_]*)\b", stmt, re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1).lower()
+    tail = stmt[m.end() :]
+    lpar = tail.find("(")
+    if lpar < 0:
+        return name, []
+    i0 = lpar
+    depth = 0
+    in_single = False
+    in_double = False
+    i1 = -1
+    for i, ch in enumerate(tail[i0:], start=i0):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                i1 = i
+                break
+    if i1 < 0:
+        return name, []
+    inside = tail[i0 + 1 : i1].strip()
+    if not inside:
+        return name, []
+    return name, split_decl_entities(inside)
+
+
+def resolve_call_formal_intent(
+    sig: CallSignature,
+    actual: str,
+    index: int,
+) -> Optional[str]:
+    """Resolve formal dummy intent for one actual arg by keyword or position."""
+    kv = top_level_equals(actual)
+    if kv is not None:
+        formal = kv[0].strip().lower()
+        if formal in sig.intent_by_dummy:
+            return sig.intent_by_dummy[formal]
+        return None
+    if index >= len(sig.ordered_dummies):
+        return None
+    formal = sig.ordered_dummies[index]
+    return sig.intent_by_dummy.get(formal)
+
+
 def is_declaration_statement(stmt: str) -> bool:
     """Return whether stmt is a declaration statement."""
     s = stmt.strip().lower()
@@ -572,6 +723,8 @@ def rewrite_decl_line_with_intents(line: str, intents_by_name: Dict[str, str]) -
 def analyze_intent_suggestions(
     finfo: fscan.SourceFileInfo,
     target_intent: str = "in",
+    call_sigs: Optional[Dict[str, Optional[CallSignature]]] = None,
+    interproc: bool = False,
 ) -> List[IntentSuggestion]:
     """Suggest dummy arguments that can be marked with the target intent."""
     out: List[IntentSuggestion] = []
@@ -673,11 +826,32 @@ def analyze_intent_suggestions(
                             first_event[d] = (ln, "write")
 
             if CALL_RE.search(low_exec):
-                for d in proc.dummy_names:
-                    if re.search(rf"\b{re.escape(d)}\b", low_exec):
-                        maybe_written_via_call.add(d)
-                        if d not in first_event:
-                            first_event[d] = (ln, "call")
+                parsed_call = parse_call_name_and_args(low_exec)
+                if parsed_call is None:
+                    parsed_call = ("", [])
+                callee, actuals = parsed_call
+                callee_sig = call_sigs.get(callee) if (interproc and call_sigs is not None and callee) else None
+                for ai, act in enumerate(actuals):
+                    expr = top_level_equals(act)[1] if top_level_equals(act) is not None else act
+                    d = fscan.base_identifier(expr)
+                    if d not in proc.dummy_names:
+                        continue
+                    if interproc and isinstance(callee_sig, CallSignature):
+                        fint = resolve_call_formal_intent(callee_sig, act, ai)
+                        if fint == "in":
+                            reads.add(d)
+                            if d not in first_event:
+                                first_event[d] = (ln, "read")
+                            continue
+                    maybe_written_via_call.add(d)
+                    if d not in first_event:
+                        first_event[d] = (ln, "call")
+                if not actuals:
+                    for d in proc.dummy_names:
+                        if re.search(rf"\b{re.escape(d)}\b", low_exec):
+                            maybe_written_via_call.add(d)
+                            if d not in first_event:
+                                first_event[d] = (ln, "call")
 
             write_unit = extract_write_unit_base(low_exec)
             if write_unit in proc.dummy_names:
@@ -923,6 +1097,14 @@ def main() -> int:
         default=10,
         help="Maximum iterations for --iterate (default: 10)",
     )
+    parser.add_argument(
+        "--interproc",
+        action="store_true",
+        help=(
+            "Use conservative interprocedural call intent analysis: "
+            "CALL arguments mapped to known callee INTENT(IN)/VALUE are treated as read-only"
+        ),
+    )
     parser.add_argument("--limit", type=int, help="Maximum number of source files to process")
     args = parser.parse_args()
     if args.out is not None:
@@ -997,12 +1179,17 @@ def main() -> int:
         pass_suggest_summary: Dict[Tuple[str, str], List[str]] = {}
         backup_pairs: List[Tuple[Path, Path]] = []
         pass_changed = 0
+        call_sigs = collect_proc_call_signatures(ordered_files) if args.interproc else None
 
         for finfo in ordered_files:
-            suggestions_in = analyze_intent_suggestions(finfo, target_intent="in")
+            suggestions_in = analyze_intent_suggestions(
+                finfo, target_intent="in", call_sigs=call_sigs, interproc=args.interproc
+            )
             suggestions_out: List[IntentSuggestion] = []
             if args.suggest_intent_out:
-                suggestions_out = analyze_intent_suggestions(finfo, target_intent="out")
+                suggestions_out = analyze_intent_suggestions(
+                    finfo, target_intent="out", call_sigs=call_sigs, interproc=args.interproc
+                )
             suggestions = suggestions_in + suggestions_out
             if args.verbose:
                 print(f"File: {fscan.display_path(finfo.path)}")

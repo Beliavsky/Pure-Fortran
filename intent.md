@@ -83,4 +83,13 @@ Equivalent intuition: value is established by the procedure before any use, and 
 - Procedure-like ambiguities (for example scalar name called as `d(...)`) are skipped.
 - Compile validation (`--compiler`) is recommended in fix workflows.
 
+## Optional interprocedural mode (`--interproc`)
+
+`--interproc` relaxes the call-site rule conservatively:
+
+- For `call callee(...)`, if `callee` resolves to a unique known signature and the matched formal dummy is known `intent(in)` (or `value`), the caller actual is treated as read-only for that call.
+- If callee resolution is missing/ambiguous, argument mapping is unclear, or formal intent is unknown/not `in`, behavior stays conservative (call may write).
+
+This means `--interproc` can enable additional `intent(in)` suggestions in callers when callee intents are already explicit and unambiguous.
+
 
