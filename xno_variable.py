@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 import xunset
 
@@ -343,7 +344,14 @@ def decl_entity_name(chunk: str) -> Optional[str]:
     return m.group(1).lower()
 
 
-def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = False) -> Tuple[int, int, int, Optional[Path]]:
+def apply_fix_file(
+    path: Path,
+    findings: List[Finding],
+    *,
+    annotate: bool = False,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
+) -> Tuple[int, int, int, Optional[Path]]:
     """Apply inlining fixes and declaration cleanup for one source file."""
     if not findings:
         return 0, 0, 0, None
@@ -375,7 +383,7 @@ def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = Fals
         decl_remove_candidates.append((f.var, f.decl_line, f.unit_start, f.unit_end, f.assign_line))
 
     if changed == 0:
-        return 0, 0, None
+        return 0, 0, 0, None
 
     # Determine which temp declarations are now unused within their units.
     decl_remove_by_line: Dict[int, Set[str]] = {}
@@ -447,8 +455,10 @@ def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = Fals
             msg = f"{indent}!! {', '.join(uniq)} removed by xno_variable.py{eol}"
             pending_annos.append((didx, msg))
 
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
+    backup: Optional[Path] = None
+    if out_path is None and create_backup:
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
 
     for idx in sorted(delete_lines, reverse=True):
         if 0 <= idx < len(lines):
@@ -476,7 +486,8 @@ def apply_fix_file(path: Path, findings: List[Finding], *, annotate: bool = Fals
         for at, msg in sorted(inserts, key=lambda x: x[0], reverse=True):
             lines.insert(at, msg)
             annotations_inserted += 1
-    path.write_text("".join(lines), encoding="utf-8")
+    target = out_path if out_path is not None else path
+    target.write_text("".join(lines), encoding="utf-8")
     return changed, removed_decl_entities, annotations_inserted, backup
 
 
@@ -489,20 +500,36 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full suggested replacement statements")
     parser.add_argument("--fix", action="store_true", help="Inline safe candidates and remove now-unused local declarations")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument(
         "--annotate",
         action="store_true",
         help="With --fix, add comments below edited declarations listing removed names",
     )
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
     if args.annotate and not args.fix:
         print("--annotate requires --fix.")
+        return 2
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
         return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     findings: List[Finding] = []
     for p in files:
@@ -532,17 +559,26 @@ def main() -> int:
         total_ann = 0
         changed_files = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            ninl, ndecl, nann, backup = apply_fix_file(p, by_file[p], annotate=args.annotate)
+            out_path = args.out if args.out is not None else None
+            ninl, ndecl, nann, backup = apply_fix_file(
+                p, by_file[p], annotate=args.annotate, out_path=out_path, create_backup=args.backup
+            )
             total_inline += ninl
             total_decl_removed += ndecl
             total_ann += nann
             if ninl > 0:
                 changed_files += 1
-                print(
-                    f"\nFixed {p.name}: inlined {ninl}, decl-entities removed {ndecl}, "
-                    f"annotations {nann}, "
-                    f"backup {backup.name if backup else '(none)'}"
-                )
+                if out_path is not None:
+                    print(
+                        f"\nFixed {p.name}: inlined {ninl}, decl-entities removed {ndecl}, "
+                        f"annotations {nann}, wrote {out_path}"
+                    )
+                else:
+                    print(
+                        f"\nFixed {p.name}: inlined {ninl}, decl-entities removed {ndecl}, "
+                        f"annotations {nann}, "
+                        f"backup {backup.name if backup else '(none)'}"
+                    )
             else:
                 print(f"\nNo fixes applied to {p.name}")
         print(
@@ -550,6 +586,9 @@ def main() -> int:
             f"inlined {total_inline}, decl-entities removed {total_decl_removed}, "
             f"annotations {total_ann}"
         )
+        if args.compiler:
+            if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+                return 5
     return 0
 
 

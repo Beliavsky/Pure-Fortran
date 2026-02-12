@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
@@ -255,7 +256,14 @@ def analyze_file(path: Path) -> List[Finding]:
     return out
 
 
-def apply_fix(path: Path, findings: List[Finding], *, annotate: bool) -> Tuple[int, Optional[Path]]:
+def apply_fix(
+    path: Path,
+    findings: List[Finding],
+    *,
+    annotate: bool,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
+) -> Tuple[int, Optional[Path]]:
     if not findings:
         return 0, None
     lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
@@ -275,13 +283,16 @@ def apply_fix(path: Path, findings: List[Finding], *, annotate: bool) -> Tuple[i
         changed += 1
     if changed == 0:
         return 0, None
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text(''.join(lines), encoding='utf-8')
+    backup: Optional[Path] = None
+    target = out_path if out_path is not None else path
+    if out_path is None and create_backup:
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
+    target.write_text(''.join(lines), encoding='utf-8')
     return changed, backup
 
 
-def apply_annotate(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Path]]:
+def apply_annotate(path: Path, findings: List[Finding], *, backup: bool = True) -> Tuple[int, Optional[Path]]:
     if not findings:
         return 0, None
     lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
@@ -302,10 +313,12 @@ def apply_annotate(path: Path, findings: List[Finding]) -> Tuple[int, Optional[P
         inserted += 1
     if inserted == 0:
         return 0, None
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
+    backup_path: Optional[Path] = None
+    if backup:
+        backup_path = make_backup_path(path)
+        shutil.copy2(path, backup_path)
     path.write_text(''.join(lines), encoding='utf-8')
-    return inserted, backup
+    return inserted, backup_path
 
 
 def main() -> int:
@@ -314,18 +327,34 @@ def main() -> int:
     parser.add_argument('--exclude', action='append', default=[], help='Glob pattern to exclude files')
     parser.add_argument('--verbose', action='store_true', help='Print full suggestions')
     parser.add_argument('--fix', action='store_true', help='Apply rewrites in-place')
+    parser.add_argument('--out', type=Path, help='With --fix, write transformed output to this file (single input)')
+    parser.add_argument('--backup', dest='backup', action='store_true', default=True)
+    parser.add_argument('--no-backup', dest='backup', action='store_false')
     parser.add_argument('--annotate', action='store_true', help='Insert suggestion comments (or changed tag with --fix)')
     parser.add_argument('--diff', '-diff', action='store_true', help='With --fix, print unified diffs')
+    parser.add_argument('--compiler', type=str, help='Compile command for baseline/after-fix validation')
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
 
     if args.diff and not args.fix:
         print('--diff requires --fix.')
+        return 2
+    if args.compiler and not args.fix:
+        print('--compiler requires --fix.')
         return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print('No source files remain after applying --exclude filters.')
         return 2
+    if args.out is not None and len(files) != 1:
+        print('--out requires exactly one input source file.')
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     findings: List[Finding] = []
     for p in files:
@@ -353,18 +382,24 @@ def main() -> int:
         total = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding='utf-8')
-            n, backup = apply_fix(p, by_file[p], annotate=args.annotate)
+            out_path = args.out if args.out is not None else None
+            n, backup = apply_fix(
+                p, by_file[p], annotate=args.annotate, out_path=out_path, create_backup=args.backup
+            )
             total += n
             if n > 0:
                 touched += 1
-                print(f"\nFixed {p.name}: rewrites {n}, backup {backup.name if backup else '(none)'}")
+                if out_path is not None:
+                    print(f"\nFixed {p.name}: rewrites {n}, wrote {out_path}")
+                else:
+                    print(f"\nFixed {p.name}: rewrites {n}, backup {backup.name if backup else '(none)'}")
                 if args.diff:
-                    after = p.read_text(encoding='utf-8')
+                    after = (out_path if out_path is not None else p).read_text(encoding='utf-8')
                     diff_lines = difflib.unified_diff(
                         before.splitlines(),
                         after.splitlines(),
                         fromfile=f"a/{p.name}",
-                        tofile=f"b/{p.name}",
+                        tofile=f"b/{(out_path.name if out_path is not None else p.name)}",
                         lineterm='',
                     )
                     print('')
@@ -380,12 +415,15 @@ def main() -> int:
         touched = 0
         total = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            n, backup = apply_annotate(p, by_file[p])
+            n, backup = apply_annotate(p, by_file[p], backup=args.backup)
             total += n
             if n > 0:
                 touched += 1
                 print(f"\nAnnotated {p.name}: inserted {n}, backup {backup.name if backup else '(none)'}")
         print(f"\n--annotate summary: files changed {touched}, inserted {total}")
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+            return 5
 
     return 0
 

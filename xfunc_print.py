@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 PRINT_RE = re.compile(r"^\s*print\b", re.IGNORECASE)
@@ -334,7 +335,13 @@ def group_findings_by_proc(path: Path, findings: List[Finding]) -> List[ProcFind
     return out
 
 
-def apply_fix_file(path: Path, findings: List[Finding], mode: str) -> Tuple[int, int, Optional[Path], str]:
+def apply_fix_file(
+    path: Path,
+    findings: List[Finding],
+    mode: str,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
+) -> Tuple[int, int, Optional[Path], str]:
     """Apply one fix strategy to a file; returns (applied, skipped, backup, diff_text)."""
     infos, any_missing = fscan.load_source_files([path])
     if not infos or any_missing:
@@ -472,16 +479,19 @@ def apply_fix_file(path: Path, findings: List[Finding], mode: str) -> Tuple[int,
 
     if applied == 0:
         return 0, skipped, None, ""
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
+    backup: Optional[Path] = None
+    if out_path is None and create_backup:
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
     after = "".join(lines)
-    path.write_text(after, encoding="utf-8")
+    target = out_path if out_path is not None else path
+    target.write_text(after, encoding="utf-8")
     diff = "\n".join(
         difflib.unified_diff(
             before.splitlines(),
             after.splitlines(),
             fromfile=f"a/{path.name}",
-            tofile=f"b/{path.name}",
+            tofile=f"b/{(target.name if out_path is not None else path.name)}",
             lineterm="",
         )
     )
@@ -497,6 +507,10 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print offending statement text")
     parser.add_argument("--diff", action="store_true", help="With fix modes, print unified diffs for changed files")
+    parser.add_argument("--out", type=Path, help="With a fix mode, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     fixg = parser.add_mutually_exclusive_group()
     fixg.add_argument("--fix-msg", action="store_true", help="Replace output statements with optional msg argument capture")
     fixg.add_argument(
@@ -567,6 +581,20 @@ def main() -> int:
     elif args.fix_error_stop:
         mode = "error-stop"
 
+    if args.out is not None and mode is None:
+        print("--out requires selecting one fix mode.")
+        return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    if args.compiler and mode is None:
+        print("--compiler requires selecting one fix mode.")
+        return 2
+    compile_paths = [args.out] if (mode is not None and args.out is not None) else files
+    if mode is not None and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
+
     if mode is not None:
         by_file: Dict[Path, List[Finding]] = {}
         for f in findings:
@@ -574,10 +602,15 @@ def main() -> int:
         total_applied = 0
         total_skipped = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            applied, skipped, backup, diff = apply_fix_file(p, by_file[p], mode=mode)
+            out_path = args.out if args.out is not None else None
+            applied, skipped, backup, diff = apply_fix_file(
+                p, by_file[p], mode=mode, out_path=out_path, create_backup=args.backup
+            )
             total_applied += applied
             total_skipped += skipped
-            if applied > 0 and backup is not None:
+            if applied > 0 and out_path is not None:
+                print(f"\nFixed {p.name}: applied {applied}, skipped {skipped}, wrote {out_path}")
+            elif applied > 0 and backup is not None:
                 print(f"\nFixed {p.name}: applied {applied}, skipped {skipped}, backup {backup.name}")
             elif applied > 0:
                 print(f"\nFixed {p.name}: applied {applied}, skipped {skipped}")
@@ -587,6 +620,9 @@ def main() -> int:
                 print("")
                 print(diff)
         print(f"\n--fix summary: applied {total_applied}, skipped {total_skipped}")
+        if args.compiler:
+            if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+                return 5
     return 0
 
 

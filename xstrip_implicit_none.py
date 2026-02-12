@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, List, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 IMPLICIT_NONE_RE = re.compile(r"^\s*implicit\s+none\b", re.IGNORECASE)
@@ -113,7 +114,7 @@ def strip_implicit_in_statement_block(lines: List[str], start_idx: int) -> Tuple
     return i, [rebuilt], removed
 
 
-def process_file(path: Path, fix: bool, backup: bool, show_diff: bool) -> int:
+def process_file(path: Path, fix: bool, backup: bool, show_diff: bool, out_path: Path | None = None) -> int:
     """Process one file and optionally write stripped IMPLICIT NONE lines."""
     text = path.read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines(keepends=True)
@@ -130,12 +131,13 @@ def process_file(path: Path, fix: bool, backup: bool, show_diff: bool) -> int:
     if removed_total == 0:
         return 0
 
+    diff_target = out_path if (out_path is not None and fix) else path
     if show_diff:
         diff = difflib.unified_diff(
             lines,
             updated,
             fromfile=str(path),
-            tofile=str(path),
+            tofile=str(diff_target),
             lineterm="",
         )
         print("\nProposed diff:")
@@ -143,11 +145,12 @@ def process_file(path: Path, fix: bool, backup: bool, show_diff: bool) -> int:
             print(d)
 
     if fix:
-        if backup:
+        if backup and out_path is None:
             backup_path = path.with_name(path.name + ".bak")
             shutil.copy2(path, backup_path)
             print(f"Backup written: {backup_path.name}")
-        path.write_text("".join(updated), encoding="utf-8", newline="")
+        target = out_path if out_path is not None else path
+        target.write_text("".join(updated), encoding="utf-8", newline="")
 
     return removed_total
 
@@ -158,15 +161,29 @@ def main() -> int:
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--fix", action="store_true", help="Write changes to files")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", action="store_true")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     removed_total = 0
     changed_files = 0
@@ -174,13 +191,17 @@ def main() -> int:
         if not p.exists():
             print(f"File not found: {p.name}")
             continue
-        n = process_file(p, fix=args.fix, backup=args.backup, show_diff=args.diff)
+        out_path = args.out if args.out is not None else None
+        n = process_file(p, fix=args.fix, backup=args.backup, show_diff=args.diff, out_path=out_path)
         if n > 0:
             removed_total += n
             changed_files += 1
 
     action = "Removed" if args.fix else "Can remove"
     print(f"{action} {removed_total} IMPLICIT NONE statement(s) in {changed_files} file(s).")
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+            return 5
     return 0
 
 

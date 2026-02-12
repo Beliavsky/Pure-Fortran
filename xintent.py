@@ -22,15 +22,18 @@ TYPE_DECL_RE = re.compile(
 )
 NO_COLON_DECL_RE = re.compile(
     r"^\s*(?P<spec>(?:integer|real|logical|complex|character)\s*(?:\([^)]*\))?"
-    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s+(?P<rhs>.+)$",
+    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?P<rhs>[a-z][a-z0-9_].*)$",
     re.IGNORECASE,
 )
 ASSIGN_RE = re.compile(
-    r"^\s*([a-z][a-z0-9_]*(?:\s*%\s*[a-z][a-z0-9_]*)?)\s*(?:\([^)]*\))?\s*=",
+    r"^\s*(?:\d+\s+)?([a-z][a-z0-9_]*(?:\s*%\s*[a-z][a-z0-9_]*)?)\s*(?:\([^)]*\))?\s*=",
     re.IGNORECASE,
 )
 ALLOC_DEALLOC_RE = re.compile(r"^\s*(allocate|deallocate)\s*\((.+)\)\s*$", re.IGNORECASE)
 CALL_RE = re.compile(r"\bcall\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+EXTERNAL_STMT_RE = re.compile(r"^\s*external\b(.*)$", re.IGNORECASE)
+WRITE_START_RE = re.compile(r"^\s*write\s*\(", re.IGNORECASE)
+DO_ITER_RE = re.compile(r"^\s*do\b(?:\s+\d+\s+)?\s*([a-z][a-z0-9_]*)\s*=", re.IGNORECASE)
 
 
 @dataclass
@@ -95,6 +98,21 @@ def maybe_git_commit(
     fbuild.git_commit_files(sorted(changed_files, key=lambda p: str(p).lower()), msg, fscan.display_path)
 
 
+def save_transformed_copy(path: Path, save_dir: Path) -> Path:
+    """Save a transformed source snapshot into save_dir with a collision-safe filename."""
+    resolved = str(path.resolve())
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", resolved).strip("_")
+    if not stem:
+        stem = path.name
+    out_name = stem
+    if not out_name.lower().endswith(path.suffix.lower()):
+        out_name += path.suffix
+    out_path = save_dir / out_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, out_path)
+    return out_path
+
+
 def quote_cmd_arg(arg: str) -> str:
     """Quote one shell argument for safe compiler command construction."""
     return fbuild.quote_cmd_arg(arg)
@@ -117,6 +135,114 @@ def split_code_comment(line: str) -> Tuple[str, str]:
         elif ch == "!" and not in_single and not in_double:
             return line[:i], line[i:]
     return line, ""
+
+
+def strip_statement_label(stmt: str) -> str:
+    """Strip a leading numeric Fortran statement label from one statement string."""
+    return re.sub(r"^\s*\d+\s+", "", stmt, count=1)
+
+
+def strip_one_line_if_prefix(stmt: str) -> str:
+    """Strip a leading one-line IF(condition) prefix and return trailing statement text."""
+    s = stmt.lstrip()
+    if not s.lower().startswith("if"):
+        return stmt
+    m = re.match(r"^if\s*\(", s, re.IGNORECASE)
+    if not m:
+        return stmt
+    i = m.end() - 1  # index at '('
+    depth = 0
+    in_single = False
+    in_double = False
+    for j in range(i, len(s)):
+        ch = s[j]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    tail = s[j + 1 :].lstrip()
+                    if tail.lower().startswith("then"):
+                        return stmt
+                    return tail if tail else stmt
+    return stmt
+
+
+def strip_one_line_where_prefix(stmt: str) -> str:
+    """Strip a leading one-line WHERE(condition) prefix and return trailing statement text."""
+    s = stmt.lstrip()
+    if not s.lower().startswith("where"):
+        return stmt
+    m = re.match(r"^where\s*\(", s, re.IGNORECASE)
+    if not m:
+        return stmt
+    i = m.end() - 1  # index at '('
+    depth = 0
+    in_single = False
+    in_double = False
+    for j in range(i, len(s)):
+        ch = s[j]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    tail = s[j + 1 :].lstrip()
+                    return tail if tail else stmt
+    return stmt
+
+
+def split_assignment(stmt: str) -> Optional[Tuple[str, str]]:
+    """Split a statement into assignment lhs/rhs when it has a true '=' operator."""
+    s = stmt.strip()
+    if not s:
+        return None
+
+    in_single = False
+    in_double = False
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")" and depth > 0:
+            depth -= 1
+            continue
+        if ch != "=" or depth != 0:
+            continue
+
+        prev = s[i - 1] if i > 0 else ""
+        nxt = s[i + 1] if i + 1 < len(s) else ""
+        # Exclude relational/equality/pointer operators.
+        if prev in {"<", ">", "/", "="}:
+            continue
+        if nxt == "=":
+            continue
+
+        lhs = s[:i].strip()
+        rhs = s[i + 1 :].strip()
+        if not lhs or not rhs:
+            return None
+        return lhs, rhs
+    return None
 
 
 def get_eol(line: str) -> str:
@@ -161,6 +287,114 @@ def split_decl_entities(rhs: str) -> List[str]:
     return parts
 
 
+def top_level_equals(text: str) -> Optional[Tuple[str, str]]:
+    """Split KEY=VALUE at top level (outside strings/parentheses)."""
+    in_single = False
+    in_double = False
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")" and depth > 0:
+            depth -= 1
+            continue
+        if ch == "=" and depth == 0:
+            prev = text[i - 1] if i > 0 else ""
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if prev in {"<", ">", "/", "="} or nxt == "=":
+                continue
+            return text[:i].strip(), text[i + 1 :].strip()
+    return None
+
+
+def extract_write_unit_base(stmt: str) -> Optional[str]:
+    """Return base identifier of WRITE unit/internal-file target, if any."""
+    s = stmt.strip()
+    if not WRITE_START_RE.match(s):
+        return None
+    pos = s.lower().find("write")
+    lpar = s.find("(", pos)
+    if lpar < 0:
+        return None
+    depth = 0
+    in_single = False
+    in_double = False
+    rpar = -1
+    for i in range(lpar, len(s)):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                rpar = i
+                break
+    if rpar < 0:
+        return None
+    ctl = s[lpar + 1 : rpar].strip()
+    if not ctl:
+        return None
+    parts = split_decl_entities(ctl)
+    if not parts:
+        return None
+    first = parts[0].strip()
+    kv = top_level_equals(first)
+    unit_expr = ""
+    if kv is not None and kv[0].lower() == "unit":
+        unit_expr = kv[1]
+    elif kv is None:
+        unit_expr = first
+    else:
+        # keyword form without positional unit first; try explicit unit= later.
+        for part in parts[1:]:
+            kv2 = top_level_equals(part.strip())
+            if kv2 is not None and kv2[0].lower() == "unit":
+                unit_expr = kv2[1]
+                break
+    if not unit_expr:
+        return None
+    return fscan.base_identifier(unit_expr)
+
+
+def parse_external_names(stmt: str) -> Set[str]:
+    """Parse names listed in an EXTERNAL statement."""
+    low = stmt.lower().strip()
+    m = EXTERNAL_STMT_RE.match(low)
+    if not m:
+        return set()
+    rest = m.group(1).strip()
+    if not rest:
+        return set()
+    if rest.startswith("::"):
+        rest = rest[2:].strip()
+    elif rest.startswith(","):
+        rest = rest[1:].strip()
+    out: Set[str] = set()
+    for tok in split_decl_entities(rest):
+        mm = re.match(r"^\s*([a-z][a-z0-9_]*)", tok, re.IGNORECASE)
+        if mm:
+            out.add(mm.group(1).lower())
+    return out
+
+
 def parse_declared_names_any(code_line: str) -> Set[str]:
     """Parse declared entity names from declaration lines with or without ::."""
     if "::" in code_line:
@@ -174,6 +408,50 @@ def parse_declared_names_any(code_line: str) -> Set[str]:
         if mm:
             out.add(mm.group(1).lower())
     return out
+
+
+def parse_declared_array_flags(code_line: str) -> Dict[str, bool]:
+    """Parse declared entities and whether each is array-like."""
+    out: Dict[str, bool] = {}
+    if "::" in code_line:
+        lhs, _rhs = code_line.split("::", 1)
+        has_dim_attr = "dimension" in lhs.lower()
+        for name, has_inline_array in fscan.parse_declared_entities(code_line):
+            out[name] = has_inline_array or has_dim_attr
+        return out
+
+    m = NO_COLON_DECL_RE.match(code_line.strip())
+    if not m:
+        return out
+    has_dim_attr = "dimension" in m.group("spec").lower()
+    for ent in split_decl_entities(m.group("rhs")):
+        mm = re.match(r"^\s*([a-z][a-z0-9_]*)\s*(\()?", ent, re.IGNORECASE)
+        if not mm:
+            continue
+        out[mm.group(1).lower()] = (mm.group(2) is not None) or has_dim_attr
+    return out
+
+
+def is_declaration_statement(stmt: str) -> bool:
+    """Return whether stmt is a declaration statement."""
+    s = stmt.strip().lower()
+    if not s:
+        return False
+    # Avoid false positive on assignments like "type = 3".
+    if re.match(r"^(type|class|procedure)\s*=", s):
+        return False
+    if "::" in s:
+        return TYPE_DECL_RE.match(s) is not None
+    return NO_COLON_DECL_RE.match(s) is not None
+
+
+def statements_in_range(
+    all_stmts: List[Tuple[int, str]],
+    start_line: int,
+    end_exclusive: int,
+) -> List[Tuple[int, str]]:
+    """Return statements with start_line <= line < end_exclusive."""
+    return [(ln, stmt) for ln, stmt in all_stmts if start_line <= ln < end_exclusive]
 
 
 def rewrite_semicolon_line_with_intents(line: str, intents_by_name: Dict[str, str]) -> Tuple[List[str], bool]:
@@ -297,54 +575,81 @@ def analyze_intent_suggestions(
 ) -> List[IntentSuggestion]:
     """Suggest dummy arguments that can be marked with the target intent."""
     out: List[IntentSuggestion] = []
+    sorted_procs = sorted(finfo.procedures, key=lambda p: p.start)
+    all_stmts = fscan.iter_fortran_statements(finfo.parsed_lines)
 
-    for proc in finfo.procedures:
+    for pidx, proc in enumerate(sorted_procs):
         if not proc.dummy_names:
             continue
+        next_start = sorted_procs[pidx + 1].start if pidx + 1 < len(sorted_procs) else (len(finfo.parsed_lines) + 1)
+        body_stmts = statements_in_range(all_stmts, proc.start, next_start)
 
         local_names: Set[str] = set(proc.dummy_names)
         if proc.result_name:
             local_names.add(proc.result_name)
+        external_dummies: Set[str] = set()
+        dummy_is_array: Dict[str, bool] = {d: False for d in proc.dummy_names}
 
         # dummy -> declaration metadata
         decl: Dict[str, Tuple[int, bool, bool, bool]] = {}
         # line, has_intent_or_value, has_alloc_ptr, fixable
 
-        for ln, code in proc.body:
+        for ln, code in body_stmts:
             low = code.lower().strip()
+            external_dummies.update(parse_external_names(low) & set(proc.dummy_names))
             if not low or not TYPE_DECL_RE.match(low):
                 continue
             if low.startswith("procedure"):
                 continue
             declared = parse_declared_names_any(low)
+            arr_flags = parse_declared_array_flags(low)
             local_names.update(declared)
-            has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None)
+            has_external = re.search(r"\bexternal\b", low) is not None
+            has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None) or has_external
             has_alloc_ptr = ("allocatable" in low) or (re.search(r"\bpointer\b", low) is not None)
             for d in proc.dummy_names:
                 if d in declared and d not in decl:
                     decl[d] = (ln, has_intent_or_value, has_alloc_ptr, True)
+                if d in arr_flags and arr_flags[d]:
+                    dummy_is_array[d] = True
+
+        probable_proc_dummies: Set[str] = set()
+        for _ln, code in body_stmts:
+            low = code.lower().strip()
+            if not low or is_declaration_statement(low) or low.startswith("procedure"):
+                continue
+            for d in proc.dummy_names:
+                if dummy_is_array.get(d, False):
+                    continue
+                if re.search(rf"\b{re.escape(d)}\s*\(", low):
+                    probable_proc_dummies.add(d)
 
         writes: Set[str] = set()
         maybe_written_via_call: Set[str] = set()
         reads: Set[str] = set()
         first_event: Dict[str, Tuple[int, str]] = {}
-        for ln, code in proc.body:
+        for ln, code in body_stmts:
             low = code.lower()
-            m_assign = ASSIGN_RE.match(low)
-            if m_assign:
-                lhs_base = fscan.base_identifier(m_assign.group(1))
+            low_nolab = strip_statement_label(low)
+            low_exec = strip_one_line_if_prefix(low_nolab)
+            low_exec = strip_one_line_where_prefix(low_exec)
+            if is_declaration_statement(low_exec):
+                continue
+            asn = split_assignment(low_exec)
+            if asn is not None:
+                lhs, rhs = asn
+                lhs_base = fscan.base_identifier(lhs)
                 if lhs_base in proc.dummy_names:
                     writes.add(lhs_base)
                     if lhs_base not in first_event:
                         first_event[lhs_base] = (ln, "write")
-                rhs = low.split("=", 1)[1] if "=" in low else ""
                 for d in proc.dummy_names:
                     if re.search(rf"\b{re.escape(d)}\b", rhs):
                         reads.add(d)
                         if d not in first_event:
                             first_event[d] = (ln, "read")
 
-            m_alloc = ALLOC_DEALLOC_RE.match(low)
+            m_alloc = ALLOC_DEALLOC_RE.match(low_exec)
             if m_alloc:
                 first_obj = m_alloc.group(2).split(",", 1)[0].strip()
                 obj = fscan.base_identifier(first_obj)
@@ -353,28 +658,44 @@ def analyze_intent_suggestions(
                     if obj not in first_event:
                         first_event[obj] = (ln, "write")
 
-            if "read" in low and "(" in low and ")" in low:
+            if "read" in low_exec and "(" in low_exec and ")" in low_exec:
                 for d in proc.dummy_names:
-                    if re.search(rf"\b{re.escape(d)}\b", low):
+                    if re.search(rf"\b{re.escape(d)}\b", low_exec):
                         writes.add(d)
                         if d not in first_event:
                             first_event[d] = (ln, "write")
 
-            if "=>" in low:
+            if "=>" in low_exec:
                 for d in proc.dummy_names:
-                    if re.search(rf"^\s*{re.escape(d)}\s*=>", low):
+                    if re.search(rf"^\s*{re.escape(d)}\s*=>", low_exec):
                         writes.add(d)
                         if d not in first_event:
                             first_event[d] = (ln, "write")
 
-            if CALL_RE.search(low):
+            if CALL_RE.search(low_exec):
                 for d in proc.dummy_names:
-                    if re.search(rf"\b{re.escape(d)}\b", low):
+                    if re.search(rf"\b{re.escape(d)}\b", low_exec):
                         maybe_written_via_call.add(d)
                         if d not in first_event:
                             first_event[d] = (ln, "call")
 
+            write_unit = extract_write_unit_base(low_exec)
+            if write_unit in proc.dummy_names:
+                writes.add(write_unit)
+                if write_unit not in first_event:
+                    first_event[write_unit] = (ln, "write")
+
+            m_do = DO_ITER_RE.match(low_exec)
+            if m_do:
+                it_name = m_do.group(1).lower()
+                if it_name in proc.dummy_names:
+                    writes.add(it_name)
+                    if it_name not in first_event:
+                        first_event[it_name] = (ln, "write")
+
         for d in sorted(proc.dummy_names):
+            if d in external_dummies or d in probable_proc_dummies:
+                continue
             meta = decl.get(d)
             if meta is None:
                 continue
@@ -414,22 +735,47 @@ def analyze_intent_suggestions(
 def collect_missing_intent_args(finfo: fscan.SourceFileInfo) -> List[IntentSuggestion]:
     """Collect dummies still lacking INTENT/VALUE annotations."""
     out: List[IntentSuggestion] = []
-    for proc in finfo.procedures:
+    sorted_procs = sorted(finfo.procedures, key=lambda p: p.start)
+    all_stmts = fscan.iter_fortran_statements(finfo.parsed_lines)
+    for pidx, proc in enumerate(sorted_procs):
         if not proc.dummy_names:
             continue
+        next_start = sorted_procs[pidx + 1].start if pidx + 1 < len(sorted_procs) else (len(finfo.parsed_lines) + 1)
+        body_stmts = statements_in_range(all_stmts, proc.start, next_start)
         decl: Dict[str, Tuple[int, bool]] = {}
-        for ln, code in proc.body:
+        external_dummies: Set[str] = set()
+        dummy_is_array: Dict[str, bool] = {d: False for d in proc.dummy_names}
+        for ln, code in body_stmts:
             low = code.lower().strip()
+            external_dummies.update(parse_external_names(low) & set(proc.dummy_names))
             if not low or not TYPE_DECL_RE.match(low):
                 continue
             if low.startswith("procedure"):
                 continue
             declared = parse_declared_names_any(low)
-            has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None)
+            arr_flags = parse_declared_array_flags(low)
+            has_external = re.search(r"\bexternal\b", low) is not None
+            has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None) or has_external
             for d in proc.dummy_names:
                 if d in declared and d not in decl:
                     decl[d] = (ln, has_intent_or_value)
+                if d in arr_flags and arr_flags[d]:
+                    dummy_is_array[d] = True
+
+        probable_proc_dummies: Set[str] = set()
+        for _ln, code in body_stmts:
+            low = code.lower().strip()
+            if not low or is_declaration_statement(low) or low.startswith("procedure"):
+                continue
+            for d in proc.dummy_names:
+                if dummy_is_array.get(d, False):
+                    continue
+                if re.search(rf"\b{re.escape(d)}\s*\(", low):
+                    probable_proc_dummies.add(d)
+
         for d in sorted(proc.dummy_names):
+            if d in external_dummies or d in probable_proc_dummies:
+                continue
             meta = decl.get(d)
             if meta is None:
                 continue
@@ -456,6 +802,7 @@ def apply_fix(
     suggestions: List[IntentSuggestion],
     backup: bool,
     show_diff: bool,
+    out_path: Optional[Path] = None,
 ) -> Tuple[int, Optional[Path], List[IntentSuggestion]]:
     """Apply intent suggestions to a file and optionally create a backup."""
     if not suggestions:
@@ -507,11 +854,12 @@ def apply_fix(
         return 0, None, []
 
     if show_diff:
+        diff_to = str(out_path) if out_path is not None else str(finfo.path)
         diff = difflib.unified_diff(
             finfo.lines,
             updated,
             fromfile=str(finfo.path),
-            tofile=str(finfo.path),
+            tofile=diff_to,
             lineterm="",
         )
         print("\nProposed diff:")
@@ -519,12 +867,13 @@ def apply_fix(
             print(line)
 
     backup_path: Optional[Path] = None
-    if backup:
+    if backup and out_path is None:
         backup_path = finfo.path.with_name(finfo.path.name + ".bak")
         shutil.copy2(finfo.path, backup_path)
         print(f"\nBackup written: {backup_path}")
 
-    with finfo.path.open("w", encoding="utf-8", newline="") as f:
+    target = out_path if out_path is not None else finfo.path
+    with target.open("w", encoding="utf-8", newline="") as f:
         f.write("".join(updated))
     return changed, backup_path, changed_items
 
@@ -551,6 +900,8 @@ def main() -> int:
     parser.add_argument("--compiler", type=str, help="Compile command; supports {files} placeholder")
     parser.add_argument("--verbose", action="store_true", help="Show per-file details")
     parser.add_argument("--git", action="store_true", help="Commit changed files to git after successful run")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--save-dir", type=Path, help="With --fix, save transformed source snapshots to this directory")
     parser.add_argument(
         "--warn-missing-intent",
         action="store_true",
@@ -572,12 +923,27 @@ def main() -> int:
         default=10,
         help="Maximum iterations for --iterate (default: 10)",
     )
+    parser.add_argument("--limit", type=int, help="Maximum number of source files to process")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
     if args.iterate and not args.fix:
         print("--iterate requires --fix.")
         return 3
+    if args.save_dir and not args.fix:
+        print("--save-dir requires --fix.")
+        return 3
     if args.max_iter < 1:
         print("--max-iter must be >= 1.")
+        return 3
+    if args.limit is not None and args.limit < 1:
+        print("--limit must be >= 1.")
+        return 3
+    if args.out is not None and args.iterate:
+        print("--out is not supported with --iterate.")
+        return 3
+    if args.out is not None and args.git:
+        print("--out is not supported with --git.")
         return 3
 
     args.fortran_files = cpaths.expand_path_args(args.fortran_files)
@@ -590,8 +956,13 @@ def main() -> int:
             print("No source files provided and no .f90/.F90 files found in current directory.")
             return 2
     args.fortran_files = fscan.apply_excludes(args.fortran_files, args.exclude)
+    if args.limit is not None:
+        args.fortran_files = args.fortran_files[: args.limit]
     if not args.fortran_files:
         print("No source files remain after applying --exclude filters.")
+        return 2
+    if args.out is not None and len(args.fortran_files) != 1:
+        print("--out requires exactly one input source file.")
         return 2
 
     changed_summary: Dict[Tuple[str, str], List[str]] = {}
@@ -611,8 +982,12 @@ def main() -> int:
             print("Processing order: " + " ".join(fscan.display_path(f.path) for f in ordered_files))
 
         compile_paths = [f.path for f in ordered_files]
+        after_compile_paths = compile_paths
         if args.compiler:
             compile_paths, _ = fscan.build_compile_closure(ordered_files)
+            after_compile_paths = compile_paths
+            if args.out is not None and args.fix:
+                after_compile_paths = [args.out]
             if args.fix and not did_baseline_compile:
                 if not run_compiler_command(args.compiler, compile_paths, phase="baseline"):
                     baseline_failed = True
@@ -646,7 +1021,11 @@ def main() -> int:
                 continue
 
             changed, backup_path, changed_items = apply_fix(
-                finfo, suggestions, backup=args.backup, show_diff=args.diff
+                finfo,
+                suggestions,
+                backup=args.backup,
+                show_diff=args.diff,
+                out_path=args.out,
             )
             pass_changed += changed
             if backup_path:
@@ -655,6 +1034,10 @@ def main() -> int:
                 for s in changed_items:
                     add_summary_item(changed_summary, s)
                 changed_files.add(finfo.path)
+                if args.save_dir:
+                    out_path = save_transformed_copy(finfo.path, args.save_dir)
+                    if args.verbose:
+                        print(f"Saved transformed copy: {out_path}")
                 if args.suggest_intent_out:
                     print(f"\nApplied INTENT(IN/OUT) to {changed} declaration(s).")
                 else:
@@ -662,7 +1045,8 @@ def main() -> int:
 
         if args.compiler:
             phase = "after-fix" if args.fix else "current"
-            if not run_compiler_command(args.compiler, compile_paths, phase=phase):
+            check_paths = after_compile_paths if args.fix else compile_paths
+            if not run_compiler_command(args.compiler, check_paths, phase=phase):
                 if args.fix and args.backup and backup_pairs:
                     rollback_backups(backup_pairs)
                 return 5

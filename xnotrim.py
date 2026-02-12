@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, List
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 # High-confidence advisory patterns:
@@ -152,7 +153,13 @@ def make_backup_path(path: Path) -> Path:
         idx += 1
 
 
-def apply_fix_file(path: Path, *, annotate: bool = False) -> tuple[int, Path | None]:
+def apply_fix_file(
+    path: Path,
+    *,
+    annotate: bool = False,
+    out_path: Path | None = None,
+    create_backup: bool = True,
+) -> tuple[int, Path | None]:
     """Apply needless-TRIM rewrites in one file."""
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     changed = 0
@@ -181,9 +188,12 @@ def apply_fix_file(path: Path, *, annotate: bool = False) -> tuple[int, Path | N
 
     if changed == 0:
         return 0, None
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text("".join(lines), encoding="utf-8")
+    backup: Path | None = None
+    target = out_path if out_path is not None else path
+    if out_path is None and create_backup:
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
+    target.write_text("".join(lines), encoding="utf-8")
     return changed, backup
 
 
@@ -196,20 +206,36 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print every finding with offending statement line")
     parser.add_argument("--fix", action="store_true", help="Rewrite needless trim(var) wrappers in comparisons")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--annotate", action="store_true", help="With --fix, append change tag comments")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
     if args.annotate and not args.fix:
         print("--annotate requires --fix.")
         return 2
     if args.diff and not args.fix:
         print("--diff requires --fix.")
         return 2
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     findings: List[Finding] = []
     for p in files:
@@ -252,27 +278,35 @@ def main() -> int:
         changed_files = sorted({f.path for f in findings}, key=lambda p: p.name.lower())
         for p in changed_files:
             before = p.read_text(encoding="utf-8")
-            nrewrites, backup = apply_fix_file(p, annotate=args.annotate)
+            out_path = args.out if args.out is not None else None
+            nrewrites, backup = apply_fix_file(
+                p, annotate=args.annotate, out_path=out_path, create_backup=args.backup
+            )
             total_rewrites += nrewrites
-            if nrewrites > 0 and backup is not None:
+            if nrewrites > 0 and out_path is not None:
+                print(f"\nFixed {p.name}: rewrites {nrewrites}, wrote {out_path}")
+            elif nrewrites > 0 and backup is not None:
                 print(f"\nFixed {p.name}: rewrites {nrewrites}, backup {backup.name}")
             elif nrewrites > 0:
                 print(f"\nFixed {p.name}: rewrites {nrewrites}")
             else:
                 print(f"\nNo fixes applied to {p.name}")
             if args.diff and nrewrites > 0:
-                after = p.read_text(encoding="utf-8")
+                after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
                 diff_lines = difflib.unified_diff(
                     before.splitlines(),
                     after.splitlines(),
                     fromfile=f"a/{p.name}",
-                    tofile=f"b/{p.name}",
+                    tofile=f"b/{(out_path.name if out_path is not None else p.name)}",
                     lineterm="",
                 )
                 print("")
                 for d in diff_lines:
                     print(d)
         print(f"\n--fix summary: rewrites {total_rewrites}")
+        if args.compiler:
+            if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+                return 5
     return 0
 
 

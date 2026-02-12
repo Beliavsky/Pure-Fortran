@@ -34,6 +34,8 @@ PRINT_RE = re.compile(r"^\s*print\b", re.IGNORECASE)
 READ_RE = re.compile(r"^\s*read\s*\(", re.IGNORECASE)
 WRITE_RE = re.compile(r"^\s*write\s*\(", re.IGNORECASE)
 FILE_IO_RE = re.compile(r"^\s*(open|close|rewind|backspace|flush|inquire)\b", re.IGNORECASE)
+SAVE_STMT_RE = re.compile(r"^\s*save\b", re.IGNORECASE)
+DATA_STMT_RE = re.compile(r"^\s*data\b", re.IGNORECASE)
 
 ERROR_STOP_RE = re.compile(r"\berror\s+stop\b", re.IGNORECASE)
 STOP_RE = re.compile(r"\bstop\b", re.IGNORECASE)
@@ -300,9 +302,27 @@ def parse_decl_intent(line_low: str) -> Optional[str]:
     m = re.search(r"\bintent\s*\(\s*(inout|out|in)\s*\)", line_low)
     if m:
         return m.group(1).lower()
-    if re.search(r"\bvalue\b", line_low):
-        return "value"
     return None
+
+
+def decl_has_value_attr(line_low: str, declared: Set[str]) -> bool:
+    """Return True when VALUE appears in declaration attribute/spec context."""
+    if not declared:
+        return False
+    if "::" in line_low:
+        spec = line_low.split("::", 1)[0]
+        return re.search(r"\bvalue\b", spec) is not None
+
+    first_name_pos: Optional[int] = None
+    for name in declared:
+        m = re.search(rf"\b{re.escape(name.lower())}\b", line_low)
+        if m:
+            if first_name_pos is None or m.start() < first_name_pos:
+                first_name_pos = m.start()
+    if first_name_pos is None:
+        return False
+    spec = line_low[:first_name_pos]
+    return re.search(r"\bvalue\b", spec) is not None
 
 
 def io_unit_expr_from_control(control: str) -> Optional[str]:
@@ -370,9 +390,9 @@ def parse_procedures(lines: List[str]) -> List[Procedure]:
             # and ignore constructs like "end if", "end do", etc.
             is_proc_end = False
             end_kind: Optional[str] = None
-            if len(toks) == 1:
+            if len(toks) == 1 and toks[0] == "end":
                 is_proc_end = True
-            elif len(toks) >= 2 and toks[1] in {"function", "subroutine"}:
+            elif len(toks) >= 2 and toks[0] == "end" and toks[1] in {"function", "subroutine"}:
                 is_proc_end = True
                 end_kind = toks[1]
             if is_proc_end:
@@ -399,6 +419,14 @@ def has_function_reference(line: str, callee: str) -> bool:
     # Looks for token like "callee(".
     """Heuristically detect function-style references to a given name in code."""
     return re.search(rf"\b{re.escape(callee)}\s*\(", line, flags=re.IGNORECASE) is not None
+
+
+IDENT_RE = re.compile(r"[a-z][a-z0-9_]*", re.IGNORECASE)
+
+
+def line_identifiers(line: str) -> Set[str]:
+    """Extract lowercase identifiers from one Fortran statement line."""
+    return {m.group(0).lower() for m in IDENT_RE.finditer(line)}
 
 
 def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Dict[str, Set[str]]]:
@@ -616,6 +644,7 @@ def analyze_lines(
         dummy_with_intent_or_value: Set[str] = set()
         dummy_intent: Dict[str, str] = {}
         character_names: Set[str] = set()
+        external_proc_names: Set[str] = set()
 
         children = [p for p in procs if p.parent and p.parent.lower() == proc.name.lower()]
         nonpure_children = [c.name for c in children if not c.is_pure_or_elemental]
@@ -628,17 +657,25 @@ def analyze_lines(
                 continue
 
             if TYPE_DECL_RE.match(low):
+                if re.search(r"\bsave\b", low):
+                    reasons.append(f"line {ln}: SAVE attribute in declaration")
                 declared = parse_declared_names_any(low)
                 if declared:
                     local_names.update(declared)
+                    if re.search(r"\bexternal\b", low):
+                        external_proc_names.update(declared)
                     if low.strip().startswith("character"):
                         character_names.update(declared)
                     intent_attr = parse_decl_intent(low)
-                    if intent_attr:
+                    has_value_attr = decl_has_value_attr(low, declared)
+                    if intent_attr or has_value_attr:
                         for d in proc.dummy_names:
                             if d in declared:
-                                dummy_intent[d] = intent_attr
-                    if "intent(" in low or re.search(r"\bvalue\b", low):
+                                if intent_attr:
+                                    dummy_intent[d] = intent_attr
+                                elif has_value_attr:
+                                    dummy_intent[d] = "value"
+                    if "intent(" in low or has_value_attr:
                         for d in proc.dummy_names:
                             if d in declared:
                                 dummy_with_intent_or_value.add(d)
@@ -647,6 +684,11 @@ def analyze_lines(
                 reasons.append(
                     f"line {ln}: procedure dummy/pointer declaration (conservatively treated as non-pure candidate)"
                 )
+
+            if SAVE_STMT_RE.match(low):
+                reasons.append(f"line {ln}: SAVE statement")
+            if DATA_STMT_RE.match(low):
+                reasons.append(f"line {ln}: DATA statement")
 
             if PRINT_RE.match(low):
                 reasons.append(f"line {ln}: PRINT statement")
@@ -705,6 +747,9 @@ def analyze_lines(
 
             for m in CALL_RE.finditer(low):
                 callee = m.group(1).lower()
+                reasons.append(
+                    f"line {ln}: CALL to procedure '{callee}' (conservative pure check)"
+                )
                 generic_targets = generics.get(callee, set())
                 if callee in has_nonpure_name:
                     reasons.append(f"line {ln}: calls non-pure procedure '{callee}'")
@@ -747,11 +792,19 @@ def analyze_lines(
                         f"line {ln}: {m_alloc.group(1).lower()} of non-local variable '{obj_base}'"
                     )
 
-            for callee in ref_nonpure_names:
+            ids_on_line = line_identifiers(low)
+            for callee in (ids_on_line & ref_nonpure_names):
                 if callee == proc.name.lower():
                     continue
                 if has_function_reference(low, callee):
                     reasons.append(f"line {ln}: references non-pure function '{callee}'")
+            for callee in (ids_on_line & external_proc_names):
+                if callee == proc.name.lower():
+                    continue
+                if has_function_reference(low, callee):
+                    reasons.append(
+                        f"line {ln}: references EXTERNAL function '{callee}' (purity unknown)"
+                    )
 
         if proc.kind == "subroutine":
             for d in sorted(proc.dummy_names):
@@ -1074,6 +1127,7 @@ def apply_fix(
     targets: List[Procedure],
     backup: bool,
     show_diff: bool,
+    out_path: Optional[Path] = None,
 ) -> Tuple[int, Optional[Path], List[Tuple[str, str]]]:
     """Apply PURE edits to selected procedures in one source file."""
     if not targets:
@@ -1096,11 +1150,12 @@ def apply_fix(
         return 0, None, []
 
     if show_diff:
+        diff_to = str(out_path) if out_path is not None else str(path)
         diff = difflib.unified_diff(
             original_lines,
             updated,
             fromfile=str(path),
-            tofile=str(path),
+            tofile=diff_to,
             lineterm="",
         )
         print("\nProposed diff:")
@@ -1108,12 +1163,13 @@ def apply_fix(
             print(line)
 
     backup_path: Optional[Path] = None
-    if backup:
+    if backup and out_path is None:
         backup_path = path.with_name(path.name + ".bak")
         shutil.copy2(path, backup_path)
         print(f"\nBackup written: {backup_path}")
 
-    with path.open("w", encoding="utf-8", newline="") as f:
+    target = out_path if out_path is not None else path
+    with target.open("w", encoding="utf-8", newline="") as f:
         f.write("".join(updated))
     return changed, backup_path, changed_names
 
@@ -1124,6 +1180,7 @@ def apply_elemental_fix(
     targets: List[Procedure],
     backup: bool,
     show_diff: bool,
+    out_path: Optional[Path] = None,
 ) -> Tuple[int, Optional[Path], List[Tuple[str, str]]]:
     """Apply ELEMENTAL edits to selected procedures in one source file."""
     if not targets:
@@ -1146,11 +1203,12 @@ def apply_elemental_fix(
         return 0, None, []
 
     if show_diff:
+        diff_to = str(out_path) if out_path is not None else str(path)
         diff = difflib.unified_diff(
             original_lines,
             updated,
             fromfile=str(path),
-            tofile=str(path),
+            tofile=diff_to,
             lineterm="",
         )
         print("\nProposed diff:")
@@ -1158,12 +1216,13 @@ def apply_elemental_fix(
             print(line)
 
     backup_path: Optional[Path] = None
-    if backup:
+    if backup and out_path is None:
         backup_path = path.with_name(path.name + ".bak")
         shutil.copy2(path, backup_path)
         print(f"\nBackup written: {backup_path}")
 
-    with path.open("w", encoding="utf-8", newline="") as f:
+    target = out_path if out_path is not None else path
+    with target.open("w", encoding="utf-8", newline="") as f:
         f.write("".join(updated))
     return changed, backup_path, changed_names
 
@@ -1238,15 +1297,24 @@ def main() -> int:
         action="store_true",
         help="Commit changed files to git after successful run",
     )
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument(
         "--compiler",
         type=str,
         help="Compilation command. Use {files} as placeholder for source files, or files are appended.",
     )
-    parser.add_argument(
+    unknown_call_group = parser.add_mutually_exclusive_group()
+    unknown_call_group.add_argument(
         "--strict-unknown-calls",
+        dest="strict_unknown_calls",
         action="store_true",
-        help="Treat calls to unknown external procedures as purity blockers",
+        help="Treat calls to unknown external procedures as purity blockers (default)",
+    )
+    unknown_call_group.add_argument(
+        "--allow-unknown-calls",
+        dest="strict_unknown_calls",
+        action="store_false",
+        help="Allow unknown external calls when suggesting/applying PURE (less safe)",
     )
     parser.add_argument(
         "--suggest-elemental",
@@ -1269,7 +1337,14 @@ def main() -> int:
         default=10,
         help="Maximum iterations for --iterate (default: 10)",
     )
+    parser.add_argument("--limit", type=int, help="Maximum number of source files to process")
+    parser.set_defaults(strict_unknown_calls=True)
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
+    if args.limit is not None and args.limit < 1:
+        print("--limit must be >= 1.")
+        return 3
     verbose = args.verbose or args.show_rejections
 
     args.fortran_files = cpaths.expand_path_args(args.fortran_files)
@@ -1287,8 +1362,13 @@ def main() -> int:
             for p in args.fortran_files:
                 print(f"  - {display_path(p)}")
     args.fortran_files = fscan.apply_excludes(args.fortran_files, args.exclude)
+    if args.limit is not None:
+        args.fortran_files = args.fortran_files[: args.limit]
     if not args.fortran_files:
         print("No source files remain after applying --exclude filters.")
+        return 2
+    if args.out is not None and len(args.fortran_files) != 1:
+        print("--out requires exactly one input source file.")
         return 2
 
     if args.iterate and not args.fix:
@@ -1302,6 +1382,12 @@ def main() -> int:
         return 3
     if args.max_iter < 1:
         print("--max-iter must be >= 1.")
+        return 3
+    if args.out is not None and args.iterate:
+        print("--out is not supported with --iterate.")
+        return 3
+    if args.out is not None and args.git:
+        print("--out is not supported with --git.")
         return 3
 
     max_passes = args.max_iter if args.iterate else 1
@@ -1333,8 +1419,12 @@ def main() -> int:
             if verbose and had_cycle:
                 print("(dependency cycle detected; cycle members processed in path order)")
         compile_paths = [f.path for f in ordered_files]
+        after_compile_paths = compile_paths
         if args.compiler:
             compile_paths, unresolved_mods = fscan.build_compile_closure(ordered_files)
+            after_compile_paths = compile_paths
+            if args.out is not None and args.fix:
+                after_compile_paths = [args.out]
             if verbose and unresolved_mods:
                 print(
                     "Unresolved modules for dependency closure: "
@@ -1420,11 +1510,21 @@ def main() -> int:
 
             if args.suggest_elemental:
                 changed, backup_path, changed_names = apply_elemental_fix(
-                    finfo.path, finfo.lines, targets, backup=args.backup, show_diff=args.diff
+                    finfo.path,
+                    finfo.lines,
+                    targets,
+                    backup=args.backup,
+                    show_diff=args.diff,
+                    out_path=args.out,
                 )
             else:
                 changed, backup_path, changed_names = apply_fix(
-                    finfo.path, finfo.lines, targets, backup=args.backup, show_diff=args.diff
+                    finfo.path,
+                    finfo.lines,
+                    targets,
+                    backup=args.backup,
+                    show_diff=args.diff,
+                    out_path=args.out,
                 )
             changed_total += changed
             if backup_path is not None:
@@ -1443,7 +1543,8 @@ def main() -> int:
             return 4
         if args.compiler:
             phase = "after-fix" if args.fix else "current"
-            if not run_compiler_command(args.compiler, compile_paths, phase=phase):
+            check_paths = after_compile_paths if args.fix else compile_paths
+            if not run_compiler_command(args.compiler, check_paths, phase=phase):
                 if args.fix and args.backup and backup_pairs:
                     rollback_backups(backup_pairs)
                 return 5

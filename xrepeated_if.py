@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 
@@ -216,7 +217,12 @@ def analyze_file(path: Path) -> Tuple[List[Finding], List[FixPlan]]:
     return findings, plans
 
 
-def apply_fixes_for_file(path: Path, plans: List[FixPlan]) -> Tuple[int, Optional[Path]]:
+def apply_fixes_for_file(
+    path: Path,
+    plans: List[FixPlan],
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
+) -> Tuple[int, Optional[Path]]:
     """Apply non-overlapping plans in one file."""
     if not plans:
         return 0, None
@@ -241,7 +247,7 @@ def apply_fixes_for_file(path: Path, plans: List[FixPlan]) -> Tuple[int, Optiona
         block.append(f"{body_indent}{p.action2}")
         block.append(f"{indent}end if")
 
-        if backup is None:
+        if backup is None and out_path is None and create_backup:
             backup = make_backup_path(path)
             shutil.copy2(path, backup)
         lines[i1 : i2 + 1] = block
@@ -251,7 +257,8 @@ def apply_fixes_for_file(path: Path, plans: List[FixPlan]) -> Tuple[int, Optiona
         out = "\n".join(lines)
         if text.endswith("\n"):
             out += "\n"
-        path.write_text(out, encoding="utf-8")
+        target = out_path if out_path is not None else path
+        target.write_text(out, encoding="utf-8")
     return applied, backup
 
 
@@ -264,13 +271,29 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print all findings (default prints summary + first)")
     parser.add_argument("--fix", action="store_true", help="Rewrite repeated single-line IF pairs into IF...THEN blocks")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     all_findings: List[Finding] = []
     plans_by_file: Dict[Path, List[FixPlan]] = {}
@@ -306,27 +329,35 @@ def main() -> int:
         total_applied = 0
         for path in sorted(plans_by_file.keys(), key=lambda p: p.name.lower()):
             before = path.read_text(encoding="utf-8")
-            applied, backup = apply_fixes_for_file(path, plans_by_file[path])
+            out_path = args.out if args.out is not None else None
+            applied, backup = apply_fixes_for_file(
+                path, plans_by_file[path], out_path=out_path, create_backup=args.backup
+            )
             total_applied += applied
-            if applied > 0 and backup is not None:
+            if applied > 0 and out_path is not None:
+                print(f"\nFixed {path.name}: applied {applied}, wrote {out_path}")
+            elif applied > 0 and backup is not None:
                 print(f"\nFixed {path.name}: applied {applied}, backup {backup.name}")
             elif applied > 0:
                 print(f"\nFixed {path.name}: applied {applied}")
             else:
                 print(f"\nNo fixes applied to {path.name}")
             if args.diff and applied > 0:
-                after = path.read_text(encoding="utf-8")
+                after = (out_path if out_path is not None else path).read_text(encoding="utf-8")
                 diff_lines = difflib.unified_diff(
                     before.splitlines(),
                     after.splitlines(),
                     fromfile=f"a/{path.name}",
-                    tofile=f"b/{path.name}",
+                    tofile=f"b/{(out_path.name if out_path is not None else path.name)}",
                     lineterm="",
                 )
                 print("")
                 for line in diff_lines:
                     print(line)
         print(f"\n--fix summary: applied {total_applied}")
+        if args.compiler:
+            if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+                return 5
     return 0
 
 

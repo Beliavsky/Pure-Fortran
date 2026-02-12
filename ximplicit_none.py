@@ -203,6 +203,7 @@ def scan_suggestions(path: Path, lines: List[str]) -> List[Suggestion]:
     """Scan one source file and return missing-IMPLICIT-NONE suggestions."""
     suggestions: List[Suggestion] = []
     stack: List[UnitState] = []
+    module_ranges: List[Tuple[int, int]] = []
     interface_depth = 0
 
     for lineno, stmt in fscan.iter_fortran_statements(lines):
@@ -297,48 +298,176 @@ def scan_suggestions(path: Path, lines: List[str]) -> List[Suggestion]:
                     for i in range(len(stack) - 1, -1, -1):
                         if stack[i].kind == end_kind:
                             unit = stack.pop(i)
+                            if unit.kind == "module":
+                                module_ranges.append((unit.start_idx + 1, lineno))
                             if should_suggest(unit):
                                 suggestions.append(Suggestion(path, unit.kind, unit.name, unit.start_idx + 1))
                             break
                 else:
                     unit = stack.pop()
+                    if unit.kind == "module":
+                        module_ranges.append((unit.start_idx + 1, lineno))
                     if should_suggest(unit):
                         suggestions.append(Suggestion(path, unit.kind, unit.name, unit.start_idx + 1))
 
     while stack:
         unit = stack.pop()
+        if unit.kind == "module":
+            module_ranges.append((unit.start_idx + 1, len(lines)))
         if should_suggest(unit):
             suggestions.append(Suggestion(path, unit.kind, unit.name, unit.start_idx + 1))
-    return suggestions
 
+    # Enforce module-level-only IMPLICIT NONE: do not suggest contained procedures.
+    def inside_any_module(line: int) -> bool:
+        for lo, hi in module_ranges:
+            if lo <= line <= hi:
+                return True
+        return False
 
-def apply_fix(path: Path, suggestions: List[Suggestion], show_diff: bool, backup: bool) -> Tuple[int, Optional[Path]]:
-    """Insert IMPLICIT NONE lines for selected suggestions in one file."""
-    if not suggestions:
-        return 0, None
-
-    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
-    inserts: List[Tuple[int, str]] = []
+    filtered: List[Suggestion] = []
     for s in suggestions:
-        start_idx = s.line - 1
-        if start_idx < 0 or start_idx >= len(lines):
+        if s.kind in {"function", "subroutine"} and inside_any_module(s.line):
+            continue
+        filtered.append(s)
+    return filtered
+
+
+def find_contained_proc_implicit_none_lines(lines: List[str]) -> List[int]:
+    """Return 0-based line indices of IMPLICIT NONE inside module-contained procedures."""
+    stack: List[UnitState] = []
+    out: List[int] = []
+    interface_depth = 0
+
+    for lineno, stmt in fscan.iter_fortran_statements(lines):
+        low = stmt.strip().lower()
+        if not low:
+            continue
+
+        if INTERFACE_START_RE.match(low):
+            interface_depth += 1
+            continue
+        if END_INTERFACE_RE.match(low):
+            interface_depth = max(0, interface_depth - 1)
+            continue
+        if interface_depth > 0:
+            continue
+
+        m_prog = PROGRAM_START_RE.match(low)
+        if m_prog:
+            stack.append(
+                UnitState(
+                    kind="program",
+                    name=m_prog.group(1).lower(),
+                    start_idx=lineno - 1,
+                    indent="",
+                    has_implicit_none=False,
+                    in_module=False,
+                    parent_kind=stack[-1].kind if stack else None,
+                )
+            )
+            continue
+
+        m_mod = MODULE_START_RE.match(low)
+        if m_mod:
+            toks = low.split()
+            if len(toks) >= 2 and toks[1] != "procedure":
+                stack.append(
+                    UnitState(
+                        kind="module",
+                        name=m_mod.group(1).lower(),
+                        start_idx=lineno - 1,
+                        indent="",
+                        has_implicit_none=False,
+                        in_module=False,
+                        parent_kind=stack[-1].kind if stack else None,
+                    )
+                )
+            continue
+
+        m_proc = PROC_START_RE.match(low)
+        if m_proc:
+            in_module = any(u.kind == "module" for u in stack)
+            stack.append(
+                UnitState(
+                    kind=m_proc.group(1).lower(),
+                    name=m_proc.group(2).lower(),
+                    start_idx=lineno - 1,
+                    indent="",
+                    has_implicit_none=False,
+                    in_module=in_module,
+                    parent_kind=stack[-1].kind if stack else None,
+                )
+            )
+            continue
+
+        if IMPLICIT_NONE_RE.match(low):
+            if stack:
+                top = stack[-1]
+                if top.kind in {"function", "subroutine"} and top.in_module:
+                    out.append(lineno - 1)
+            continue
+
+        if CONTAINS_RE.match(low):
+            continue
+
+        if low.startswith("end") and stack:
+            toks = low.split()
+            is_unit_end = False
+            end_kind = ""
+            if len(toks) == 1:
+                is_unit_end = True
+            elif len(toks) >= 2 and toks[1] in {"program", "module", "function", "subroutine"}:
+                is_unit_end = True
+                end_kind = toks[1]
+            if is_unit_end:
+                if end_kind:
+                    for i in range(len(stack) - 1, -1, -1):
+                        if stack[i].kind == end_kind:
+                            stack.pop(i)
+                            break
+                else:
+                    stack.pop()
+    return sorted(set(out))
+
+
+def apply_fix(
+    path: Path,
+    suggestions: List[Suggestion],
+    show_diff: bool,
+    backup: bool,
+    out_path: Optional[Path] = None,
+) -> Tuple[int, Optional[Path]]:
+    """Insert IMPLICIT NONE lines for selected suggestions in one file."""
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+    remove_idxs = find_contained_proc_implicit_none_lines(lines)
+    remove_set = set(remove_idxs)
+    lines_after_removals = [ln for i, ln in enumerate(lines) if i not in remove_set]
+
+    inserts: List[Tuple[int, str]] = []
+    removed_before = 0
+    remove_ptr = 0
+    sorted_remove = sorted(remove_idxs)
+    for s in suggestions:
+        start_idx_orig = s.line - 1
+        while remove_ptr < len(sorted_remove) and sorted_remove[remove_ptr] < start_idx_orig:
+            removed_before += 1
+            remove_ptr += 1
+        start_idx = start_idx_orig - removed_before
+        if start_idx < 0 or start_idx >= len(lines_after_removals):
             continue
         if s.kind == "module":
-            insert_at = module_contains_insert_index(lines, start_idx)
+            insert_at = module_contains_insert_index(lines_after_removals, start_idx)
         else:
-            insert_at = unit_insert_index(lines, start_idx)
-        indent = choose_indent(lines, start_idx, insert_at)
-        new_line = f"{indent}implicit none{eol_of(lines[start_idx])}"
+            insert_at = unit_insert_index(lines_after_removals, start_idx)
+        indent = choose_indent(lines_after_removals, start_idx, insert_at)
+        new_line = f"{indent}implicit none{eol_of(lines_after_removals[start_idx])}"
         inserts.append((insert_at, new_line))
-
-    if not inserts:
-        return 0, None
 
     # Deduplicate insertion points.
     dedup: Dict[int, str] = {}
     for idx, text in inserts:
         dedup.setdefault(idx, text)
-    updated = lines[:]
+    updated = lines_after_removals[:]
     for idx, text in sorted(dedup.items(), key=lambda x: x[0], reverse=True):
         updated.insert(idx, text)
 
@@ -346,19 +475,21 @@ def apply_fix(path: Path, suggestions: List[Suggestion], show_diff: bool, backup
         return 0, None
 
     if show_diff:
-        diff = difflib.unified_diff(lines, updated, fromfile=str(path), tofile=str(path), lineterm="")
+        diff_to = str(out_path) if out_path is not None else str(path)
+        diff = difflib.unified_diff(lines, updated, fromfile=str(path), tofile=diff_to, lineterm="")
         print("\nProposed diff:")
         for d in diff:
             print(d)
 
     backup_path: Optional[Path] = None
-    if backup:
+    if backup and out_path is None:
         backup_path = path.with_name(path.name + ".bak")
         shutil.copy2(path, backup_path)
         print(f"Backup written: {backup_path.name}")
 
-    path.write_text("".join(updated), encoding="utf-8", newline="")
-    return len(dedup), backup_path
+    target = out_path if out_path is not None else path
+    target.write_text("".join(updated), encoding="utf-8", newline="")
+    return len(dedup) + len(remove_idxs), backup_path
 
 
 def print_summary(summary: Dict[Tuple[str, str], List[str]], label: str) -> None:
@@ -387,15 +518,27 @@ def main() -> int:
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--fix", action="store_true", help="Insert IMPLICIT NONE where suggested")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", action="store_true")
     parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix checks")
+    parser.add_argument("--limit", type=int, help="Maximum number of source files to process")
     args = parser.parse_args()
+    if args.limit is not None and args.limit < 1:
+        print("--limit must be >= 1.")
+        return 2
+    if args.out is not None:
+        args.fix = True
 
     files = choose_files(args.fortran_files, args.exclude)
+    if args.limit is not None:
+        files = files[: args.limit]
     if not files:
         print("No source files remain after applying --exclude filters.")
+        return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
         return 2
 
     infos, any_missing = fscan.load_source_files(files)
@@ -406,8 +549,12 @@ def main() -> int:
         print("Processing order:", " ".join(f.path.name for f in ordered_infos))
 
     compile_paths = [f.path for f in ordered_infos]
+    after_compile_paths = compile_paths
     if args.compiler:
         compile_paths, _ = fscan.build_compile_closure(ordered_infos)
+        after_compile_paths = compile_paths
+        if args.out is not None and args.fix:
+            after_compile_paths = [args.out]
 
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
@@ -421,18 +568,25 @@ def main() -> int:
         for s in suggestions:
             summary.setdefault((finfo.path.name, s.kind), []).append(s.name)
         if args.fix:
-            c, bak = apply_fix(finfo.path, suggestions, show_diff=args.diff, backup=args.backup)
+            out_path = args.out if args.out is not None else None
+            c, bak = apply_fix(
+                finfo.path,
+                suggestions,
+                show_diff=args.diff,
+                backup=args.backup,
+                out_path=out_path,
+            )
             changed += c
             if bak:
                 backups.append((finfo.path, bak))
 
     if args.fix and args.compiler:
-        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+        if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
             fbuild.rollback_backups(backups, fscan.display_path)
             return 5
 
     if args.fix:
-        print(f"\nInserted {changed} IMPLICIT NONE line(s).")
+        print(f"\nApplied {changed} IMPLICIT NONE edit(s).")
         print_summary(summary, "were marked implicit none")
     else:
         print_summary(summary, "can be marked implicit none")

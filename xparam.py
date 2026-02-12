@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 import xunset
 
@@ -802,7 +803,12 @@ def analyze_unit(
 
 
 def apply_fixes_for_file(
-    path: Path, candidates: List[Candidate], aggressive: bool = False, annotate: bool = False
+    path: Path,
+    candidates: List[Candidate],
+    aggressive: bool = False,
+    annotate: bool = False,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
 ) -> Tuple[int, List[FixSkip], Optional[Path]]:
     """Apply PARAMETER fixes to one file and return stats."""
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -897,7 +903,7 @@ def apply_fixes_for_file(
         if annotate:
             param_decl_line = f"{param_decl_line}  {ANNOTATE_CHANGED_SUFFIX}"
 
-        if backup_path is None:
+        if backup_path is None and out_path is None and create_backup:
             backup_path = make_backup_path(path)
             shutil.copy2(path, backup_path)
 
@@ -942,7 +948,8 @@ def apply_fixes_for_file(
         text = "\n".join(lines)
         if path.read_text(encoding="utf-8").endswith("\n"):
             text += "\n"
-        path.write_text(text, encoding="utf-8")
+        target = out_path if out_path is not None else path
+        target.write_text(text, encoding="utf-8")
     return applied, skipped, backup_path
 
 
@@ -984,7 +991,9 @@ def build_param_decl_suggestion(lines: List[str], c: Candidate) -> Optional[str]
     return f"{indent}! {left_new} :: {target_new} = {expr}  {ANNOTATE_SUGGEST_SUFFIX}"
 
 
-def apply_annotations_for_file(path: Path, candidates: List[Candidate]) -> Tuple[int, Optional[Path]]:
+def apply_annotations_for_file(
+    path: Path, candidates: List[Candidate], *, create_backup: bool = True
+) -> Tuple[int, Optional[Path]]:
     """Insert suggestion comments for candidates without rewriting code."""
     if not candidates:
         return 0, None
@@ -1002,7 +1011,7 @@ def apply_annotations_for_file(path: Path, candidates: List[Candidate]) -> Tuple
             continue
         if ins_idx < len(lines) and lines[ins_idx].strip().lower() == suggestion.strip().lower():
             continue
-        if backup_path is None:
+        if backup_path is None and create_backup:
             backup_path = make_backup_path(path)
             shutil.copy2(path, backup_path)
         lines.insert(ins_idx, suggestion)
@@ -1063,16 +1072,33 @@ def main() -> int:
         action="store_true",
         help="Allow allocatable rank-1 deferred-shape arrays to be promoted to PARAMETER when safe",
     )
+    parser.add_argument("--out", type=Path, help="With fix modes, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", action="store_true", help="With fix modes, print unified diffs for changed files")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
     if args.diff and not (args.fix or args.fix_all):
         print("--diff requires --fix or --fix-all.")
+        return 2
+    if args.compiler and not (args.fix or args.fix_all):
+        print("--compiler requires --fix or --fix-all.")
         return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    do_fix = args.fix or args.fix_all
+    compile_paths = [args.out] if (do_fix and args.out is not None) else files
+    if do_fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     infos, any_missing = fscan.load_source_files(files)
     if not infos:
@@ -1117,33 +1143,51 @@ def main() -> int:
             file_applied = 0
             file_skipped: List[FixSkip] = []
             backup_name = ""
-            max_iter = 100
-            for _iter in range(max_iter):
-                iter_candidates, _iter_exclusions = analyze_file(path, allow_alloc_promotion=args.fix_alloc)
-                if not iter_candidates:
-                    break
-                applied, skipped, backup = apply_fixes_for_file(
-                    path, iter_candidates, aggressive=args.fix_all, annotate=args.annotate
+            if args.out is not None:
+                applied, skipped, _backup = apply_fixes_for_file(
+                    path,
+                    by_file[path],
+                    aggressive=args.fix_all,
+                    annotate=args.annotate,
+                    out_path=args.out,
+                    create_backup=args.backup,
                 )
                 file_applied += applied
                 file_skipped.extend(skipped)
-                if backup is not None and not backup_name:
-                    backup_name = backup.name
-                if applied == 0:
-                    break
+            else:
+                max_iter = 100
+                for _iter in range(max_iter):
+                    iter_candidates, _iter_exclusions = analyze_file(path, allow_alloc_promotion=args.fix_alloc)
+                    if not iter_candidates:
+                        break
+                    applied, skipped, backup = apply_fixes_for_file(
+                        path,
+                        iter_candidates,
+                        aggressive=args.fix_all,
+                        annotate=args.annotate,
+                        create_backup=args.backup,
+                    )
+                    file_applied += applied
+                    file_skipped.extend(skipped)
+                    if backup is not None and not backup_name:
+                        backup_name = backup.name
+                    if applied == 0:
+                        break
             total_applied += file_applied
             total_skipped += len(file_skipped)
-            if backup_name:
+            if args.out is not None and file_applied > 0:
+                print(f"\nFixed {path.name}: applied {file_applied}, wrote {args.out}")
+            elif backup_name:
                 print(f"\nFixed {path.name}: applied {file_applied}, backup {backup_name}")
             elif file_applied == 0:
                 print(f"\nNo fixes applied to {path.name}")
             if args.diff and file_applied > 0:
-                updated_text = path.read_text(encoding="utf-8")
+                updated_text = (args.out if args.out is not None else path).read_text(encoding="utf-8")
                 diff_lines = difflib.unified_diff(
                     original_text.splitlines(),
                     updated_text.splitlines(),
                     fromfile=f"a/{path.name}",
-                    tofile=f"b/{path.name}",
+                    tofile=f"b/{(args.out.name if args.out is not None else path.name)}",
                     lineterm="",
                 )
                 print("")
@@ -1161,13 +1205,17 @@ def main() -> int:
         total_inserted = 0
         touched = 0
         for path in sorted(by_file.keys(), key=lambda p: p.name.lower()):
-            inserted, backup = apply_annotations_for_file(path, by_file[path])
+            inserted, backup = apply_annotations_for_file(path, by_file[path], create_backup=args.backup)
             total_inserted += inserted
             if inserted > 0:
                 touched += 1
                 bname = backup.name if backup is not None else "none"
                 print(f"\nAnnotated {path.name}: inserted {inserted} suggestion(s), backup {bname}")
         print(f"\n--annotate summary: files changed {touched}, inserted {total_inserted}")
+
+    if do_fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+            return 5
 
     return 0
 

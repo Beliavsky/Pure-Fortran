@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 import xunset
 
@@ -407,6 +408,8 @@ def apply_file_edits(
     *,
     fix: bool,
     annotate: bool,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
 ) -> Tuple[int, int, Optional[Path]]:
     """Apply fix/annotation edits in one file."""
     if not findings:
@@ -467,9 +470,12 @@ def apply_file_edits(
     if changed == 0 and inserted == 0:
         return 0, 0, None
 
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text("".join(lines), encoding="utf-8")
+    backup: Optional[Path] = None
+    target = out_path if (out_path is not None and fix) else path
+    if create_backup and (out_path is None or not fix):
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
+    target.write_text("".join(lines), encoding="utf-8")
     return changed, inserted, backup
 
 
@@ -482,18 +488,34 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full assignment statement lines")
     parser.add_argument("--fix", action="store_true", help="Comment out redundant allocate lines")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--annotate", action="store_true", help="Annotate findings (or tagged comments with --fix)")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
 
     if args.diff and not args.fix:
         print("--diff requires --fix.")
+        return 2
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
         return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     findings: List[Finding] = []
     for p in files:
@@ -530,21 +552,27 @@ def main() -> int:
     inserted_notes = 0
     for path, fs in sorted(by_file.items(), key=lambda kv: kv[0].name.lower()):
         before = path.read_text(encoding="utf-8")
-        n_changed, n_ins, backup = apply_file_edits(path, fs, fix=args.fix, annotate=args.annotate)
+        out_path = args.out if args.out is not None else None
+        n_changed, n_ins, backup = apply_file_edits(
+            path, fs, fix=args.fix, annotate=args.annotate, out_path=out_path, create_backup=args.backup
+        )
         if n_changed == 0 and n_ins == 0:
             continue
         changed_files += 1
         changed_lines += n_changed
         inserted_notes += n_ins
         if args.fix:
-            print(f"Fixed {path.name}: commented {n_changed} line(s) (backup: {backup.name})")
+            if out_path is not None:
+                print(f"Fixed {path.name}: commented {n_changed} line(s) (wrote: {out_path})")
+            else:
+                print(f"Fixed {path.name}: commented {n_changed} line(s) (backup: {backup.name})")
             if args.diff:
-                after = path.read_text(encoding="utf-8")
+                after = (out_path if out_path is not None else path).read_text(encoding="utf-8")
                 diff = difflib.unified_diff(
                     before.splitlines(),
                     after.splitlines(),
                     fromfile=path.name,
-                    tofile=f"{path.name} (updated)",
+                    tofile=f"{(out_path.name if out_path is not None else path.name)} (updated)",
                     lineterm="",
                 )
                 print("\n".join(diff))
@@ -556,6 +584,9 @@ def main() -> int:
         f"\n{mode} summary: files changed {changed_files}, "
         f"lines commented {changed_lines}, notes inserted {inserted_notes}"
     )
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+            return 5
     return 0
 
 

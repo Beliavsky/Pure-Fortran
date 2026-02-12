@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 
@@ -153,7 +154,12 @@ def analyze_file(path: Path, max_len: int) -> List[Finding]:
     return out
 
 
-def apply_fix_file(path: Path, max_len: int) -> Tuple[int, int, Optional[Path]]:
+def apply_fix_file(
+    path: Path,
+    max_len: int,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
+) -> Tuple[int, int, Optional[Path]]:
     """Wrap overlong lines in one file; returns (changed_lines, skipped_lines, backup)."""
     raw_lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     out: List[str] = []
@@ -179,9 +185,12 @@ def apply_fix_file(path: Path, max_len: int) -> Tuple[int, int, Optional[Path]]:
 
     if not touched:
         return 0, skipped, None
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text("".join(out), encoding="utf-8")
+    backup: Optional[Path] = None
+    target = out_path if out_path is not None else path
+    if out_path is None and create_backup:
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
+    target.write_text("".join(out), encoding="utf-8")
     return changed, skipped, backup
 
 
@@ -193,8 +202,14 @@ def main() -> int:
     parser.add_argument("--max-len", type=int, default=100, help="Maximum allowed line length (default: 100)")
     parser.add_argument("--verbose", action="store_true", help="Print full overlong lines")
     parser.add_argument("--fix", action="store_true", help="Wrap long lines with '&' continuation")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", "-diff", action="store_true", help="With --fix, show unified diffs for changed files")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
 
     if args.max_len < 20:
         print("--max-len should be at least 20.")
@@ -202,11 +217,21 @@ def main() -> int:
     if args.diff and not args.fix:
         print("--diff requires --fix.")
         return 2
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     findings: List[Finding] = []
     for p in files:
@@ -239,19 +264,23 @@ def main() -> int:
         total_skipped = 0
         for p in candidates:
             before = p.read_text(encoding="utf-8")
-            ch, sk, backup = apply_fix_file(p, args.max_len)
+            out_path = args.out if args.out is not None else None
+            ch, sk, backup = apply_fix_file(p, args.max_len, out_path=out_path, create_backup=args.backup)
             total_changed += ch
             total_skipped += sk
             if ch > 0:
                 files_changed += 1
-                print(f"\nFixed {p.name}: wrapped {ch}, skipped {sk}, backup {backup.name if backup else '(none)'}")
+                if out_path is not None:
+                    print(f"\nFixed {p.name}: wrapped {ch}, skipped {sk}, wrote {out_path}")
+                else:
+                    print(f"\nFixed {p.name}: wrapped {ch}, skipped {sk}, backup {backup.name if backup else '(none)'}")
                 if args.diff:
-                    after = p.read_text(encoding="utf-8")
+                    after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
                     diff = difflib.unified_diff(
                         before.splitlines(),
                         after.splitlines(),
                         fromfile=f"a/{p.name}",
-                        tofile=f"b/{p.name}",
+                        tofile=f"b/{(out_path.name if out_path is not None else p.name)}",
                         lineterm="",
                     )
                     txt = "\n".join(diff)
@@ -262,6 +291,9 @@ def main() -> int:
         print(
             f"\n--fix summary: files changed {files_changed}, wrapped {total_changed}, skipped {total_skipped}"
         )
+        if args.compiler:
+            if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+                return 5
     return 0
 
 

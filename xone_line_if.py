@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
@@ -214,7 +215,15 @@ def analyze_reverse_file(path: Path) -> List[ReverseFinding]:
     return out
 
 
-def apply_edits(path: Path, findings: List[Finding], *, fix: bool, annotate: bool) -> Tuple[int, int, Optional[Path]]:
+def apply_edits(
+    path: Path,
+    findings: List[Finding],
+    *,
+    fix: bool,
+    annotate: bool,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
+) -> Tuple[int, int, Optional[Path]]:
     """Apply fix/annotation edits for one file."""
     if not findings:
         return 0, 0, None
@@ -259,9 +268,12 @@ def apply_edits(path: Path, findings: List[Finding], *, fix: bool, annotate: boo
     if inserts_or_changes == 0:
         return 0, 0, None
 
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text("".join(lines), encoding="utf-8")
+    backup: Optional[Path] = None
+    target = out_path if (out_path is not None and fix) else path
+    if create_backup and (out_path is None or not fix):
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
+    target.write_text("".join(lines), encoding="utf-8")
     return inserts_or_changes, removed_lines, backup
 
 
@@ -271,6 +283,8 @@ def apply_reverse_edits(
     *,
     fix: bool,
     annotate: bool,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
 ) -> Tuple[int, int, Optional[Path]]:
     """Apply reverse edits (one-line IF -> block) for one file."""
     if not findings:
@@ -308,9 +322,12 @@ def apply_reverse_edits(
 
     if edits == 0:
         return 0, 0, None
-    backup = make_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text("".join(lines), encoding="utf-8")
+    backup: Optional[Path] = None
+    target = out_path if (out_path is not None and fix) else path
+    if create_backup and (out_path is None or not fix):
+        backup = make_backup_path(path)
+        shutil.copy2(path, backup)
+    target.write_text("".join(lines), encoding="utf-8")
     return edits, inserted_lines, backup
 
 
@@ -321,13 +338,22 @@ def main() -> int:
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full original body and suggestion")
     parser.add_argument("--fix", action="store_true", help="Rewrite matching 3-line IF blocks to one-line IF")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--backup", dest="backup", action="store_true", default=True)
+    parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--annotate", action="store_true", help="Insert suggested one-line IF comments")
     parser.add_argument("--diff", action="store_true", help="With edits, print unified diffs")
     parser.add_argument("--reverse", action="store_true", help="Operate in reverse: one-line IF -> 3-line IF block")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
 
     if args.diff and not (args.fix or args.annotate):
         print("--diff requires --fix or --annotate.")
+        return 2
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
         return 2
     if not args.fix and not args.annotate and not args.verbose:
         # advisory summary mode is allowed; no action needed
@@ -337,6 +363,13 @@ def main() -> int:
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     if not args.reverse:
         findings: List[Finding] = []
@@ -364,23 +397,34 @@ def main() -> int:
             touched = 0
             for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
                 before = p.read_text(encoding="utf-8")
-                ch, rem, backup = apply_edits(p, by_file[p], fix=args.fix, annotate=args.annotate)
+                out_path = args.out if args.out is not None else None
+                ch, rem, backup = apply_edits(
+                    p,
+                    by_file[p],
+                    fix=args.fix,
+                    annotate=args.annotate,
+                    out_path=out_path,
+                    create_backup=args.backup,
+                )
                 total_changes += ch
                 total_removed += rem
                 if ch > 0:
                     touched += 1
-                    print(
-                        f"\nEdited {p.name}: edits {ch}, removed lines {rem}, backup {backup.name if backup else '(none)'}"
-                    )
+                    if out_path is not None:
+                        print(f"\nEdited {p.name}: edits {ch}, removed lines {rem}, wrote {out_path}")
+                    else:
+                        print(
+                            f"\nEdited {p.name}: edits {ch}, removed lines {rem}, backup {backup.name if backup else '(none)'}"
+                        )
                     if args.diff:
-                        after = p.read_text(encoding="utf-8")
+                        after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
                         before_disp = before.replace("\ufeff", "")
                         after_disp = after.replace("\ufeff", "")
                         diff = difflib.unified_diff(
                             before_disp.splitlines(),
                             after_disp.splitlines(),
                             fromfile=f"a/{p.name}",
-                            tofile=f"b/{p.name}",
+                            tofile=f"b/{(out_path.name if out_path is not None else p.name)}",
                             lineterm="",
                         )
                         txt = "\n".join(diff)
@@ -391,6 +435,9 @@ def main() -> int:
             print(
                 f"\nsummary: files changed {touched}, edits {total_changes}, removed lines {total_removed}"
             )
+            if args.fix and args.compiler:
+                if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+                    return 5
         return 0
     # Reverse mode
     rfindings: List[ReverseFinding] = []
@@ -418,23 +465,34 @@ def main() -> int:
         touched = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding="utf-8")
-            ch, ins, backup = apply_reverse_edits(p, by_file[p], fix=args.fix, annotate=args.annotate)
+            out_path = args.out if args.out is not None else None
+            ch, ins, backup = apply_reverse_edits(
+                p,
+                by_file[p],
+                fix=args.fix,
+                annotate=args.annotate,
+                out_path=out_path,
+                create_backup=args.backup,
+            )
             total_changes += ch
             total_inserted += ins
             if ch > 0:
                 touched += 1
-                print(
-                    f"\nEdited {p.name}: edits {ch}, inserted lines {ins}, backup {backup.name if backup else '(none)'}"
-                )
+                if out_path is not None:
+                    print(f"\nEdited {p.name}: edits {ch}, inserted lines {ins}, wrote {out_path}")
+                else:
+                    print(
+                        f"\nEdited {p.name}: edits {ch}, inserted lines {ins}, backup {backup.name if backup else '(none)'}"
+                    )
                 if args.diff:
-                    after = p.read_text(encoding="utf-8")
+                    after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
                     before_disp = before.replace("\ufeff", "")
                     after_disp = after.replace("\ufeff", "")
                     diff = difflib.unified_diff(
                         before_disp.splitlines(),
                         after_disp.splitlines(),
                         fromfile=f"a/{p.name}",
-                        tofile=f"b/{p.name}",
+                        tofile=f"b/{(out_path.name if out_path is not None else p.name)}",
                         lineterm="",
                     )
                     txt = "\n".join(diff)
@@ -445,6 +503,9 @@ def main() -> int:
         print(
             f"\nsummary: files changed {touched}, edits {total_changes}, inserted lines {total_inserted}"
         )
+        if args.fix and args.compiler:
+            if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+                return 5
     return 0
 
 

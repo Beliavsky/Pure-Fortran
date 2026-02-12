@@ -277,6 +277,7 @@ def apply_fix_for_file(
     module_exports: Dict[str, ModuleExports],
     backup: bool,
     show_diff: bool,
+    out_path: Optional[Path] = None,
 ) -> Tuple[int, Optional[Path], Dict[str, List[str]]]:
     """Apply USE, ONLY rewrites for one file and return changed module-name mapping."""
     lines = finfo.lines[:]
@@ -312,11 +313,12 @@ def apply_fix_for_file(
         return 0, None, {}
 
     if show_diff:
+        diff_to = str(out_path) if out_path is not None else str(finfo.path)
         diff = difflib.unified_diff(
             finfo.lines,
             lines,
             fromfile=str(finfo.path),
-            tofile=str(finfo.path),
+            tofile=diff_to,
             lineterm="",
         )
         print("\nProposed diff:")
@@ -324,12 +326,13 @@ def apply_fix_for_file(
             print(d)
 
     backup_path: Optional[Path] = None
-    if backup:
+    if backup and out_path is None:
         backup_path = finfo.path.with_name(finfo.path.name + ".bak")
         shutil.copy2(finfo.path, backup_path)
         print(f"Backup written: {backup_path.name}")
 
-    finfo.path.write_text("".join(lines), encoding="utf-8", newline="")
+    target = out_path if out_path is not None else finfo.path
+    target.write_text("".join(lines), encoding="utf-8", newline="")
     return changed, backup_path, changes
 
 
@@ -339,15 +342,21 @@ def main() -> int:
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--fix", action="store_true", help="Rewrite USE statements to USE, ONLY")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", action="store_true")
     parser.add_argument("--compiler", type=str, help="Compilation command for fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
+        return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
         return 2
 
     infos, any_missing = fscan.load_source_files(files)
@@ -382,8 +391,12 @@ def main() -> int:
         return 0
 
     compile_paths = [f.path for f in ordered_infos]
+    after_compile_paths = compile_paths
     if args.compiler:
         compile_paths, _ = fscan.build_compile_closure(ordered_infos)
+        after_compile_paths = compile_paths
+        if args.out is not None and args.fix:
+            after_compile_paths = [args.out]
 
     if args.compiler and not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
         return 5
@@ -392,11 +405,13 @@ def main() -> int:
     backup_pairs: List[Tuple[Path, Path]] = []
     summary: Dict[str, Dict[str, List[str]]] = {}
     for finfo in ordered_infos:
+        out_path = args.out if args.out is not None else None
         changed, backup_path, changes = apply_fix_for_file(
             finfo,
             module_exports=module_exports,
             backup=args.backup,
             show_diff=args.diff,
+            out_path=out_path,
         )
         changed_total += changed
         if backup_path:
@@ -404,7 +419,12 @@ def main() -> int:
         if changes:
             summary[finfo.path.name] = changes
 
-    if args.compiler and not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+    if args.compiler and not fbuild.run_compiler_command(
+        args.compiler,
+        after_compile_paths,
+        "after-fix",
+        fscan.display_path,
+    ):
         fbuild.rollback_backups(backup_pairs, fscan.display_path)
         return 5
 

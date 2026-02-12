@@ -330,9 +330,12 @@ def main() -> int:
     )
     parser.add_argument("--out-dir", type=Path, default=Path("pruned"), help="Output directory (default: pruned)")
     parser.add_argument("--in-place", action="store_true", help="Modify sources in place (default: off)")
+    parser.add_argument("--fix", action="store_true", help="Alias for --in-place")
     parser.add_argument("--max-iter", type=int, default=10, help="Maximum prune passes (default: 10)")
     parser.add_argument("--verbose", action="store_true", help="Print accepted/rejected removals")
     args = parser.parse_args()
+    if args.fix:
+        args.in_place = True
 
     if args.max_iter < 1:
         print("--max-iter must be >= 1.")

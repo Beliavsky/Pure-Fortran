@@ -481,12 +481,25 @@ def main() -> int:
     parser.add_argument("--diff", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--git", action="store_true", help="Commit changed files to git after successful run")
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    if args.out is not None and args.git:
+        print("--out is not supported with --git.")
+        return 2
+    if args.out is not None:
+        src = files[0]
+        args.out.write_text(src.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8", newline="")
+        files = [args.out]
 
     infos, any_missing = fscan.load_source_files(files)
     if not infos:

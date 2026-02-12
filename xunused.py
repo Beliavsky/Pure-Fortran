@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+import fortran_build as fbuild
 import fortran_scan as fscan
 
 PROGRAM_START_RE = re.compile(r"^\s*program\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
@@ -616,6 +617,7 @@ def apply_fix(
     remove_assign_lines: Set[int],
     backup: bool,
     show_diff: bool,
+    out_path: Optional[Path] = None,
 ) -> Tuple[int, Optional[Path]]:
     """Apply conservative removal actions to one file."""
     if not decl_actions and not remove_assign_lines:
@@ -640,17 +642,19 @@ def apply_fix(
         return 0, None
 
     if show_diff:
-        diff = difflib.unified_diff(lines, updated, fromfile=str(path), tofile=str(path), lineterm="")
+        diff_to = str(out_path) if out_path is not None else str(path)
+        diff = difflib.unified_diff(lines, updated, fromfile=str(path), tofile=diff_to, lineterm="")
         print("\nProposed diff:")
         for d in diff:
             print(d)
 
     backup_path: Optional[Path] = None
-    if backup:
+    if backup and out_path is None:
         backup_path = path.with_name(path.name + ".bak")
         shutil.copy2(path, backup_path)
         print(f"Backup written: {backup_path.name}")
-    path.write_text("".join(updated), encoding="utf-8", newline="")
+    target = out_path if out_path is not None else path
+    target.write_text("".join(updated), encoding="utf-8", newline="")
     return changes, backup_path
 
 
@@ -774,15 +778,29 @@ def main() -> int:
         action="store_true",
         help="Also warn about likely dead-store assignments (advisory)",
     )
+    parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", action="store_true")
+    parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.out is not None:
+        args.fix = True
+    if args.compiler and not args.fix:
+        print("--compiler requires --fix.")
+        return 2
 
     files = choose_files(args.fortran_files, args.exclude)
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out is not None and len(files) != 1:
+        print("--out requires exactly one input source file.")
+        return 2
+    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
+            return 5
 
     infos, any_missing = fscan.load_source_files(files)
     if not infos:
@@ -835,12 +853,14 @@ def main() -> int:
 
         total_changes = 0
         for p in sorted({*per_file_decl_actions.keys(), *per_file_remove_assign.keys()}, key=lambda x: x.name.lower()):
+            out_path = args.out if args.out is not None else None
             c, _bak = apply_fix(
                 p,
                 per_file_decl_actions.get(p, {}),
                 per_file_remove_assign.get(p, set()),
                 backup=args.backup,
                 show_diff=args.diff,
+                out_path=out_path,
             )
             total_changes += c
         print(f"Applied {total_changes} conservative fix edit(s).")
@@ -865,6 +885,9 @@ def main() -> int:
             f"{first.name} [{first.category}] - {first.detail}"
         )
         print("Run with --verbose to list all findings.")
+    if args.fix and args.compiler:
+        if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
+            return 5
     return 0
 
 
