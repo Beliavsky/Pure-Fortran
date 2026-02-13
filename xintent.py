@@ -17,11 +17,13 @@ import cli_paths as cpaths
 import fortran_scan as fscan
 
 TYPE_DECL_RE = re.compile(
-    r"^\s*(integer|real|logical|character|complex|double\s+precision|type\b|class\b|procedure\b)",
+    r"^\s*(integer(?:\s*\*\s*\d+)?|real(?:\s*\*\s*\d+)?|logical(?:\s*\*\s*\d+)?|"
+    r"character(?:\s*\*\s*\d+)?|complex(?:\s*\*\s*\d+)?|double\s+precision|type\b|class\b|procedure\b)",
     re.IGNORECASE,
 )
 NO_COLON_DECL_RE = re.compile(
-    r"^\s*(?P<spec>(?:integer|real|logical|complex|character|double\s+precision)\s*(?:\([^)]*\))?"
+    r"^\s*(?P<spec>(?:integer(?:\s*\*\s*\d+)?|real(?:\s*\*\s*\d+)?|logical(?:\s*\*\s*\d+)?|"
+    r"complex(?:\s*\*\s*\d+)?|character(?:\s*\*\s*\d+)?|double\s+precision)\s*(?:\([^)]*\))?"
     r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?P<rhs>[a-z][a-z0-9_]*(?:.*))$",
     re.IGNORECASE,
 )
@@ -71,6 +73,28 @@ def add_summary_item(summary: Dict[Tuple[str, str], List[str]], s: IntentSuggest
     bucket = summary.setdefault(key, [])
     if token.lower() not in {x.lower() for x in bucket}:
         bucket.append(token)
+
+
+def suggestion_intent_priority(intent: str) -> int:
+    """Priority for conflicts on same dummy: inout > out > in."""
+    if intent == "inout":
+        return 3
+    if intent == "out":
+        return 2
+    if intent == "in":
+        return 1
+    return 0
+
+
+def dedupe_suggestions(suggestions: List[IntentSuggestion]) -> List[IntentSuggestion]:
+    """Deduplicate by (decl_line, dummy), keeping strongest intent suggestion."""
+    best: Dict[Tuple[int, str], IntentSuggestion] = {}
+    for s in suggestions:
+        key = (s.decl_line, s.dummy.lower())
+        prev = best.get(key)
+        if prev is None or suggestion_intent_priority(s.intent) > suggestion_intent_priority(prev.intent):
+            best[key] = s
+    return list(best.values())
 
 
 def print_summary(summary: Dict[Tuple[str, str], List[str]], label: str) -> None:
@@ -595,6 +619,24 @@ def parse_declared_array_flags(code_line: str) -> Dict[str, bool]:
     return out
 
 
+def parse_decl_entity_names(code_line: str) -> Set[str]:
+    """Parse only declared entity names (first token of each entity)."""
+    rhs = ""
+    if "::" in code_line:
+        rhs = code_line.split("::", 1)[1]
+    else:
+        m_no = NO_COLON_DECL_RE.match(code_line.strip())
+        if not m_no:
+            return set()
+        rhs = m_no.group("rhs")
+    out: Set[str] = set()
+    for ent in split_decl_entities(rhs):
+        mm = re.match(r"^\s*([a-z][a-z0-9_]*)", ent, re.IGNORECASE)
+        if mm:
+            out.add(mm.group(1).lower())
+    return out
+
+
 def parse_decl_intent(code_line: str) -> Optional[str]:
     """Extract intent from declaration attributes; value implies read-only."""
     low = code_line.lower()
@@ -690,6 +732,16 @@ def collect_provisional_proc_intents(ordered_files: List[fscan.SourceFileInfo]) 
             elif cur != s.intent:
                 # Conflicting provisional intents are treated as unknown.
                 bucket.pop(s.dummy.lower(), None)
+    return out
+
+
+def collect_provisional_proc_in_intents(ordered_files: List[fscan.SourceFileInfo]) -> Dict[str, Set[str]]:
+    """Collect provisional per-procedure dummies inferred as intent(in) only."""
+    out: Dict[str, Set[str]] = {}
+    for finfo in ordered_files:
+        sug_in = analyze_intent_suggestions(finfo, target_intent="in", call_sigs=None, interproc=False)
+        for s in sug_in:
+            out.setdefault(s.proc_name.lower(), set()).add(s.dummy.lower())
     return out
 
 
@@ -886,45 +938,68 @@ def collect_nonvariable_actual_formals(
     """Collect formals that are passed definitely non-variable actuals somewhere."""
     out: Dict[str, Set[str]] = {}
     for finfo in ordered_files:
+        sorted_procs = sorted(finfo.procedures, key=lambda p: p.start)
         all_stmts = fscan.iter_fortran_statements(finfo.parsed_lines)
-        for _ln, code in all_stmts:
-            low = code.lower()
-            low_nolab = strip_statement_label(low)
-            stmt = strip_one_line_where_prefix(strip_one_line_if_prefix(low_nolab))
-            stmt_s = stmt.strip().lower()
-            if not stmt_s:
-                continue
-            if is_declaration_statement(stmt_s):
-                continue
-            if re.match(
-                r"^(subroutine|function|program|module|contains|end\b|use\b|implicit\b|interface\b|type\b|class\b|procedure\b)",
-                stmt_s,
-            ):
-                continue
+        for pidx, proc in enumerate(sorted_procs):
+            next_start = sorted_procs[pidx + 1].start if pidx + 1 < len(sorted_procs) else (len(finfo.parsed_lines) + 1)
+            body_stmts = statements_in_range(all_stmts, proc.start, next_start)
 
-            invocations: List[Tuple[str, List[str]]] = []
-            parsed_call = parse_call_name_and_args(stmt)
-            if parsed_call is not None:
-                invocations.append(parsed_call)
-            invocations.extend(iter_function_invocations(stmt))
-
-            for pname, actuals in invocations:
-                sig = call_sigs.get(pname)
-                if not isinstance(sig, CallSignature):
+            param_names: Set[str] = set()
+            for _ln, code in body_stmts:
+                low = code.lower().strip()
+                if not low:
                     continue
-                for ai, act in enumerate(actuals):
-                    expr = top_level_equals(act)[1] if top_level_equals(act) is not None else act
-                    if not is_definitely_nonvariable_actual(expr):
+                if is_declaration_statement(low) and re.search(r"\bparameter\b", low):
+                    param_names.update(parse_declared_names_any(low))
+                m_par = re.match(r"^\s*parameter\s*\((.*)\)\s*$", low, re.IGNORECASE)
+                if m_par:
+                    for item in split_decl_entities(m_par.group(1)):
+                        kv = top_level_equals(item)
+                        if kv is not None:
+                            name = kv[0].strip().lower()
+                            if re.match(r"^[a-z][a-z0-9_]*$", name):
+                                param_names.add(name)
+
+            for _ln, code in body_stmts:
+                low = code.lower()
+                low_nolab = strip_statement_label(low)
+                stmt = strip_one_line_where_prefix(strip_one_line_if_prefix(low_nolab))
+                stmt_s = stmt.strip().lower()
+                if not stmt_s:
+                    continue
+                if is_declaration_statement(stmt_s):
+                    continue
+                if re.match(
+                    r"^(subroutine|function|program|module|contains|end\b|use\b|implicit\b|interface\b)",
+                    stmt_s,
+                ):
+                    continue
+
+                invocations: List[Tuple[str, List[str]]] = []
+                parsed_call = parse_call_name_and_args(low_nolab)
+                if parsed_call is not None:
+                    invocations.append(parsed_call)
+                invocations.extend(iter_function_invocations(low_nolab))
+
+                for pname, actuals in invocations:
+                    sig = call_sigs.get(pname)
+                    if not isinstance(sig, CallSignature):
                         continue
-                    kv = top_level_equals(act)
-                    if kv is not None:
-                        formal = kv[0].strip().lower()
-                    elif ai < len(sig.ordered_dummies):
-                        formal = sig.ordered_dummies[ai]
-                    else:
-                        continue
-                    if formal:
-                        out.setdefault(pname, set()).add(formal)
+                    for ai, act in enumerate(actuals):
+                        expr = top_level_equals(act)[1] if top_level_equals(act) is not None else act
+                        expr_base = fscan.base_identifier(expr)
+                        is_nonvar = is_definitely_nonvariable_actual(expr) or (expr_base in param_names)
+                        if not is_nonvar:
+                            continue
+                        kv = top_level_equals(act)
+                        if kv is not None:
+                            formal = kv[0].strip().lower()
+                        elif ai < len(sig.ordered_dummies):
+                            formal = sig.ordered_dummies[ai]
+                        else:
+                            continue
+                        if formal:
+                            out.setdefault(pname, set()).add(formal)
     return out
 
 
@@ -946,7 +1021,7 @@ def collect_observed_actual_formals(
             if is_declaration_statement(stmt_s):
                 continue
             if re.match(
-                r"^(subroutine|function|program|module|contains|end\b|use\b|implicit\b|interface\b|type\b|class\b|procedure\b)",
+                r"^(subroutine|function|program|module|contains|end\b|use\b|implicit\b|interface\b)",
                 stmt_s,
             ):
                 continue
@@ -1176,16 +1251,25 @@ def analyze_intent_suggestions(
                     probable_proc_dummies.add(d)
 
         writes: Set[str] = set()
+        write_events: Dict[str, List[Tuple[int, int]]] = {d: [] for d in proc.dummy_names}
+        read_events: Dict[str, List[int]] = {d: [] for d in proc.dummy_names}
+        self_read_writes: Set[str] = set()
         maybe_written_via_call: Set[str] = set()
         reads: Set[str] = set()
         spec_reads: Set[str] = set()
         const_like: Set[str] = set()
         first_event: Dict[str, Tuple[int, str]] = {}
+        control_depth = 0
         for ln, code in body_stmts:
             low = code.lower()
             low_nolab = strip_statement_label(low)
             low_exec = strip_one_line_if_prefix(low_nolab)
             low_exec = strip_one_line_where_prefix(low_exec)
+            stmt_s = low_exec.strip().lower()
+            raw_s = low_nolab.strip().lower()
+            # Track block depth conservatively for IF/DO blocks.
+            if re.match(r"^end\s*if\b", raw_s) or re.match(r"^end\s*do\b", raw_s):
+                control_depth = max(0, control_depth - 1)
             if is_declaration_statement(low_exec):
                 declared_here = parse_declared_names_any(low_exec)
                 rhs_decl = ""
@@ -1224,17 +1308,26 @@ def analyze_intent_suggestions(
                         if d not in first_event:
                             first_event[d] = (ln, "read")
                 continue
+            if re.match(
+                r"^(subroutine|function|program|module|contains|end\b|use\b|implicit\b|interface\b)",
+                stmt_s,
+            ):
+                continue
             asn = split_assignment(low_exec)
             if asn is not None:
                 lhs, rhs = asn
                 lhs_base = fscan.base_identifier(lhs)
                 if lhs_base in proc.dummy_names:
                     writes.add(lhs_base)
+                    write_events[lhs_base].append((ln, control_depth))
                     if lhs_base not in first_event:
                         first_event[lhs_base] = (ln, "write")
+                    if re.search(rf"\b{re.escape(lhs_base)}\b", rhs):
+                        self_read_writes.add(lhs_base)
                 for d in proc.dummy_names:
                     if re.search(rf"\b{re.escape(d)}\b", rhs):
                         reads.add(d)
+                        read_events[d].append(ln)
                         if d not in first_event:
                             first_event[d] = (ln, "read")
                 if interproc and call_sigs is not None:
@@ -1263,6 +1356,7 @@ def analyze_intent_suggestions(
                 obj = fscan.base_identifier(first_obj)
                 if obj in proc.dummy_names:
                     writes.add(obj)
+                    write_events[obj].append((ln, control_depth))
                     if obj not in first_event:
                         first_event[obj] = (ln, "write")
 
@@ -1270,11 +1364,13 @@ def analyze_intent_suggestions(
                 for obj in extract_read_iolist_bases(low_exec):
                     if obj in proc.dummy_names:
                         writes.add(obj)
+                        write_events[obj].append((ln, control_depth))
                         if obj not in first_event:
                             first_event[obj] = (ln, "write")
                 for obj in extract_read_control_write_bases(low_exec):
                     if obj in proc.dummy_names:
                         writes.add(obj)
+                        write_events[obj].append((ln, control_depth))
                         if obj not in first_event:
                             first_event[obj] = (ln, "write")
 
@@ -1282,11 +1378,12 @@ def analyze_intent_suggestions(
                 for d in proc.dummy_names:
                     if re.search(rf"^\s*{re.escape(d)}\s*=>", low_exec):
                         writes.add(d)
+                        write_events[d].append((ln, control_depth))
                         if d not in first_event:
                             first_event[d] = (ln, "write")
 
-            if CALL_RE.search(low_exec):
-                parsed_call = parse_call_name_and_args(low_exec)
+            if CALL_RE.search(low_nolab):
+                parsed_call = parse_call_name_and_args(low_nolab)
                 if parsed_call is None:
                     parsed_call = ("", [])
                 callee, actuals = parsed_call
@@ -1300,6 +1397,7 @@ def analyze_intent_suggestions(
                         fint = resolve_call_formal_intent(callee_sig, act, ai)
                         if fint == "in":
                             reads.add(d)
+                            read_events[d].append(ln)
                             if d not in first_event:
                                 first_event[d] = (ln, "read")
                             continue
@@ -1308,13 +1406,15 @@ def analyze_intent_suggestions(
                         first_event[d] = (ln, "call")
                 if not actuals:
                     for d in proc.dummy_names:
-                        if re.search(rf"\b{re.escape(d)}\b", low_exec):
+                        if re.search(rf"\b{re.escape(d)}\b", low_nolab):
                             maybe_written_via_call.add(d)
                             if d not in first_event:
                                 first_event[d] = (ln, "call")
 
             if interproc and call_sigs is not None:
-                for fname, fargs in iter_function_invocations(low_exec):
+                # Use the statement before one-line IF/WHERE stripping so we
+                # still see calls embedded in IF conditions.
+                for fname, fargs in iter_function_invocations(low_nolab):
                     fsig = call_sigs.get(fname)
                     if not isinstance(fsig, CallSignature):
                         continue
@@ -1326,6 +1426,7 @@ def analyze_intent_suggestions(
                         fint = resolve_call_formal_intent(fsig, act, ai)
                         if fint == "in":
                             reads.add(d)
+                            read_events[d].append(ln)
                             if d not in first_event:
                                 first_event[d] = (ln, "read")
                         else:
@@ -1336,6 +1437,7 @@ def analyze_intent_suggestions(
             write_unit = extract_write_unit_base(low_exec)
             if write_unit in proc.dummy_names and dummy_is_character.get(write_unit, False):
                 writes.add(write_unit)
+                write_events[write_unit].append((ln, control_depth))
                 if write_unit not in first_event:
                     first_event[write_unit] = (ln, "write")
 
@@ -1344,8 +1446,12 @@ def analyze_intent_suggestions(
                 it_name = m_do.group(1).lower()
                 if it_name in proc.dummy_names:
                     writes.add(it_name)
+                    write_events[it_name].append((ln, control_depth))
                     if it_name not in first_event:
                         first_event[it_name] = (ln, "write")
+
+            if re.match(r"^if\s*\(.*\)\s*then\b", raw_s) or re.match(r"^do\b", raw_s):
+                control_depth += 1
 
         for d in sorted(proc.dummy_names):
             if d in external_dummies or d in probable_proc_dummies:
@@ -1375,17 +1481,21 @@ def analyze_intent_suggestions(
                     continue
                 if d in maybe_written_via_call:
                     continue
-                if d in reads and (d not in writes or ev[1] != "write"):
-                    continue
+                if d in reads:
+                    # Allow reads only when there is a definite top-level write
+                    # before the first read (e.g. init-then-accumulate).
+                    first_read = min(read_events[d]) if read_events[d] else None
+                    safe_init = False
+                    if first_read is not None:
+                        for wln, wdepth in write_events[d]:
+                            if wln < first_read and wdepth == 0:
+                                safe_init = True
+                                break
+                    if not safe_init:
+                        continue
             elif target_intent == "inout":
                 # Conservative INTENT(IN OUT): written, and evidence of input usage.
                 if d not in writes:
-                    continue
-                # Only mark IN OUT when this formal is actually observed at calls
-                # in analyzed files, to avoid tightening interfaces blindly.
-                if observed_actual_formals is None:
-                    continue
-                if d not in observed_actual_formals.get(proc.name.lower(), set()):
                     continue
                 if nonvariable_actual_formals is not None:
                     if d in nonvariable_actual_formals.get(proc.name.lower(), set()):
@@ -1394,9 +1504,21 @@ def analyze_intent_suggestions(
                     continue
                 if d in maybe_written_via_call:
                     continue
-                # Require explicit read-like evidence in the procedure.
-                if d not in reads and d not in spec_reads:
+                # Require read-modify-write evidence (or declaration-spec read).
+                if d not in self_read_writes and d not in spec_reads:
                     continue
+                if d in reads:
+                    # If there is a clear top-level initialization before first read,
+                    # prefer INTENT(OUT) rather than INTENT(IN OUT).
+                    first_read = min(read_events[d]) if read_events[d] else None
+                    safe_init = False
+                    if first_read is not None:
+                        for wln, wdepth in write_events[d]:
+                            if wln < first_read and wdepth == 0:
+                                safe_init = True
+                                break
+                    if safe_init:
+                        continue
             else:
                 continue
             out.append(
@@ -1491,12 +1613,28 @@ def apply_fix(
     if not suggestions:
         return 0, None, []
 
+    def intent_priority(intent: str) -> int:
+        if intent == "inout":
+            return 3
+        if intent == "out":
+            return 2
+        if intent == "in":
+            return 1
+        return 0
+
     line_to_suggestions: Dict[int, List[IntentSuggestion]] = {}
     for s in suggestions:
         if not s.fixable:
             continue
         line_to_suggestions.setdefault(s.decl_line, [])
-        if all(x.dummy.lower() != s.dummy.lower() for x in line_to_suggestions[s.decl_line]):
+        replaced = False
+        for i, prev in enumerate(line_to_suggestions[s.decl_line]):
+            if prev.dummy.lower() == s.dummy.lower():
+                if intent_priority(s.intent) > intent_priority(prev.intent):
+                    line_to_suggestions[s.decl_line][i] = s
+                replaced = True
+                break
+        if not replaced:
             line_to_suggestions[s.decl_line].append(s)
 
     if not line_to_suggestions:
@@ -1575,7 +1713,12 @@ def reorder_arg_decls_before_locals(lines: List[str]) -> List[str]:
     for pidx, proc in enumerate(procs):
         if not proc.dummy_names:
             continue
-        ordered_dummies = parse_proc_header_ordered_dummies(parsed_lines[proc.start - 1])
+        start_stmt = ""
+        for ln, stmt in stmts:
+            if ln == proc.start:
+                start_stmt = stmt
+                break
+        ordered_dummies = parse_proc_header_ordered_dummies(start_stmt if start_stmt else parsed_lines[proc.start - 1])
         if not ordered_dummies:
             ordered_dummies = sorted(proc.dummy_names)
         dummy_pos = {name: i for i, name in enumerate(ordered_dummies)}
@@ -1583,11 +1726,16 @@ def reorder_arg_decls_before_locals(lines: List[str]) -> List[str]:
         body = statements_in_range(stmts, proc.start, next_start)
         decl_idxs: List[int] = []
         arg_line_keys: Dict[int, int] = {}
-        fixed_idxs: List[int] = []
+        param_idxs: List[int] = []
+        param_names_by_idx: Dict[int, Set[str]] = {}
+        skipped_decl_texts: List[str] = []
         interface_depth = 0
         in_spec_part = True
 
         for ln, stmt in body:
+            if ln == proc.start:
+                # Skip procedure header statement.
+                continue
             low = stmt.lower().strip()
             if INTERFACE_START_RE.match(low):
                 interface_depth += 1
@@ -1616,13 +1764,15 @@ def reorder_arg_decls_before_locals(lines: List[str]) -> List[str]:
             raw = out[idx].rstrip("\r\n")
             # Skip complex physical lines; keep reordering conservative.
             if ";" in raw or raw.rstrip().endswith("&") or raw.lstrip().startswith("&"):
+                skipped_decl_texts.append(low)
                 continue
-            declared = parse_declared_names_any(low)
+            declared = parse_decl_entity_names(low)
             if not declared:
                 continue
             decl_idxs.append(idx)
             if re.search(r"\bparameter\b", low):
-                fixed_idxs.append(idx)
+                param_idxs.append(idx)
+                param_names_by_idx[idx] = set(declared)
                 continue
             arg_names = [d for d in declared if d in dummy_pos]
             if arg_names:
@@ -1630,13 +1780,44 @@ def reorder_arg_decls_before_locals(lines: List[str]) -> List[str]:
 
         if not arg_line_keys:
             continue
+
+        # Keep only parameter declarations that are used in argument declaration lines
+        # ahead of args; other parameters are treated like locals.
+        arg_decl_texts = [
+            parsed_lines[idx].lower()
+            for idx in decl_idxs
+            if idx in arg_line_keys
+        ]
+        fixed_idxs: List[int] = []
+        for pidx in param_idxs:
+            pnames = param_names_by_idx.get(pidx, set())
+            used_in_arg_decl = False
+            used_in_skipped_decl = False
+            for pname in pnames:
+                pat = rf"\b{re.escape(pname)}\b"
+                if any(re.search(pat, txt) for txt in arg_decl_texts):
+                    used_in_arg_decl = True
+                    break
+                if any(re.search(pat, txt) for txt in skipped_decl_texts):
+                    used_in_skipped_decl = True
+            if used_in_arg_decl:
+                fixed_idxs.append(pidx)
+                continue
+            if used_in_skipped_decl:
+                fixed_idxs.append(pidx)
+
         arg_idxs = [idx for idx in decl_idxs if idx in arg_line_keys and idx not in fixed_idxs]
-        local_idxs = [idx for idx in decl_idxs if idx not in arg_line_keys and idx not in fixed_idxs]
+        trailing_param_idxs = [idx for idx in param_idxs if idx not in fixed_idxs]
+        local_idxs = [
+            idx
+            for idx in decl_idxs
+            if idx not in arg_line_keys and idx not in fixed_idxs and idx not in trailing_param_idxs
+        ]
 
         # Keep relative order for lines with the same argument position key.
         arg_sorted = sorted(arg_idxs, key=lambda idx: (arg_line_keys[idx], idx))
         fixed_order = [idx for idx in decl_idxs if idx in fixed_idxs]
-        want_order = fixed_order + arg_sorted + local_idxs
+        want_order = fixed_order + arg_sorted + trailing_param_idxs + local_idxs
         have_order = decl_idxs
         if want_order == have_order:
             continue
@@ -1784,6 +1965,17 @@ def main() -> int:
         nonvariable_actual_formals: Optional[Dict[str, Set[str]]] = None
         observed_actual_formals: Optional[Dict[str, Set[str]]] = None
         if call_sigs is not None:
+            if args.interproc:
+                # Seed missing interprocedural signatures with conflict-checked
+                # provisional intents from current source state. This avoids
+                # forcing intent(in) where local evidence indicates out/inout.
+                provisional = collect_provisional_proc_intents(ordered_files)
+                for pname, by_dummy in provisional.items():
+                    sig = call_sigs.get(pname)
+                    if not isinstance(sig, CallSignature):
+                        continue
+                    for dname, dint in by_dummy.items():
+                        sig.intent_by_dummy.setdefault(dname, dint)
             nonvariable_actual_formals = collect_nonvariable_actual_formals(ordered_files, call_sigs)
             observed_actual_formals = collect_observed_actual_formals(ordered_files, call_sigs)
 
@@ -1816,7 +2008,7 @@ def main() -> int:
                     nonvariable_actual_formals=nonvariable_actual_formals,
                     observed_actual_formals=observed_actual_formals,
                 )
-            suggestions = suggestions_in + suggestions_out + suggestions_inout
+            suggestions = dedupe_suggestions(suggestions_in + suggestions_out + suggestions_inout)
             if args.verbose:
                 print(f"File: {fscan.display_path(finfo.path)}")
                 if args.suggest_intent_out or args.suggest_intent_inout:
