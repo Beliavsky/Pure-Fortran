@@ -63,6 +63,8 @@ A dummy is suggested for `intent(out)` iff:
 5. It is not const-like initialized in declaration.
 6. It is not read in declaration/spec expressions.
 7. It is not a formal that is observed with non-variable actuals at call sites.
+8. If it is read in executable code, there must be a clear top-level initialization write
+   before the first read (for example `z = 0; z = z + ...`).
 
 ## `intent(in out)` Rule (`--suggest-intent-inout`)
 
@@ -73,16 +75,21 @@ A dummy is suggested for `intent(in out)` iff:
 3. It has read evidence (`reads` or `spec_reads`).
 4. It has no maybe-written-via-call event.
 5. It is not const-like initialized in declaration.
-6. It is observed at real call sites in analyzed files.
-7. It is never observed with non-variable actuals at call sites.
+6. It is not a formal that is observed with non-variable actuals at call sites.
+7. If there is a clear top-level initialization write before first read, `intent(out)` is
+   preferred and `intent(in out)` is not suggested.
 
-Call-site safety behavior is intentionally conservative: `intent(in out)` is not suggested just from local body shape if usage at calls is unknown.
+Typical `intent(in out)` pattern accepted:
+
+- read-modify-write use such as `x = alpha*x` or `a = a + 1`.
 
 ## Interprocedural Mode (`--interproc`)
 
 `--interproc` improves call argument classification conservatively:
 
 - For `call callee(...)` and function invocations `callee(...)`, if callee signature is known and the matched formal is explicit `intent(in)`/`value`, the actual is treated as read for that call.
+- In addition, provisional intra-file `intent(in)` inferences are used conservatively to
+  improve read-only call-argument classification.
 - Otherwise, actual is treated as maybe-written-via-call.
 - Ambiguous/missing callee resolution remains conservative.
 
@@ -91,10 +98,12 @@ Call-site safety behavior is intentionally conservative: `intent(in out)` is not
 - Applies only fixable inferred suggestions.
 - Rewrites declaration statements (with and without `::`), including multi-entity and continued declarations.
 - Uses `intent(in out)` spelling for inout fixes.
+- Reorders declarations in specification parts so argument declarations come before locals,
+  in argument-list order. `parameter` declarations are kept before args only when needed
+  by argument declarations.
 - Does not modify lines already containing `intent(...)` or `value`.
 
 ## Practical Limitations
 
 - Analysis is token/dataflow heuristic, not full semantic alias analysis.
-- Call-site safety for `in out` depends on observed call sites in scanned files.
 - Compile validation with `--compiler` is strongly recommended for fix workflows.
