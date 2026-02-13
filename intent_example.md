@@ -1,5 +1,7 @@
+## Example of xintent.py output
+
 `python xintent.py m_stats.f90 --out m_stats_intent.f90 --suggest-intent-out --suggest-intent-inout`
-transforms
+transforms code with no argument intents
 
 ```fortran
   module m_stats
