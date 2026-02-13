@@ -1,95 +1,100 @@
-﻿# xintent.py INTENT Rules
+# xintent.py Intent Rules
 
-This document describes the current conservative rules used by `xintent.py` to decide when a dummy argument can be marked `intent(in)` or `intent(out)`.
+This document describes the current conservative rules used by `xintent.py` to suggest and apply:
+
+- `intent(in)` (default mode)
+- `intent(out)` (`--suggest-intent-out`)
+- `intent(in out)` (`--suggest-intent-inout`)
 
 ## Scope
 
-- Analysis is per procedure (subroutine/function) from `fortran_scan.py` parsing.
+- Analysis is per procedure (subroutine/function) parsed via `fortran_scan.py`.
 - Only declared dummy arguments are considered.
 - If a case is ambiguous, the tool prefers no suggestion.
 
-## Dummy eligibility prerequisites
+## Dummy Eligibility Prerequisites
 
-A dummy must satisfy all of the following before intent inference:
+A dummy must satisfy all of the following:
 
-1. It has a declaration line in the procedure body.
-2. Its declaration does **not** already contain:
-   - `intent(...)`, or
-   - `value`, or
-   - `external` (treated as procedure-like and skipped).
-3. Its declaration is **not** `allocatable` or `pointer` (skipped).
-4. It is not inferred to be procedure-like by usage:
-   - scalar dummy used as `d(...)` in executable code is treated as probable procedure dummy and skipped.
+1. It has a declaration in the procedure body.
+2. Its declaration does not already contain:
+   - `intent(...)`
+   - `value`
+   - `external` (treated as procedure-like/explicitly excluded)
+3. Its declaration is not `allocatable` or `pointer`.
+4. It is not inferred procedure-like by usage (for example scalar `d(...)` use in executable code).
 
-## Read/write event detection
+## Event Detection
 
-For each eligible dummy, `xintent.py` scans executable statements and records events:
+For eligible dummies, `xintent.py` scans statements and records conservative events:
 
-- **Write** if dummy is on assignment LHS:
-  - `d = ...`
-  - `d(...) = ...`
-  - `%` component LHS base is also recognized via base identifier.
-- **Read** if dummy token appears on assignment RHS.
-- **Write** if dummy appears as first object in `allocate(...)` or `deallocate(...)`.
-- **Write** if dummy appears in a `read(...)` statement.
-- **Write** for pointer assignment `d => ...`.
-- **Maybe-written-via-call** if dummy appears in any `call ...` statement argument list.
-- **Write** if dummy is the internal file/unit target in `write(...)`.
-- **Write** if dummy is used as a `do` iterator variable.
+- **Write**
+  - assignment LHS (`d = ...`, `d(...) = ...`, component base `d%...`)
+  - first object in `allocate(...)` / `deallocate(...)`
+  - pointer assignment `d => ...`
+  - `do d = ...` iterator
+  - `read(...)` i/o list targets (including implied-do targets)
+  - `read(..., iostat=..., iomsg=..., size=...)` control targets
+  - `write(...)` internal-file unit target only when dummy is `character`
+- **Read**
+  - assignment RHS token use
+  - declaration/spec-expression use (for example bounds using another dummy)
+- **Maybe-written-via-call**
+  - call/function-actual usage not provably `intent(in)` under interprocedural rules
 
-The tool tracks each dummy's **first event** (`read`, `write`, or `call`) by source line.
+The tool also tracks each dummy's first observed event (`read`, `write`, or `call`).
 
-Notes:
-
-- Leading statement labels are stripped before analysis.
-- One-line `if (...) stmt` and one-line `where (...) stmt` prefixes are stripped so the inner statement is analyzed.
-
-## `intent(in)` rule
+## `intent(in)` Rule
 
 A dummy is suggested for `intent(in)` iff:
 
-1. It passes eligibility prerequisites.
-2. It has **no write events**.
-3. It has **no maybe-written-via-call** event.
+1. It passes eligibility.
+2. It has no write events.
+3. It has no maybe-written-via-call event.
 
-Equivalent intuition: appears read-only and not passed to calls in a way that might modify it.
-
-## `intent(out)` rule (`--suggest-intent-out`)
+## `intent(out)` Rule (`--suggest-intent-out`)
 
 A dummy is suggested for `intent(out)` iff:
 
-1. It passes eligibility prerequisites.
-2. It has at least one **write** event.
-3. Its **first event is write** (so not read/call before first write).
-4. It has no **maybe-written-via-call** event.
+1. It passes eligibility.
+2. It has at least one write event.
+3. Its first event is `write`.
+4. It has no maybe-written-via-call event.
+5. It is not const-like initialized in declaration.
+6. It is not read in declaration/spec expressions.
+7. It is not a formal that is observed with non-variable actuals at call sites.
 
-Equivalent intuition: value is established by the procedure before any use, and not ambiguous due to call-side effects.
+## `intent(in out)` Rule (`--suggest-intent-inout`)
 
-## What `--fix` edits
+A dummy is suggested for `intent(in out)` iff:
 
-- Only suggestions marked fixable are edited (the inferred intent suggestions are fixable; reporting from `--warn-missing-intent` is advisory).
-- Declaration rewrite supports:
-  - `::` declarations,
-  - many no-`::` declarations,
-  - multi-entity declarations,
-  - semicolon-separated declaration statements,
-  - continued declaration statements.
-- Existing `intent(...)` or `value` declarations are not touched.
+1. It passes eligibility.
+2. It has at least one write event.
+3. It has read evidence (`reads` or `spec_reads`).
+4. It has no maybe-written-via-call event.
+5. It is not const-like initialized in declaration.
+6. It is observed at real call sites in analyzed files.
+7. It is never observed with non-variable actuals at call sites.
 
-## Conservative limitations
+Call-site safety behavior is intentionally conservative: `intent(in out)` is not suggested just from local body shape if usage at calls is unknown.
 
-- Token-based scans can miss deeper dataflow/aliasing semantics.
-- Any dummy seen in call argument context is conservatively blocked for both `intent(in)` and `intent(out)`.
-- Procedure-like ambiguities (for example scalar name called as `d(...)`) are skipped.
-- Compile validation (`--compiler`) is recommended in fix workflows.
+## Interprocedural Mode (`--interproc`)
 
-## Optional interprocedural mode (`--interproc`)
+`--interproc` improves call argument classification conservatively:
 
-`--interproc` relaxes the call-site rule conservatively:
+- For `call callee(...)` and function invocations `callee(...)`, if callee signature is known and the matched formal is explicit `intent(in)`/`value`, the actual is treated as read for that call.
+- Otherwise, actual is treated as maybe-written-via-call.
+- Ambiguous/missing callee resolution remains conservative.
 
-- For `call callee(...)`, if `callee` resolves to a unique known signature and the matched formal dummy is known `intent(in)` (or `value`), the caller actual is treated as read-only for that call.
-- If callee resolution is missing/ambiguous, argument mapping is unclear, or formal intent is unknown/not `in`, behavior stays conservative (call may write).
+## What `--fix` Changes
 
-This means `--interproc` can enable additional `intent(in)` suggestions in callers when callee intents are already explicit and unambiguous.
+- Applies only fixable inferred suggestions.
+- Rewrites declaration statements (with and without `::`), including multi-entity and continued declarations.
+- Uses `intent(in out)` spelling for inout fixes.
+- Does not modify lines already containing `intent(...)` or `value`.
 
+## Practical Limitations
 
+- Analysis is token/dataflow heuristic, not full semantic alias analysis.
+- Call-site safety for `in out` depends on observed call sites in scanned files.
+- Compile validation with `--compiler` is strongly recommended for fix workflows.

@@ -17,12 +17,12 @@ import cli_paths as cpaths
 import fortran_scan as fscan
 
 TYPE_DECL_RE = re.compile(
-    r"^\s*(integer|real|logical|character|complex|type\b|class\b|procedure\b)",
+    r"^\s*(integer|real|logical|character|complex|double\s+precision|type\b|class\b|procedure\b)",
     re.IGNORECASE,
 )
 NO_COLON_DECL_RE = re.compile(
-    r"^\s*(?P<spec>(?:integer|real|logical|complex|character)\s*(?:\([^)]*\))?"
-    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?P<rhs>[a-z][a-z0-9_].*)$",
+    r"^\s*(?P<spec>(?:integer|real|logical|complex|character|double\s+precision)\s*(?:\([^)]*\))?"
+    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?P<rhs>[a-z][a-z0-9_]*(?:.*))$",
     re.IGNORECASE,
 )
 ASSIGN_RE = re.compile(
@@ -33,7 +33,10 @@ ALLOC_DEALLOC_RE = re.compile(r"^\s*(allocate|deallocate)\s*\((.+)\)\s*$", re.IG
 CALL_RE = re.compile(r"\bcall\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 EXTERNAL_STMT_RE = re.compile(r"^\s*external\b(.*)$", re.IGNORECASE)
 WRITE_START_RE = re.compile(r"^\s*write\s*\(", re.IGNORECASE)
+READ_START_RE = re.compile(r"^\s*read\b", re.IGNORECASE)
 DO_ITER_RE = re.compile(r"^\s*do\b(?:\s+\d+\s+)?\s*([a-z][a-z0-9_]*)\s*=", re.IGNORECASE)
+INTERFACE_START_RE = re.compile(r"^\s*(abstract\s+)?interface\b", re.IGNORECASE)
+END_INTERFACE_RE = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
 PROC_HEADER_ARGS_RE = re.compile(
     r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\s+"
     r"[a-z][a-z0-9_]*\s*\(([^)]*)\)",
@@ -269,13 +272,14 @@ def get_eol(line: str) -> str:
 
 def add_intent_attr(line: str, intent: str) -> Tuple[str, bool]:
     """Insert an INTENT attribute into a declaration line when eligible."""
+    intent_text = "in out" if intent == "inout" else intent
     code, comment = split_code_comment(line)
     if "::" not in code:
         return line, False
     lhs, rhs = code.split("::", 1)
     if "intent(" in lhs.lower() or re.search(r"\bvalue\b", lhs.lower()):
         return line, False
-    new_code = lhs.rstrip() + f", intent({intent}) ::" + rhs
+    new_code = lhs.rstrip() + f", intent({intent_text}) ::" + rhs
     return new_code + comment, True
 
 
@@ -385,6 +389,152 @@ def extract_write_unit_base(stmt: str) -> Optional[str]:
     if not unit_expr:
         return None
     return fscan.base_identifier(unit_expr)
+
+
+def extract_read_iolist_bases(stmt: str) -> Set[str]:
+    """Return base identifiers written by READ via its input item list."""
+    s = stmt.strip()
+    if not READ_START_RE.match(s):
+        return set()
+    low = s.lower()
+    pos = low.find("read")
+    tail = s[pos + 4 :].lstrip()
+    if not tail:
+        return set()
+
+    iolist = ""
+    if tail.startswith("("):
+        depth = 0
+        in_single = False
+        in_double = False
+        rpar = -1
+        for i, ch in enumerate(tail):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                continue
+            if in_single or in_double:
+                continue
+            if ch == "(":
+                depth += 1
+                continue
+            if ch == ")":
+                depth -= 1
+                if depth == 0:
+                    rpar = i
+                    break
+        if rpar < 0:
+            return set()
+        iolist = tail[rpar + 1 :].strip()
+    elif tail.startswith("*"):
+        comma = tail.find(",")
+        if comma < 0:
+            return set()
+        iolist = tail[comma + 1 :].strip()
+    else:
+        # Unhandled legacy form; do not guess.
+        return set()
+
+    if not iolist:
+        return set()
+
+    def implied_do_target_base(item: str) -> Optional[str]:
+        t = item.strip()
+        if not t.startswith("(") or not t.endswith(")"):
+            return None
+        inner = t[1:-1].strip()
+        if not inner:
+            return None
+        depth = 0
+        in_single = False
+        in_double = False
+        comma = -1
+        for i, ch in enumerate(inner):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                continue
+            if in_single or in_double:
+                continue
+            if ch == "(":
+                depth += 1
+                continue
+            if ch == ")" and depth > 0:
+                depth -= 1
+                continue
+            if ch == "," and depth == 0:
+                comma = i
+                break
+        if comma < 0:
+            return None
+        expr = inner[:comma].strip()
+        if not expr:
+            return None
+        return fscan.base_identifier(expr)
+
+    out: Set[str] = set()
+    for item in split_decl_entities(iolist):
+        base = fscan.base_identifier(item)
+        if not base:
+            base = implied_do_target_base(item)
+        if base:
+            out.add(base)
+    return out
+
+
+def extract_read_control_write_bases(stmt: str) -> Set[str]:
+    """Return base identifiers written by READ control specifiers (IOSTAT/IOMSG/SIZE)."""
+    s = stmt.strip()
+    if not READ_START_RE.match(s):
+        return set()
+    low = s.lower()
+    pos = low.find("read")
+    tail = s[pos + 4 :].lstrip()
+    if not tail.startswith("("):
+        return set()
+
+    depth = 0
+    in_single = False
+    in_double = False
+    rpar = -1
+    for i, ch in enumerate(tail):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                rpar = i
+                break
+    if rpar < 0:
+        return set()
+
+    ctl = tail[1:rpar].strip()
+    if not ctl:
+        return set()
+    out: Set[str] = set()
+    for part in split_decl_entities(ctl):
+        kv = top_level_equals(part.strip())
+        if kv is None:
+            continue
+        key = kv[0].lower()
+        if key in {"iostat", "iomsg", "size"}:
+            base = fscan.base_identifier(kv[1])
+            if base:
+                out.add(base)
+    return out
 
 
 def parse_external_names(stmt: str) -> Set[str]:
@@ -583,6 +733,76 @@ def parse_call_name_and_args(stmt: str) -> Optional[Tuple[str, List[str]]]:
     return name, split_decl_entities(inside)
 
 
+def iter_function_invocations(stmt: str) -> List[Tuple[str, List[str]]]:
+    """Find function-like invocations NAME(...) within a statement."""
+    out: List[Tuple[str, List[str]]] = []
+    s = stmt
+    n = len(s)
+    i = 0
+    in_single = False
+    in_double = False
+    while i < n:
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double:
+            i += 1
+            continue
+        if ch.isalpha():
+            j = i + 1
+            while j < n and (s[j].isalnum() or s[j] == "_"):
+                j += 1
+            name = s[i:j].lower()
+            k = j
+            while k < n and s[k].isspace():
+                k += 1
+            if k < n and s[k] == "(":
+                depth = 0
+                in_s2 = False
+                in_d2 = False
+                endp = -1
+                m = k
+                while m < n:
+                    c2 = s[m]
+                    if c2 == "'" and not in_d2:
+                        in_s2 = not in_s2
+                        m += 1
+                        continue
+                    if c2 == '"' and not in_s2:
+                        in_d2 = not in_d2
+                        m += 1
+                        continue
+                    if in_s2 or in_d2:
+                        m += 1
+                        continue
+                    if c2 == "(":
+                        depth += 1
+                    elif c2 == ")":
+                        depth -= 1
+                        if depth == 0:
+                            endp = m
+                            break
+                    m += 1
+                if endp > k:
+                    inner = s[k + 1 : endp].strip()
+                    args = split_decl_entities(inner) if inner else []
+                    if inner:
+                        out.extend(iter_function_invocations(inner))
+                    out.append((name, args))
+                    i = endp + 1
+                    continue
+            i = j
+            continue
+        i += 1
+    return out
+
+
 def resolve_call_formal_intent(
     sig: CallSignature,
     actual: str,
@@ -599,6 +819,159 @@ def resolve_call_formal_intent(
         return None
     formal = sig.ordered_dummies[index]
     return sig.intent_by_dummy.get(formal)
+
+
+def is_definitely_nonvariable_actual(expr: str) -> bool:
+    """Return True when an actual argument is definitely not a variable designator."""
+    s = expr.strip()
+    if not s:
+        return True
+    low = s.lower()
+    if "'" in s or '"' in s:
+        return True
+    if re.match(r"^[+-]?(\d+(\.\d*)?|\.\d+)([deq][+-]?\d+)?(_[a-z0-9_]+)?$", low):
+        return True
+    if low in {".true.", ".false.", ".null."}:
+        return True
+
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")" and depth > 0:
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            if ch in "+-*/":
+                return True
+            if ch == ",":
+                return True
+            if i + 1 < len(s) and s[i : i + 2] in {"//", "**", "==", "/=", "<=", ">="}:
+                return True
+            if ch in "<>":
+                return True
+        i += 1
+
+    var_designator_re = re.compile(
+        r"^\s*[a-z][a-z0-9_]*(?:\s*%\s*[a-z][a-z0-9_]*)*(?:\s*\([^)]*\))?\s*$",
+        re.IGNORECASE,
+    )
+    if var_designator_re.match(s):
+        return False
+    return fscan.base_identifier(s) == ""
+
+
+def collect_nonvariable_actual_formals(
+    ordered_files: List[fscan.SourceFileInfo],
+    call_sigs: Dict[str, Optional[CallSignature]],
+) -> Dict[str, Set[str]]:
+    """Collect formals that are passed definitely non-variable actuals somewhere."""
+    out: Dict[str, Set[str]] = {}
+    for finfo in ordered_files:
+        all_stmts = fscan.iter_fortran_statements(finfo.parsed_lines)
+        for _ln, code in all_stmts:
+            low = code.lower()
+            low_nolab = strip_statement_label(low)
+            stmt = strip_one_line_where_prefix(strip_one_line_if_prefix(low_nolab))
+            stmt_s = stmt.strip().lower()
+            if not stmt_s:
+                continue
+            if is_declaration_statement(stmt_s):
+                continue
+            if re.match(
+                r"^(subroutine|function|program|module|contains|end\b|use\b|implicit\b|interface\b|type\b|class\b|procedure\b)",
+                stmt_s,
+            ):
+                continue
+
+            invocations: List[Tuple[str, List[str]]] = []
+            parsed_call = parse_call_name_and_args(stmt)
+            if parsed_call is not None:
+                invocations.append(parsed_call)
+            invocations.extend(iter_function_invocations(stmt))
+
+            for pname, actuals in invocations:
+                sig = call_sigs.get(pname)
+                if not isinstance(sig, CallSignature):
+                    continue
+                for ai, act in enumerate(actuals):
+                    expr = top_level_equals(act)[1] if top_level_equals(act) is not None else act
+                    if not is_definitely_nonvariable_actual(expr):
+                        continue
+                    kv = top_level_equals(act)
+                    if kv is not None:
+                        formal = kv[0].strip().lower()
+                    elif ai < len(sig.ordered_dummies):
+                        formal = sig.ordered_dummies[ai]
+                    else:
+                        continue
+                    if formal:
+                        out.setdefault(pname, set()).add(formal)
+    return out
+
+
+def collect_observed_actual_formals(
+    ordered_files: List[fscan.SourceFileInfo],
+    call_sigs: Dict[str, Optional[CallSignature]],
+) -> Dict[str, Set[str]]:
+    """Collect formals that are observed at least once at call sites."""
+    out: Dict[str, Set[str]] = {}
+    for finfo in ordered_files:
+        all_stmts = fscan.iter_fortran_statements(finfo.parsed_lines)
+        for _ln, code in all_stmts:
+            low = code.lower()
+            low_nolab = strip_statement_label(low)
+            stmt = strip_one_line_where_prefix(strip_one_line_if_prefix(low_nolab))
+            stmt_s = stmt.strip().lower()
+            if not stmt_s:
+                continue
+            if is_declaration_statement(stmt_s):
+                continue
+            if re.match(
+                r"^(subroutine|function|program|module|contains|end\b|use\b|implicit\b|interface\b|type\b|class\b|procedure\b)",
+                stmt_s,
+            ):
+                continue
+
+            invocations: List[Tuple[str, List[str]]] = []
+            parsed_call = parse_call_name_and_args(stmt)
+            if parsed_call is not None:
+                invocations.append(parsed_call)
+            invocations.extend(iter_function_invocations(stmt))
+
+            for pname, actuals in invocations:
+                sig = call_sigs.get(pname)
+                if not isinstance(sig, CallSignature):
+                    continue
+                for ai, act in enumerate(actuals):
+                    kv = top_level_equals(act)
+                    if kv is not None:
+                        formal = kv[0].strip().lower()
+                    elif ai < len(sig.ordered_dummies):
+                        formal = sig.ordered_dummies[ai]
+                    else:
+                        continue
+                    if formal:
+                        out.setdefault(pname, set()).add(formal)
+    return out
 
 
 def is_declaration_statement(stmt: str) -> bool:
@@ -724,7 +1097,8 @@ def rewrite_decl_line_with_intents(line: str, intents_by_name: Dict[str, str]) -
     base_lhs = lhs.rstrip()
 
     for ent, intent in targeted:
-        out_lines.append(f"{base_lhs}, intent({intent}) :: {ent}\n")
+        intent_text = "in out" if intent == "inout" else intent
+        out_lines.append(f"{base_lhs}, intent({intent_text}) :: {ent}\n")
 
     if remaining:
         out_lines.append(f"{base_lhs} :: {', '.join(remaining)}")
@@ -743,6 +1117,8 @@ def analyze_intent_suggestions(
     target_intent: str = "in",
     call_sigs: Optional[Dict[str, Optional[CallSignature]]] = None,
     interproc: bool = False,
+    nonvariable_actual_formals: Optional[Dict[str, Set[str]]] = None,
+    observed_actual_formals: Optional[Dict[str, Set[str]]] = None,
 ) -> List[IntentSuggestion]:
     """Suggest dummy arguments that can be marked with the target intent."""
     out: List[IntentSuggestion] = []
@@ -760,6 +1136,7 @@ def analyze_intent_suggestions(
             local_names.add(proc.result_name)
         external_dummies: Set[str] = set()
         dummy_is_array: Dict[str, bool] = {d: False for d in proc.dummy_names}
+        dummy_is_character: Dict[str, bool] = {d: False for d in proc.dummy_names}
 
         # dummy -> declaration metadata
         decl: Dict[str, Tuple[int, bool, bool, bool]] = {}
@@ -778,9 +1155,12 @@ def analyze_intent_suggestions(
             has_external = re.search(r"\bexternal\b", low) is not None
             has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None) or has_external
             has_alloc_ptr = ("allocatable" in low) or (re.search(r"\bpointer\b", low) is not None)
+            is_character_decl = re.search(r"^\s*character\b", low) is not None
             for d in proc.dummy_names:
                 if d in declared and d not in decl:
                     decl[d] = (ln, has_intent_or_value, has_alloc_ptr, True)
+                if d in declared and is_character_decl:
+                    dummy_is_character[d] = True
                 if d in arr_flags and arr_flags[d]:
                     dummy_is_array[d] = True
 
@@ -798,6 +1178,8 @@ def analyze_intent_suggestions(
         writes: Set[str] = set()
         maybe_written_via_call: Set[str] = set()
         reads: Set[str] = set()
+        spec_reads: Set[str] = set()
+        const_like: Set[str] = set()
         first_event: Dict[str, Tuple[int, str]] = {}
         for ln, code in body_stmts:
             low = code.lower()
@@ -805,6 +1187,42 @@ def analyze_intent_suggestions(
             low_exec = strip_one_line_if_prefix(low_nolab)
             low_exec = strip_one_line_where_prefix(low_exec)
             if is_declaration_statement(low_exec):
+                declared_here = parse_declared_names_any(low_exec)
+                rhs_decl = ""
+                if "::" in low_exec:
+                    rhs_decl = low_exec.split("::", 1)[1]
+                else:
+                    m_no = NO_COLON_DECL_RE.match(low_exec.strip())
+                    if m_no:
+                        rhs_decl = m_no.group("rhs")
+                for d in proc.dummy_names:
+                    if d in declared_here:
+                        # Dummy may still appear in shape/init expressions of other
+                        # entities in the same declaration statement.
+                        if rhs_decl:
+                            for ent in split_decl_entities(rhs_decl):
+                                mm_ent = re.match(r"^\s*([a-z][a-z0-9_]*)", ent, re.IGNORECASE)
+                                if mm_ent and mm_ent.group(1).lower() == d:
+                                    continue
+                                if re.search(rf"\b{re.escape(d)}\b", ent):
+                                    spec_reads.add(d)
+                                    if d not in first_event:
+                                        first_event[d] = (ln, "read")
+                                    break
+                        for ent in split_decl_entities(low_exec.split("::", 1)[1] if "::" in low_exec else low_exec):
+                            mm = re.match(r"^\s*([a-z][a-z0-9_]*)", ent, re.IGNORECASE)
+                            if mm and mm.group(1).lower() == d and "=" in ent and "=>" not in ent:
+                                const_like.add(d)
+                                if d not in first_event:
+                                    first_event[d] = (ln, "read")
+                                break
+                for d in proc.dummy_names:
+                    if d in declared_here:
+                        continue
+                    if re.search(rf"\b{re.escape(d)}\b", low_exec):
+                        spec_reads.add(d)
+                        if d not in first_event:
+                            first_event[d] = (ln, "read")
                 continue
             asn = split_assignment(low_exec)
             if asn is not None:
@@ -819,6 +1237,25 @@ def analyze_intent_suggestions(
                         reads.add(d)
                         if d not in first_event:
                             first_event[d] = (ln, "read")
+                if interproc and call_sigs is not None:
+                    for fname, fargs in iter_function_invocations(rhs):
+                        fsig = call_sigs.get(fname)
+                        if not isinstance(fsig, CallSignature):
+                            continue
+                        for ai, act in enumerate(fargs):
+                            expr = top_level_equals(act)[1] if top_level_equals(act) is not None else act
+                            d = fscan.base_identifier(expr)
+                            if d not in proc.dummy_names:
+                                continue
+                            fint = resolve_call_formal_intent(fsig, act, ai)
+                            if fint == "in":
+                                reads.add(d)
+                                if d not in first_event:
+                                    first_event[d] = (ln, "read")
+                            else:
+                                maybe_written_via_call.add(d)
+                                if d not in first_event:
+                                    first_event[d] = (ln, "call")
 
             m_alloc = ALLOC_DEALLOC_RE.match(low_exec)
             if m_alloc:
@@ -829,12 +1266,17 @@ def analyze_intent_suggestions(
                     if obj not in first_event:
                         first_event[obj] = (ln, "write")
 
-            if "read" in low_exec and "(" in low_exec and ")" in low_exec:
-                for d in proc.dummy_names:
-                    if re.search(rf"\b{re.escape(d)}\b", low_exec):
-                        writes.add(d)
-                        if d not in first_event:
-                            first_event[d] = (ln, "write")
+            if READ_START_RE.match(low_exec):
+                for obj in extract_read_iolist_bases(low_exec):
+                    if obj in proc.dummy_names:
+                        writes.add(obj)
+                        if obj not in first_event:
+                            first_event[obj] = (ln, "write")
+                for obj in extract_read_control_write_bases(low_exec):
+                    if obj in proc.dummy_names:
+                        writes.add(obj)
+                        if obj not in first_event:
+                            first_event[obj] = (ln, "write")
 
             if "=>" in low_exec:
                 for d in proc.dummy_names:
@@ -871,8 +1313,28 @@ def analyze_intent_suggestions(
                             if d not in first_event:
                                 first_event[d] = (ln, "call")
 
+            if interproc and call_sigs is not None:
+                for fname, fargs in iter_function_invocations(low_exec):
+                    fsig = call_sigs.get(fname)
+                    if not isinstance(fsig, CallSignature):
+                        continue
+                    for ai, act in enumerate(fargs):
+                        expr = top_level_equals(act)[1] if top_level_equals(act) is not None else act
+                        d = fscan.base_identifier(expr)
+                        if d not in proc.dummy_names:
+                            continue
+                        fint = resolve_call_formal_intent(fsig, act, ai)
+                        if fint == "in":
+                            reads.add(d)
+                            if d not in first_event:
+                                first_event[d] = (ln, "read")
+                        else:
+                            maybe_written_via_call.add(d)
+                            if d not in first_event:
+                                first_event[d] = (ln, "call")
+
             write_unit = extract_write_unit_base(low_exec)
-            if write_unit in proc.dummy_names:
+            if write_unit in proc.dummy_names and dummy_is_character.get(write_unit, False):
                 writes.add(write_unit)
                 if write_unit not in first_event:
                     first_event[write_unit] = (ln, "write")
@@ -897,9 +1359,16 @@ def analyze_intent_suggestions(
             if target_intent == "in":
                 if d in writes or d in maybe_written_via_call:
                     continue
-            else:
+            elif target_intent == "out":
                 # Conservative INTENT(OUT): must be written and not read/called before first write.
                 if d not in writes:
+                    continue
+                if nonvariable_actual_formals is not None:
+                    if d in nonvariable_actual_formals.get(proc.name.lower(), set()):
+                        continue
+                if d in const_like:
+                    continue
+                if d in spec_reads:
                     continue
                 ev = first_event.get(d)
                 if ev is None or ev[1] != "write":
@@ -908,6 +1377,28 @@ def analyze_intent_suggestions(
                     continue
                 if d in reads and (d not in writes or ev[1] != "write"):
                     continue
+            elif target_intent == "inout":
+                # Conservative INTENT(IN OUT): written, and evidence of input usage.
+                if d not in writes:
+                    continue
+                # Only mark IN OUT when this formal is actually observed at calls
+                # in analyzed files, to avoid tightening interfaces blindly.
+                if observed_actual_formals is None:
+                    continue
+                if d not in observed_actual_formals.get(proc.name.lower(), set()):
+                    continue
+                if nonvariable_actual_formals is not None:
+                    if d in nonvariable_actual_formals.get(proc.name.lower(), set()):
+                        continue
+                if d in const_like:
+                    continue
+                if d in maybe_written_via_call:
+                    continue
+                # Require explicit read-like evidence in the procedure.
+                if d not in reads and d not in spec_reads:
+                    continue
+            else:
+                continue
             out.append(
                 IntentSuggestion(
                     filename=fscan.display_path(finfo.path),
@@ -1092,10 +1583,31 @@ def reorder_arg_decls_before_locals(lines: List[str]) -> List[str]:
         body = statements_in_range(stmts, proc.start, next_start)
         decl_idxs: List[int] = []
         arg_line_keys: Dict[int, int] = {}
-        local_idxs: List[int] = []
+        fixed_idxs: List[int] = []
+        interface_depth = 0
+        in_spec_part = True
 
         for ln, stmt in body:
             low = stmt.lower().strip()
+            if INTERFACE_START_RE.match(low):
+                interface_depth += 1
+                continue
+            if END_INTERFACE_RE.match(low):
+                if interface_depth > 0:
+                    interface_depth -= 1
+                continue
+            if interface_depth > 0:
+                continue
+            if not in_spec_part:
+                continue
+            if not (
+                is_declaration_statement(low)
+                or low.startswith("implicit ")
+                or low.startswith("use ")
+                or low.startswith("import ")
+            ):
+                in_spec_part = False
+                continue
             if not low or not TYPE_DECL_RE.match(low) or low.startswith("procedure"):
                 continue
             idx = ln - 1
@@ -1109,19 +1621,22 @@ def reorder_arg_decls_before_locals(lines: List[str]) -> List[str]:
             if not declared:
                 continue
             decl_idxs.append(idx)
+            if re.search(r"\bparameter\b", low):
+                fixed_idxs.append(idx)
+                continue
             arg_names = [d for d in declared if d in dummy_pos]
             if arg_names:
                 arg_line_keys[idx] = min(dummy_pos[d] for d in arg_names)
-            else:
-                local_idxs.append(idx)
 
         if not arg_line_keys:
             continue
-        arg_idxs = [idx for idx in decl_idxs if idx in arg_line_keys]
+        arg_idxs = [idx for idx in decl_idxs if idx in arg_line_keys and idx not in fixed_idxs]
+        local_idxs = [idx for idx in decl_idxs if idx not in arg_line_keys and idx not in fixed_idxs]
 
         # Keep relative order for lines with the same argument position key.
         arg_sorted = sorted(arg_idxs, key=lambda idx: (arg_line_keys[idx], idx))
-        want_order = arg_sorted + [idx for idx in decl_idxs if idx not in arg_line_keys]
+        fixed_order = [idx for idx in decl_idxs if idx in fixed_idxs]
+        want_order = fixed_order + arg_sorted + local_idxs
         have_order = decl_idxs
         if want_order == have_order:
             continue
@@ -1165,6 +1680,11 @@ def main() -> int:
         "--suggest-intent-out",
         action="store_true",
         help="Suggest/apply INTENT(OUT) (default is INTENT(IN))",
+    )
+    parser.add_argument(
+        "--suggest-intent-inout",
+        action="store_true",
+        help="Suggest/apply INTENT(IN OUT)",
     )
     parser.add_argument(
         "--iterate",
@@ -1259,29 +1779,47 @@ def main() -> int:
         pass_suggest_summary: Dict[Tuple[str, str], List[str]] = {}
         backup_pairs: List[Tuple[Path, Path]] = []
         pass_changed = 0
-        call_sigs = collect_proc_call_signatures(ordered_files) if args.interproc else None
-        if args.interproc and call_sigs is not None:
-            provisional = collect_provisional_proc_intents(ordered_files)
-            for pname, pints in provisional.items():
-                sig = call_sigs.get(pname)
-                if not isinstance(sig, CallSignature):
-                    continue
-                for dname, dint in pints.items():
-                    sig.intent_by_dummy.setdefault(dname, dint)
+        need_call_sigs = args.interproc or args.suggest_intent_inout
+        call_sigs = collect_proc_call_signatures(ordered_files) if need_call_sigs else None
+        nonvariable_actual_formals: Optional[Dict[str, Set[str]]] = None
+        observed_actual_formals: Optional[Dict[str, Set[str]]] = None
+        if call_sigs is not None:
+            nonvariable_actual_formals = collect_nonvariable_actual_formals(ordered_files, call_sigs)
+            observed_actual_formals = collect_observed_actual_formals(ordered_files, call_sigs)
 
         for finfo in ordered_files:
             suggestions_in = analyze_intent_suggestions(
-                finfo, target_intent="in", call_sigs=call_sigs, interproc=args.interproc
+                finfo,
+                target_intent="in",
+                call_sigs=call_sigs,
+                interproc=args.interproc,
+                nonvariable_actual_formals=nonvariable_actual_formals,
+                observed_actual_formals=observed_actual_formals,
             )
             suggestions_out: List[IntentSuggestion] = []
             if args.suggest_intent_out:
                 suggestions_out = analyze_intent_suggestions(
-                    finfo, target_intent="out", call_sigs=call_sigs, interproc=args.interproc
+                    finfo,
+                    target_intent="out",
+                    call_sigs=call_sigs,
+                    interproc=args.interproc,
+                    nonvariable_actual_formals=nonvariable_actual_formals,
+                    observed_actual_formals=observed_actual_formals,
                 )
-            suggestions = suggestions_in + suggestions_out
+            suggestions_inout: List[IntentSuggestion] = []
+            if args.suggest_intent_inout:
+                suggestions_inout = analyze_intent_suggestions(
+                    finfo,
+                    target_intent="inout",
+                    call_sigs=call_sigs,
+                    interproc=args.interproc,
+                    nonvariable_actual_formals=nonvariable_actual_formals,
+                    observed_actual_formals=observed_actual_formals,
+                )
+            suggestions = suggestions_in + suggestions_out + suggestions_inout
             if args.verbose:
                 print(f"File: {fscan.display_path(finfo.path)}")
-                if args.suggest_intent_out:
+                if args.suggest_intent_out or args.suggest_intent_inout:
                     print(f"\n{len(suggestions)} Likely INTENT(IN/OUT) suggestions:")
                 else:
                     print(f"\n{len(suggestions)} Likely INTENT(IN) suggestions:")
@@ -1313,7 +1851,7 @@ def main() -> int:
                     out_path = save_transformed_copy(finfo.path, args.save_dir)
                     if args.verbose:
                         print(f"Saved transformed copy: {out_path}")
-                if args.suggest_intent_out:
+                if args.suggest_intent_out or args.suggest_intent_inout:
                     print(f"\nApplied INTENT(IN/OUT) to {changed} declaration(s).")
                 else:
                     print(f"\nApplied INTENT(IN) to {changed} declaration(s).")
@@ -1342,16 +1880,16 @@ def main() -> int:
             args.git,
             changed_files,
             changed_summary,
-            "intent(in/out)" if args.suggest_intent_out else "intent(in)",
+            "intent(in/out)" if (args.suggest_intent_out or args.suggest_intent_inout) else "intent(in)",
         )
-        if args.suggest_intent_out:
+        if args.suggest_intent_out or args.suggest_intent_inout:
             print_summary(changed_summary, label="with arguments marked intent(in/out)")
         else:
             print_summary(changed_summary, label="with arguments marked intent(in)")
         if baseline_failed:
             print("\nNote: baseline compile failed before fixes; after-fix compile checks passed.")
     else:
-        if args.suggest_intent_out:
+        if args.suggest_intent_out or args.suggest_intent_inout:
             print_summary(suggest_summary_last, label="likely needing intent(in/out)")
         else:
             print_summary(suggest_summary_last, label="likely needing intent(in)")

@@ -23,7 +23,7 @@ Pure-Fortran focuses on practical improvements that are:
 
 Main programs:
 
-- `xintent.py` - suggest/apply `intent(in)` and optional `intent(out)`.
+- `xintent.py` - suggest/apply `intent(in)`, optional `intent(out)`, and optional `intent(in out)`.
 - `xpure.py` - suggest/apply `pure`, optionally upgrade to `elemental`, and advisory-suggest `impure elemental`.
 - `xprivate.py` - suggest/apply module-level `private :: name` restrictions.
 - `xprune.py` - compile-validated pruning of likely unused top-level procedures.
@@ -118,6 +118,7 @@ Core use cases:
 
 - add `intent(in)` where argument appears read-only
 - optionally add `intent(out)` with `--suggest-intent-out`
+- optionally add `intent(in out)` with `--suggest-intent-inout`
 - warn about unresolved arguments with `--warn-missing-intent`
 
 Typical commands:
@@ -126,6 +127,7 @@ Typical commands:
 python xintent.py
 python xintent.py --fix --iterate --compiler "gfortran -o foo.exe"
 python xintent.py --fix --iterate --suggest-intent-out --warn-missing-intent --compiler "gfortran -o foo.exe"
+python xintent.py --fix --iterate --suggest-intent-inout --warn-missing-intent --compiler "gfortran -o foo.exe"
 ```
 
 Notes:

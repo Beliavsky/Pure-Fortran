@@ -803,13 +803,19 @@ def collect_rank1_array_names(unit: xunset.Unit) -> Set[str]:
 def simplify_section_expr(expr: str, decl_bounds: Dict[str, str]) -> str:
     """Simplify full-range rank-1 sections to whole arrays when clearly safe."""
     s = expr
-    # Rule 1: a(1:size(a)) -> a
-    s = re.sub(
+    # Rule 1: a(1:size(a)) -> a, unless immediately followed by substring selector:
+    # a(1:size(a))(i:j) must stay as-is.
+    pat_full_size = re.compile(
         r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*size\s*\(\s*\1\s*\)\s*\)",
-        r"\1",
-        s,
-        flags=re.IGNORECASE,
+        re.IGNORECASE,
     )
+    def repl_full_size(m: re.Match[str]) -> str:
+        name = m.group(1)
+        tail = m.string[m.end() :]
+        if tail.lstrip().startswith("("):
+            return f"{name}(:)"
+        return name
+    s = pat_full_size.sub(repl_full_size, s)
     # Rule 2: a(lb:ub) -> a when section matches declaration bounds.
     for name, bnd in decl_bounds.items():
         pat = re.compile(rf"\b{re.escape(name)}\s*\(\s*([^)]*)\)", re.IGNORECASE)
@@ -817,7 +823,10 @@ def simplify_section_expr(expr: str, decl_bounds: Dict[str, str]) -> str:
             rng = m.group(1).strip()
             if ":" not in rng:
                 return m.group(0)
+            tail = m.string[m.end() :]
             if normalize_expr(rng) == normalize_expr(bnd):
+                if tail.lstrip().startswith("("):
+                    return f"{name}(:)"
                 return name
             return m.group(0)
         s = pat.sub(repl, s)
