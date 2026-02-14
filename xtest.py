@@ -7,13 +7,16 @@ import argparse
 from datetime import datetime, timezone
 import glob
 import json
+import time
 import shlex
 import shutil
 import subprocess
-import time
+import difflib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+SILENT_PROGRESS_PER_LINE = 20
 
 
 def load_codes(path: Path) -> List[Path]:
@@ -25,6 +28,37 @@ def load_codes(path: Path) -> List[Path]:
             continue
         out.append(Path(line))
     return out
+
+
+def baseline_ok_list_path(codes_path: Path) -> Path:
+    """Return baseline-ok list path derived from codes list path."""
+    return codes_path.with_name(f"{codes_path.stem}_baseline_ok{codes_path.suffix}")
+
+
+def load_baseline_ok(path: Path) -> Tuple[List[str], set]:
+    """Load baseline-ok file preserving order and return (ordered, seen-lower)."""
+    ordered: List[str] = []
+    seen_lower = set()
+    if not path.exists():
+        return ordered, seen_lower
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key = line.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        ordered.append(line)
+    return ordered, seen_lower
+
+
+def write_baseline_ok(path: Path, entries: List[str]) -> None:
+    """Write baseline-ok entries one path per line."""
+    text = ""
+    if entries:
+        text = "\n".join(entries) + "\n"
+    path.write_text(text, encoding="utf-8")
 
 
 def expand_inputs(specs: List[str]) -> List[Path]:
@@ -71,13 +105,21 @@ class CmdResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    elapsed_sec: float = 0.0
 
 
 def run_cmd(argv: List[str], timeout: Optional[float] = None) -> CmdResult:
     """Run one command and capture stdout/stderr text."""
+    t0 = time.perf_counter()
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return CmdResult(proc.returncode, proc.stdout or "", proc.stderr or "", timed_out=False)
+        return CmdResult(
+            proc.returncode,
+            proc.stdout or "",
+            proc.stderr or "",
+            timed_out=False,
+            elapsed_sec=time.perf_counter() - t0,
+        )
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout if isinstance(exc.stdout, str) else ""
         err = exc.stderr if isinstance(exc.stderr, str) else ""
@@ -86,7 +128,57 @@ def run_cmd(argv: List[str], timeout: Optional[float] = None) -> CmdResult:
             err = err.rstrip() + "\n" + msg + "\n"
         else:
             err = msg + "\n"
-        return CmdResult(124, out, err, timed_out=True)
+        return CmdResult(124, out, err, timed_out=True, elapsed_sec=time.perf_counter() - t0)
+
+
+def count_text_lines(text: str) -> int:
+    """Return number of logical lines in text."""
+    return len(text.splitlines())
+
+
+def changed_original_line_count(before_text: str, after_text: str) -> int:
+    """Count number of original lines touched by non-equal diff hunks."""
+    a = before_text.splitlines()
+    b = after_text.splitlines()
+    sm = difflib.SequenceMatcher(a=a, b=b)
+    changed = 0
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag != "equal":
+            changed += (i2 - i1)
+    return changed
+
+
+def print_lines_dataframe(rows: List[Dict[str, object]]) -> None:
+    """Print per-file line metrics as a pandas DataFrame (fallback to plain text)."""
+    if not rows:
+        print("Line metrics: no processed files.")
+        return
+    cols = [
+        "index",
+        "source",
+        "orig_lines",
+        "transformed_lines",
+        "delta_lines",
+        "changed_orig_lines",
+    ]
+    try:
+        import pandas as pd  # type: ignore
+
+        df = pd.DataFrame(rows)
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        df = df[cols]
+        print("\nLine metrics:")
+        print(df.to_string(index=False))
+    except Exception:
+        print("\nLine metrics (pandas unavailable; plain text):")
+        print("index source orig_lines transformed_lines delta_lines changed_orig_lines")
+        for r in rows:
+            print(
+                f"{r.get('index','')} {r.get('source','')} {r.get('orig_lines','')} "
+                f"{r.get('transformed_lines','')} {r.get('delta_lines','')} {r.get('changed_orig_lines','')}"
+            )
 
 
 def show_output(prefix: str, proc: CmdResult) -> None:
@@ -245,15 +337,80 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
             start_idx = next_index
 
         if start_idx > 0:
-            print(f"Resuming from entry {start_idx + 1}: {sources[start_idx]}")
+            if not args.silent:
+                print(f"Resuming from entry {start_idx + 1}: {sources[start_idx]}")
         elif status:
-            print("Resume requested but no matching prior failing file found; starting at first entry.")
+            if not args.silent:
+                print("Resume requested but no matching prior failing file found; starting at first entry.")
 
-    print(f"Loaded {len(sources)} code path(s) from {source_desc}")
+    if not args.silent:
+        print(f"Loaded {len(sources)} code path(s) from {source_desc}")
     tested = 0
     baseline_failed = 0
+    post_failed = 0
     processed_entries = 0
     limit_reached = False
+    silent_progress_open = False
+    silent_progress_in_line = 0
+    run_t0 = time.perf_counter()
+    t_baseline = 0.0
+    t_transform = 0.0
+    t_post = 0.0
+    n_baseline = 0
+    n_transform = 0
+    n_post = 0
+    line_rows: List[Dict[str, object]] = []
+    baseline_ok_out: Optional[Path] = None
+    baseline_ok_entries: List[str] = []
+    baseline_ok_seen_lower = set()
+    if not args.inputs:
+        baseline_ok_out = baseline_ok_list_path(args.codes)
+        baseline_ok_entries, baseline_ok_seen_lower = load_baseline_ok(baseline_ok_out)
+
+    def flush_silent_progress_line() -> None:
+        nonlocal silent_progress_open, silent_progress_in_line
+        if args.silent and silent_progress_open:
+            print("")
+            silent_progress_open = False
+            silent_progress_in_line = 0
+
+    def show_problem_source() -> None:
+        flush_silent_progress_line()
+        if args.silent:
+            print(f"[{tested}] {src}")
+
+    def maybe_record_baseline_ok(src_path: Path) -> None:
+        nonlocal baseline_ok_entries, baseline_ok_seen_lower
+        if baseline_ok_out is None:
+            return
+        text = normalize_path_text(src_path)
+        key = text.lower()
+        if key in baseline_ok_seen_lower:
+            return
+        baseline_ok_seen_lower.add(key)
+        baseline_ok_entries.append(text)
+
+    def persist_baseline_ok() -> None:
+        if baseline_ok_out is None:
+            return
+        write_baseline_ok(baseline_ok_out, baseline_ok_entries)
+
+    def print_time_summary() -> None:
+        if args.notime:
+            return
+        total = time.perf_counter() - run_t0
+        print(
+            (
+                f"Time: total {total:.2f}s | "
+                f"baseline {t_baseline:.2f}s ({n_baseline}) | "
+                f"transform {t_transform:.2f}s ({n_transform}) | "
+                f"post {t_post:.2f}s ({n_post})"
+            )
+        )
+
+    def print_optional_lines_summary() -> None:
+        if args.lines:
+            print_lines_dataframe(line_rows)
 
     for idx, src in enumerate(sources[start_idx:], start=start_idx):
         if args.limit is not None and processed_entries >= args.limit:
@@ -277,17 +434,46 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
             continue
 
         tested += 1
-        print(f"\n[{tested}] Testing {src}")
+        if not args.silent:
+            print(f"\n[{tested}] Testing {src}")
+        else:
+            print(f"{tested} ", end="", flush=True)
+            silent_progress_open = True
+            silent_progress_in_line += 1
+            if silent_progress_in_line >= SILENT_PROGRESS_PER_LINE:
+                print("")
+                silent_progress_open = False
+                silent_progress_in_line = 0
         shutil.copy2(src, args.temp)
 
         base_cmd = command_from_template(args.compile_cmd, args.temp)
         base = run_cmd(base_cmd, timeout=args.compile_timeout)
+        t_baseline += base.elapsed_sec
+        n_baseline += 1
+        try:
+            orig_text = src.read_text(encoding="utf-8", errors="ignore")
+            orig_lines = count_text_lines(orig_text)
+        except Exception:
+            orig_text = ""
+            orig_lines = 0
         if base.returncode != 0:
             baseline_failed += 1
-            print("Baseline compile failed, moving to next file.")
-            if base.timed_out:
-                print("Baseline compile timed out, moving to next file.")
-            show_output("baseline", base)
+            line_rows.append(
+                {
+                    "index": tested,
+                    "source": normalize_path_text(src),
+                    "orig_lines": orig_lines,
+                    "transformed_lines": None,
+                    "delta_lines": None,
+                    "changed_orig_lines": None,
+                }
+            )
+            if not args.silent:
+                show_problem_source()
+                print("Baseline compile failed, moving to next file.")
+                if base.timed_out:
+                    print("Baseline compile timed out, moving to next file.")
+                show_output("baseline", base)
             save_state(
                 args.state_file,
                 {
@@ -302,18 +488,41 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
                 },
             )
             continue
+        maybe_record_baseline_ok(src)
 
         shutil.copy2(args.temp, args.before_copy)
 
         transform_cmd = command_from_template(args.transform_cmd, args.temp)
         tx = run_cmd(transform_cmd, timeout=args.transform_timeout)
+        t_transform += tx.elapsed_sec
+        n_transform += 1
+        transformed_text = args.temp.read_text(encoding="utf-8", errors="ignore") if args.temp.exists() else ""
+        transformed_lines = count_text_lines(transformed_text) if transformed_text else 0
+        changed_orig = (
+            changed_original_line_count(orig_text, transformed_text)
+            if (orig_text and transformed_text)
+            else None
+        )
+        delta_lines = (transformed_lines - orig_lines) if transformed_text else None
+        line_rows.append(
+            {
+                "index": tested,
+                "source": normalize_path_text(src),
+                "orig_lines": orig_lines,
+                "transformed_lines": transformed_lines if transformed_text else None,
+                "delta_lines": delta_lines,
+                "changed_orig_lines": changed_orig,
+            }
+        )
         if tx.returncode not in args.transform_ok_codes:
-            print("Transform command failed. Stopping.")
-            print("Source retained at:", args.temp)
-            print("Pre-transform snapshot:", args.before_copy)
-            if tx.timed_out:
-                print("Transform command timed out.")
-            show_output("transform", tx)
+            if not args.silent:
+                show_problem_source()
+                print("Transform command failed. Stopping.")
+                print("Source retained at:", args.temp)
+                print("Pre-transform snapshot:", args.before_copy)
+                if tx.timed_out:
+                    print("Transform command timed out.")
+                show_output("transform", tx)
             save_state(
                 args.state_file,
                 {
@@ -338,13 +547,21 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
                     command=transform_cmd,
                     proc=tx,
                 )
-                print(f"Failure log written: {args.fail_log}")
+                if not args.silent:
+                    print(f"Failure log written: {args.fail_log}")
+            persist_baseline_ok()
+            print_time_summary()
+            print_optional_lines_summary()
             return 3
 
         post_cmd = command_from_template(args.compile_cmd, args.temp)
         post = run_cmd(post_cmd, timeout=args.compile_timeout)
+        t_post += post.elapsed_sec
+        n_post += 1
         if post.returncode != 0:
-            print("Post-transform compile failed. Stopping.")
+            post_failed += 1
+            show_problem_source()
+            print("Post-transform compile failed.")
             print("Source retained at:", args.temp)
             print("Pre-transform snapshot:", args.before_copy)
             print("Failing original source:", src)
@@ -375,7 +592,29 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
                     proc=post,
                 )
                 print(f"Failure log written: {args.fail_log}")
-            return 1
+            maxfail_unlimited = args.maxfail == 0
+            maxfail_reached = (not maxfail_unlimited) and (post_failed >= args.maxfail)
+            if maxfail_reached:
+                print(f"Reached --maxfail {args.maxfail}. Stopping.")
+                persist_baseline_ok()
+                print_time_summary()
+                print_optional_lines_summary()
+                return 1
+            save_state(
+                args.state_file,
+                {
+                    "status": "post_compile_fail_continue",
+                    "codes_file": normalize_path_text(args.codes) if not args.inputs else "",
+                    "input_specs": list(args.inputs) if args.inputs else [],
+                    "compile_cmd": args.compile_cmd,
+                    "transform_cmd": args.transform_cmd,
+                    "failed_source": normalize_path_text(src),
+                    "last_source": normalize_path_text(src),
+                    "next_index": idx + 1,
+                    "post_failures": post_failed,
+                },
+            )
+            continue
 
         save_state(
             args.state_file,
@@ -391,7 +630,11 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
         )
 
     if limit_reached:
-        print(f"\nStopped after {processed_entries} file(s) due to --limit {args.limit}.")
+        flush_silent_progress_line()
+        if not args.silent:
+            print(f"\nStopped after {processed_entries} file(s) due to --limit {args.limit}.")
+            if post_failed > 0:
+                print(f"Post-transform compile failures encountered: {post_failed}")
         save_state(
             args.state_file,
             {
@@ -404,12 +647,19 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
                 "next_index": min(start_idx + processed_entries, len(sources)),
             },
         )
-        return 0
+        persist_baseline_ok()
+        print_time_summary()
+        print_optional_lines_summary()
+        return 1 if post_failed > 0 else 0
 
-    print(
-        f"\nDone. Tested {tested} existing file(s). "
-        f"Baseline failed for {baseline_failed} file(s). No post-transform compile failures."
-    )
+    if not args.silent:
+        print(
+            f"\nDone. Tested {tested} existing file(s). "
+            f"Baseline failed for {baseline_failed} file(s). "
+            f"Post-transform compile failed for {post_failed} file(s)."
+        )
+    else:
+        flush_silent_progress_line()
     save_state(
         args.state_file,
         {
@@ -420,9 +670,13 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
             "transform_cmd": args.transform_cmd,
             "last_source": normalize_path_text(sources[-1]) if sources else "",
             "next_index": len(sources),
+            "post_failures": post_failed,
         },
     )
-    return 0
+    persist_baseline_ok()
+    print_time_summary()
+    print_optional_lines_summary()
+    return 1 if post_failed > 0 else 0
 
 
 def main() -> int:
@@ -430,7 +684,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Copy each listed Fortran file to temp file, compile baseline, run transform command, "
-            "compile again, and stop on first post-transform compile failure."
+            "compile again, and stop when --maxfail post-transform compile failures are reached."
         )
     )
     parser.add_argument(
@@ -510,6 +764,12 @@ def main() -> int:
         help="Maximum number of source entries to process this run (applies after --resume)",
     )
     parser.add_argument(
+        "--maxfail",
+        type=int,
+        default=1,
+        help="Maximum post-transform compile failures before stopping (0 = unlimited, default: 1)",
+    )
+    parser.add_argument(
         "--fail-log",
         type=Path,
         default=Path("xtest_fail.log"),
@@ -519,6 +779,21 @@ def main() -> int:
         "--wait-file",
         type=Path,
         help="In --loop mode, wait for this file to be touched/created before retrying",
+    )
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Suppress routine progress/success output; print only problems/failures",
+    )
+    parser.add_argument(
+        "--notime",
+        action="store_true",
+        help="Disable elapsed-time summary output",
+    )
+    parser.add_argument(
+        "--lines",
+        action="store_true",
+        help="Print per-file line-change metrics at end as a pandas DataFrame",
     )
     parser.add_argument(
         "inputs",
@@ -531,6 +806,9 @@ def main() -> int:
         return 2
     if args.limit is not None and args.limit < 1:
         print("--limit must be >= 1.")
+        return 2
+    if args.maxfail < 0:
+        print("--maxfail must be >= 0.")
         return 2
     if args.transform_ok_codes is None:
         args.transform_ok_codes = default_transform_ok_codes(args.transform_cmd)
@@ -555,14 +833,17 @@ def main() -> int:
     last_code = 0
     while run_count < args.max_loop:
         run_count += 1
-        print(f"\n=== xtest loop {run_count}/{args.max_loop} ===")
+        if not args.silent:
+            print(f"\n=== xtest loop {run_count}/{args.max_loop} ===")
         last_code = run_once(args, resume=resume_flag)
         if last_code == 0:
-            print("Loop mode: run completed successfully.")
+            if not args.silent:
+                print("Loop mode: run completed successfully.")
             return 0
 
         if run_count >= args.max_loop:
-            print("Loop mode: max-loop reached; stopping.")
+            if not args.silent:
+                print("Loop mode: max-loop reached; stopping.")
             return last_code
 
         if args.wait_file is not None:
