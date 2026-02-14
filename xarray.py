@@ -105,6 +105,8 @@ ELEMENTAL_INTRINSICS = {
     "dprod",
     "exp",
     "floor",
+    "iachar",
+    "ichar",
     "int",
     "log",
     "log10",
