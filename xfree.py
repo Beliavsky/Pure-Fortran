@@ -12,6 +12,8 @@ import subprocess
 import re
 from typing import Dict, List, Optional, Tuple
 
+SILENT_PROGRESS_PER_LINE = 20
+
 
 @dataclass
 class PendingStmt:
@@ -58,6 +60,32 @@ def normalize_exponent_blanks(code: str) -> str:
         chunk = re.sub(
             r"(?i)([0-9.])\s+([deq])\s*([+-]?)\s*(\d+)",
             r"\1\2\3\4",
+            chunk,
+        )
+        # Also handle no-blank-before-exponent forms with blank after exponent
+        # letter, e.g. ".121699028117870E 1" -> ".121699028117870E1".
+        chunk = re.sub(
+            r"(?i)(?<=\d)([deq])\s+([+-]?\d+)",
+            r"\1\2",
+            chunk,
+        )
+        # Join split mantissa fragments in numeric literals continued with
+        # blanks, including multiple groups:
+        # "0.6931471805 5994530941 7232121458 18D0"
+        # -> "0.69314718055994530941723212145818D0".
+        def _join_split_real(m: re.Match[str]) -> str:
+            return re.sub(r"\s+", "", m.group(0))
+        chunk = re.sub(
+            r"(?i)[+-]?(?:\d+\.\d*|\.\d+)(?:\s+\d+)+\s*[deq][+-]?\d+",
+            _join_split_real,
+            chunk,
+        )
+        # Join split decimal groups without exponent when followed by a
+        # delimiter (common in complex constants), e.g.
+        # "1.414213562 3730950488)" -> "1.4142135623730950488)".
+        chunk = re.sub(
+            r"(?i)([+-]?(?:\d+\.\d*|\.\d+)(?:\s+\d+)+)(?=\s*[,)/])",
+            _join_split_real,
             chunk,
         )
         chunk = re.sub(
@@ -115,7 +143,7 @@ def normalize_exponent_blanks(code: str) -> str:
             r"double\s*precision)"
         )
         chunk = re.sub(
-            rf"(?i)^(\s*)({type_prefix})\s*([a-z_])",
+            rf"(?i)^(\s*)({type_prefix})\b\s*([a-z_])",
             lambda m: f"{m.group(1)}{m.group(2)} {m.group(3)}",
             chunk,
         )
@@ -135,9 +163,18 @@ def normalize_exponent_blanks(code: str) -> str:
             r"\1do while \2",
             chunk,
         )
-        m_if_call = re.match(r"(?i)^(\s*if\s*\([^)]*\))\s*call([a-z_]\w*)\s*$", chunk)
-        if m_if_call and "=" not in chunk:
-            chunk = f"{m_if_call.group(1)} call {m_if_call.group(2)}"
+        # Fixed-form ignores blanks, so CALL statements can appear as CALLFOO(...).
+        # Insert required blank after CALL token.
+        chunk = re.sub(
+            r"(?i)\bcall([a-z_]\w*)(\s*\()",
+            r"call \1\2",
+            chunk,
+        )
+        chunk = re.sub(
+            r"(?i)\bcall([a-z_]\w*)\b$",
+            r"call \1",
+            chunk,
+        )
         chunk = re.sub(
             r"(?i)^(\s*if\s*\([^)]*\)\s*)(goto|read|print|pause|stop|rewind|backspace|endfile)\s*(\d+)\s*$",
             r"\1\2 \3",
@@ -168,6 +205,24 @@ def normalize_exponent_blanks(code: str) -> str:
             r"\1data \2\3",
             chunk,
         )
+        # Fixed form ignores blanks in names, so constructs like
+        # "DATA AIF CS(1) / ... /" are equivalent to "DATA AIFCS(1) / ... /".
+        # In free form, merge split identifier fragments in DATA object lists
+        # when the second fragment is immediately followed by a subscript.
+        md = re.match(r"(?i)^(\s*(?:\d+\s+)?data\s+)(.+)$", chunk)
+        if md:
+            head = md.group(1)
+            tail = md.group(2)
+            while True:
+                new_tail = re.sub(
+                    r"(?i)\b([a-z_]\w*)\s+([a-z_]\w*)(\s*\()",
+                    r"\1\2\3",
+                    tail,
+                )
+                if new_tail == tail:
+                    break
+                tail = new_tail
+            chunk = head + tail
         chunk = re.sub(
             r"(?i)^(\s*)dimension([a-z_]\w*)(\s*\(.*)$",
             r"\1dimension \2\3",
@@ -276,16 +331,76 @@ def flush_stmt(pending: Optional[PendingStmt], out_lines: List[str]) -> Optional
     for nxt in parts[1:]:
         prev_r = merged_parts[-1].rstrip()
         nxt_l = nxt.lstrip()
-        if (
+        join_lexical = (
             prev_r
             and nxt_l
             and re.search(r"[A-Z0-9_]$", prev_r, flags=re.IGNORECASE)
             and re.match(r"[A-Z0-9_]", nxt_l, flags=re.IGNORECASE)
+        )
+        # Fixed-form continuation can split logical operators:
+        # ".AND" + ".X" => ".AND.X", "." + "OR.X" => ".OR.X"
+        join_logop = (
+            prev_r
+            and nxt_l
+            and (
+                (
+                    re.search(r"(?i)\.(?:and|or|not|eqv|neqv|eq|ne|lt|le|gt|ge)$", prev_r)
+                    and nxt_l.startswith(".")
+                )
+                or (
+                    prev_r.endswith(".")
+                    and re.match(r"(?i)(?:and|or|not|eqv|neqv|eq|ne|lt|le|gt|ge)\.", nxt_l)
+                )
+            )
+        )
+        # Split exponent sign across continuation: "...E+" + "03".
+        join_exponent = (
+            prev_r
+            and nxt_l
+            and re.search(r"(?i)[deq][+-]$", prev_r)
+            and re.match(r"^\d", nxt_l)
+        )
+        # Split exponent after a trailing decimal point: "0." + "E0".
+        join_decimal_exp = (
+            prev_r
+            and nxt_l
+            and re.search(r"(?i)\.$", prev_r)
+            and re.match(r"(?i)^[deq][+-]?\d", nxt_l)
+        )
+        if (
+            join_lexical
+            or join_logop
+            or join_exponent
+            or join_decimal_exp
         ):
-            merged_parts[-1] = prev_r + nxt_l
+            # Keep a separating blank when a declaration keyword ends the prior
+            # fragment (e.g. "INTEGER" + "NX,NY" should become "INTEGER NX,NY").
+            if re.search(
+                r"(?i)\b(?:integer|real|logical|complex|character|double\s*precision)\s*$",
+                prev_r,
+            ):
+                merged_parts[-1] = prev_r + " " + nxt_l
+            else:
+                merged_parts[-1] = prev_r + nxt_l
         else:
             merged_parts.append(nxt_l)
     parts = merged_parts
+
+    # Hollerith FORMAT text can be split across fixed-form continuation records.
+    # In free form this must stay a single lexical token stream (continuation
+    # with '&' inside the token is invalid), so collapse into one line.
+    head0 = parts[0].lstrip()
+    is_format_stmt = bool(re.match(r"(?i)^(?:\d+\s+)?format\b", head0))
+    has_hollerith = any(re.search(r"(?i)\b\d+\s*h", p) for p in parts)
+    if len(parts) > 1 and is_format_stmt and has_hollerith:
+        merged = parts[0].rstrip()
+        for nxt in parts[1:]:
+            merged += nxt.lstrip()
+        parts = [merged]
+
+    # Re-run token normalizations after continuation merges, since fixed-form
+    # split points can hide transforms (e.g. CALLX + ERROR(...) -> CALL XERROR).
+    parts = [normalize_exponent_blanks(p) for p in parts]
 
     if len(parts) == 1:
         body = parts[0].rstrip()
@@ -323,6 +438,10 @@ def convert_text(text: str) -> str:
             deferred_comments.clear()
 
     for raw in text.splitlines():
+        # Fixed-form columns are position-based; expand tabs before parsing
+        # label/continuation fields to avoid misclassifying lines such as
+        # "  60<TAB> CONTINUE" as continuations.
+        fixed = raw.expandtabs(8)
         if raw.strip() == "":
             flush_pending()
             out_lines.append("")
@@ -341,11 +460,11 @@ def convert_text(text: str) -> str:
 
         # Some sources place '!' in the fixed-form label field (columns 1-5).
         # Treat that as a full comment line.
-        if "!" in raw[:5]:
-            bang = raw[:5].find("!")
-            if raw[:bang].strip() == "":
+        if "!" in fixed[:5]:
+            bang = fixed[:5].find("!")
+            if fixed[:bang].strip() == "":
                 flush_pending()
-                out_lines.append("!" + raw[bang + 1 :].rstrip("\r\n"))
+                out_lines.append("!" + fixed[bang + 1 :].rstrip("\r\n"))
                 continue
 
         # Preprocessor/directive lines in column 1.
@@ -355,9 +474,9 @@ def convert_text(text: str) -> str:
             continue
 
         # Fixed-form fields.
-        label = raw[:5].strip() if len(raw) >= 5 else raw.strip()
-        cont_col = raw[5] if len(raw) >= 6 else " "
-        code = (raw[6:72] if len(raw) > 6 else "").rstrip()
+        label = fixed[:5].strip() if len(fixed) >= 5 else fixed.strip()
+        cont_col = fixed[5] if len(fixed) >= 6 else " "
+        code = (fixed[6:72] if len(fixed) > 6 else "").rstrip()
         code = normalize_exponent_blanks(code)
         is_cont = (cont_col not in {" ", "0"})
 
@@ -453,6 +572,7 @@ def main() -> int:
     parser.add_argument("path", type=Path, help="Input .f file or directory containing .f files")
     parser.add_argument("--recursive", action="store_true", help="When input is a directory, include subdirectories")
     parser.add_argument("--verbose", action="store_true", help="Print extra per-file check details")
+    parser.add_argument("--silent", action="store_true", help="Suppress routine progress output; print only failures")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing .f90 outputs")
     parser.add_argument(
         "--check",
@@ -475,6 +595,12 @@ def main() -> int:
         "--fail-fast",
         action="store_true",
         help="With --check, stop on first regression where .f compiles and .f90 fails",
+    )
+    parser.add_argument(
+        "--maxfail",
+        type=int,
+        default=0,
+        help="With --check, stop after this many failures (0 = unlimited, default: 0)",
     )
     parser.add_argument(
         "--state-file",
@@ -505,6 +631,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.fail_fast and not args.check:
         print("--fail-fast requires --check.")
+        return 2
+    if args.maxfail < 0:
+        print("--maxfail must be >= 0.")
         return 2
     if args.no_skip_known_ok and args.skip_known_ok:
         print("Use only one of --skip-known-ok / --no-skip-known-ok.")
@@ -556,9 +685,11 @@ def main() -> int:
             idx = key_to_index.get(last_fail.lower())
             if idx is not None:
                 start_index = idx
-                print(f"Resuming from entry {idx + 1}: {outputs[idx][0]}")
+                if not args.silent:
+                    print(f"Resuming from entry {idx + 1}: {outputs[idx][0]}")
             else:
-                print("Resume target from state was not found in current input set; starting from first file.")
+                if not args.silent:
+                    print("Resume target from state was not found in current input set; starting from first file.")
 
     converted = 0
     regressions = 0
@@ -569,11 +700,29 @@ def main() -> int:
     failures = 0
     processed = 0
     limit_reached = False
+    silent_progress_open = False
+    silent_progress_in_line = 0
+
+    def flush_silent_progress_line() -> None:
+        nonlocal silent_progress_open, silent_progress_in_line
+        if args.silent and silent_progress_open:
+            print("")
+            silent_progress_open = False
+            silent_progress_in_line = 0
+
     for src, dst in outputs[start_index:]:
         if args.limit is not None and processed >= args.limit:
             limit_reached = True
             break
         processed += 1
+        if args.silent:
+            print(f"{processed} ", end="", flush=True)
+            silent_progress_open = True
+            silent_progress_in_line += 1
+            if silent_progress_in_line >= SILENT_PROGRESS_PER_LINE:
+                print("")
+                silent_progress_open = False
+                silent_progress_in_line = 0
         src_key = normalize_key(src)
         src_fp = file_fingerprint(src)
         prev = state_files.get(src_key)
@@ -581,13 +730,18 @@ def main() -> int:
             prev = {}
 
         if args.check and skip_known_ok and prev.get("fingerprint") == src_fp and can_skip_known_ok(prev, args.check_mode):
-            skipped_known_ok += 1
-            print(f"Skipped (known OK): {src}")
-            continue
+            if dst.exists():
+                skipped_known_ok += 1
+                if not args.silent:
+                    print(f"Skipped (known OK): {src}")
+                continue
+            if args.verbose and not args.silent:
+                print(f"Known-OK output missing; reconverting: {dst}")
 
         convert_file(src, dst)
         converted += 1
-        print(f"Converted: {src} -> {dst}")
+        if not args.silent:
+            print(f"Converted: {src} -> {dst}")
         state_files[src_key] = {
             "source": str(src),
             "dest": str(dst),
@@ -621,6 +775,7 @@ def main() -> int:
             if orig is not None and orig.returncode == 0 and conv.returncode != 0:
                 failed = True
                 regressions += 1
+                flush_silent_progress_line()
                 print("")
                 print(f"CHECK regression: {src} compiles, but {dst} does not.")
                 print("converted stderr:")
@@ -631,6 +786,7 @@ def main() -> int:
         else:
             if conv.returncode != 0:
                 failed = True
+                flush_silent_progress_line()
                 print("")
                 print(f"CHECK failure: converted file did not compile: {dst}")
                 print("converted stderr:")
@@ -650,10 +806,26 @@ def main() -> int:
             }
             save_state(args.state_file, state)
             if args.fail_fast:
+                flush_silent_progress_line()
                 print(
                     "Fail-fast: stopping at first "
                     + ("regression." if args.check_mode == "regression" else "converted-file compile failure.")
                 )
+                print(f"Done. Converted {converted} file(s).")
+                if skipped_known_ok:
+                    print(f"Skipped known OK unchanged: {skipped_known_ok}")
+                print(f"Check summary: checked {checked} file(s).")
+                if args.check_mode == "regression":
+                    print(f"Original .f compiled: {originals_compiled}")
+                    print(f"Converted .f90 failed to compile: {converted_failed}")
+                    print(f"Regressions (.f compiled but .f90 failed): {regressions}")
+                else:
+                    print(f"Converted .f90 failed to compile: {converted_failed}")
+                return 1
+            fail_count = regressions if args.check_mode == "regression" else failures
+            if args.maxfail > 0 and fail_count >= args.maxfail:
+                flush_silent_progress_line()
+                print(f"Reached --maxfail {args.maxfail}. Stopping.")
                 print(f"Done. Converted {converted} file(s).")
                 if skipped_known_ok:
                     print(f"Skipped known OK unchanged: {skipped_known_ok}")
@@ -675,17 +847,21 @@ def main() -> int:
             }
 
     if limit_reached:
+        flush_silent_progress_line()
         print(f"Stopped after {processed} file(s) due to --limit {args.limit}.")
-    print(f"Done. Converted {converted} file(s).")
-    if skipped_known_ok:
-        print(f"Skipped known OK unchanged: {skipped_known_ok}")
-    if args.check:
-        print(f"Check summary: checked {checked} file(s).")
-        if args.check_mode == "regression":
-            print(f"Original .f compiled: {originals_compiled}")
-        print(f"Converted .f90 failed to compile: {converted_failed}")
-        if args.check_mode == "regression":
-            print(f"Regressions (.f compiled but .f90 failed): {regressions}")
+    if not args.silent:
+        print(f"Done. Converted {converted} file(s).")
+        if skipped_known_ok:
+            print(f"Skipped known OK unchanged: {skipped_known_ok}")
+        if args.check:
+            print(f"Check summary: checked {checked} file(s).")
+            if args.check_mode == "regression":
+                print(f"Original .f compiled: {originals_compiled}")
+            print(f"Converted .f90 failed to compile: {converted_failed}")
+            if args.check_mode == "regression":
+                print(f"Regressions (.f compiled but .f90 failed): {regressions}")
+    else:
+        flush_silent_progress_line()
 
     state["last_fail"] = None
     save_state(args.state_file, state)
