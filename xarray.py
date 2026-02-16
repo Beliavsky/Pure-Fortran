@@ -7,6 +7,7 @@ import argparse
 import difflib
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -14,6 +15,8 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import cli_paths as cpaths
 import fortran_build as fbuild
 import fortran_scan as fscan
+import xalloc_assign
+import xno_variable
 import xunset
 
 DO_RE = re.compile(
@@ -24,6 +27,10 @@ END_DO_RE = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
 IF_THEN_RE = re.compile(r"^\s*if\s*\((.+)\)\s*then\s*$", re.IGNORECASE)
 END_IF_RE = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
 ELSE_RE = re.compile(r"^\s*else\b", re.IGNORECASE)
+CYCLE_RE = re.compile(r"^\s*cycle\b", re.IGNORECASE)
+EXIT_RE = re.compile(r"^\s*exit\b", re.IGNORECASE)
+RETURN_RE = re.compile(r"^\s*return\b", re.IGNORECASE)
+SELECT_CASE_RE = re.compile(r"^\s*select\s+case\b", re.IGNORECASE)
 ONE_LINE_IF_RE = re.compile(r"^\s*if\s*\((.+)\)\s*(.+)$", re.IGNORECASE)
 ASSIGN_RE = re.compile(r"^\s*(.+?)\s*=\s*(.+)$", re.IGNORECASE)
 ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
@@ -55,6 +62,7 @@ NUM_LITERAL_RE = re.compile(
     r"^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[deq][+-]?\d+)?(?:_[a-z0-9_]+)?\s*$",
     re.IGNORECASE,
 )
+INT_LITERAL_RE = re.compile(r"^\s*([+-]?\d+)(?:_[a-z0-9_]+)?\s*$", re.IGNORECASE)
 LOGICAL_LITERAL_RE = re.compile(r"^\s*\.(?:true|false)\.\s*$", re.IGNORECASE)
 CHAR_LITERAL_RE = re.compile(r"^\s*(['\"]).*\1\s*$", re.IGNORECASE)
 
@@ -74,31 +82,50 @@ class Finding:
     start_line: int
     end_line: int
     suggestion: str
+    insert_only: bool = False
 
 
-CMP_RE = re.compile(r"^\s*(.+?)\s*(<=|>=|<|>)\s*(.+?)\s*$", re.IGNORECASE)
+CMP_RE = re.compile(
+    r"^\s*(.+?)\s*(<=|>=|<|>|\.lt\.|\.le\.|\.gt\.|\.ge\.)\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
 EQ_RE = re.compile(r"^\s*(.+?)\s*(==|\.eq\.)\s*(.+?)\s*$", re.IGNORECASE)
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 CALL_LIKE_RE = re.compile(r"\b([a-z][a-z0-9_]*)\s*\(", re.IGNORECASE)
 INDEXED_CONST_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*(\d+)\s*\)\s*$", re.IGNORECASE)
+INDEXED_ANY_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*\(\s*([^)]+)\s*\)\s*$", re.IGNORECASE)
 PRINT_PREFIX_RE = re.compile(r"^\s*print\s*\*\s*,\s*(.+)\s*$", re.IGNORECASE)
 READ_PREFIX_RE = re.compile(r"^\s*read\s*\*\s*,\s*(.+)\s*$", re.IGNORECASE)
 PRINT_STMT_RE = re.compile(r"^\s*print\s+(.+)$", re.IGNORECASE)
 LOOP_ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 RANDOM_CALL_RE = re.compile(r"^\s*call\s+random_number\s*\(\s*(.+)\s*\)\s*$", re.IGNORECASE)
+CALL_STMT_RE = re.compile(r"^\s*call\s+([a-z][a-z0-9_]*)\s*\((.*)\)\s*$", re.IGNORECASE)
 
 # Conservative set of elemental intrinsics that are safe in array expressions.
 ELEMENTAL_INTRINSICS = {
     "abs",
     "acos",
+    "acosd",
+    "acosh",
     "asin",
+    "asind",
+    "asinh",
     "atan",
+    "atan2",
+    "atan2d",
+    "atand",
+    "atanh",
     "aint",
     "anint",
+    "bessel_j0",
+    "bessel_j1",
+    "bessel_y0",
+    "bessel_y1",
     "ceiling",
     "cmplx",
     "conjg",
     "cos",
+    "cosd",
     "cosh",
     "dble",
     "dim",
@@ -110,6 +137,7 @@ ELEMENTAL_INTRINSICS = {
     "int",
     "log",
     "log10",
+    "log_gamma",
     "max",
     "min",
     "mod",
@@ -118,11 +146,19 @@ ELEMENTAL_INTRINSICS = {
     "real",
     "sign",
     "sin",
+    "sind",
     "sinh",
+    "spacing",
     "sqrt",
     "tan",
+    "tand",
     "tanh",
+    "gamma",
 }
+
+# Per-file user-defined elemental function names (lowercase).
+USER_ELEMENTAL_CALLS: Set[str] = set()
+USER_ELEMENTAL_SUBROUTINES: Set[str] = set()
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -406,6 +442,25 @@ def find_matching_paren(text: str, open_pos: int) -> int:
     return -1
 
 
+def parse_one_line_if(stmt: str) -> Optional[Tuple[str, str]]:
+    """Parse one-line IF into (condition, body_stmt), handling nested parentheses."""
+    s = stmt.strip()
+    m_if = re.match(r"^\s*if\b", s, re.IGNORECASE)
+    if not m_if:
+        return None
+    open_pos = s.find("(", m_if.end())
+    if open_pos < 0:
+        return None
+    close_pos = find_matching_paren(s, open_pos)
+    if close_pos < 0:
+        return None
+    cond = s[open_pos + 1 : close_pos].strip()
+    body = s[close_pos + 1 :].strip()
+    if not cond or not body:
+        return None
+    return cond, body
+
+
 def replace_affine_index_anydim(
     expr: str, loop_var: str, lb: str, ub: str, array_names: Optional[Set[str]] = None
 ) -> str:
@@ -660,6 +715,20 @@ def range_to_do_triplet(rng: str) -> str:
 def normalize_expr(text: str) -> str:
     """Normalize expression text for conservative equality checks."""
     return "".join(text.lower().split())
+
+
+def canonical_relop(op: str) -> str:
+    """Map Fortran symbolic/dotted relational operators to symbolic form."""
+    o = normalize_expr(op)
+    if o == ".lt.":
+        return "<"
+    if o == ".le.":
+        return "<="
+    if o == ".gt.":
+        return ">"
+    if o == ".ge.":
+        return ">="
+    return o
 
 
 def parse_rank1_decl_bounds(unit: xunset.Unit) -> Dict[str, str]:
@@ -1380,6 +1449,34 @@ def parse_alloc_rank1_bounds(stmt: str) -> Dict[str, str]:
     return out
 
 
+def parse_scalar_decl_initializers(unit: xunset.Unit) -> Dict[str, str]:
+    """Collect scalar declaration initializers: name -> rhs text (lower-cased parse)."""
+    out: Dict[str, str] = {}
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low or not TYPE_DECL_RE.match(low):
+            continue
+        if "::" not in low:
+            continue
+        rhs = low.split("::", 1)[1]
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt or "=" not in txt or "=>" in txt:
+                continue
+            lhs_txt, rhs_txt = txt.split("=", 1)
+            lhs_txt = lhs_txt.strip()
+            rhs_txt = rhs_txt.strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", lhs_txt, re.IGNORECASE)
+            if not mname:
+                continue
+            # Scalar-only declaration entity.
+            rest = lhs_txt[mname.end() :].lstrip()
+            if rest.startswith("("):
+                continue
+            out.setdefault(mname.group(1).lower(), rhs_txt)
+    return out
+
+
 def parse_allocate_for_source(stmt: str) -> Optional[Tuple[str, str, List[str]]]:
     """Parse allocate(...) as (base_name, alloc_object_text, option_chunks) for source rewrite."""
     m = ALLOCATE_RE.match(stmt.strip())
@@ -1534,6 +1631,44 @@ def maybe_elementwise(
     return f"{lhs_expr} = {rhs_sliced}"
 
 
+def maybe_elemental_subroutine_call(
+    loop_var: str,
+    rng: str,
+    body_stmt: str,
+    decl_bounds: Dict[str, str],
+    array_names: Set[str],
+) -> Optional[str]:
+    """Detect looped calls to an elemental subroutine and suggest array call."""
+    m = CALL_STMT_RE.match(body_stmt.strip())
+    if not m:
+        return None
+    callee = m.group(1).lower()
+    if callee not in USER_ELEMENTAL_SUBROUTINES:
+        return None
+    args_raw = m.group(2).strip()
+    args = split_top_level_commas(args_raw) if args_raw else []
+    if not args:
+        return None
+    lb, ubtxt = split_range(rng)
+    out_args: List[str] = []
+    changed_any = False
+    for a in args:
+        at = a.strip()
+        # Conservative: skip keyword arguments.
+        if re.search(r"(?<![<>=/])=(?![=])", at):
+            return None
+        as_s = replace_affine_index_anydim(at, loop_var, lb, ubtxt, array_names=array_names)
+        if has_loop_var(as_s, loop_var):
+            return None
+        if as_s != at:
+            changed_any = True
+        as_s = simplify_section_expr(as_s, decl_bounds)
+        out_args.append(as_s)
+    if not changed_any:
+        return None
+    return f"call {callee}({', '.join(out_args)})"
+
+
 def maybe_temp_then_elementwise(
     loop_var: str,
     rng: str,
@@ -1600,6 +1735,143 @@ def maybe_temp_then_elementwise(
     if has_disallowed_function_calls(rhs2_inlined, array_names):
         return None
     return f"{lhs_expr} = {rhs2_inlined}"
+
+
+def maybe_multi_elementwise(
+    loop_var: str,
+    rng: str,
+    body_stmts: List[str],
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+    array_names: Set[str],
+) -> Optional[str]:
+    """Detect multiple independent elementwise assignments in one loop body."""
+    if len(body_stmts) < 2:
+        return None
+    suggestions: List[str] = []
+    lhs_names: List[str] = []
+    for stmt in body_stmts:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = m.group(1).strip()
+        rhs = m.group(2).strip()
+        lhs_parsed = parse_lhs_indexed_by_loop(lhs, loop_var)
+        if lhs_parsed is None:
+            return None
+        lhs_name, _lhs_args, _lhs_pos = lhs_parsed
+        lhs_low = lhs_name.lower()
+        # Conservative: require distinct assignment targets.
+        if lhs_low in lhs_names:
+            return None
+        lhs_names.append(lhs_low)
+        suggestions.append(maybe_elementwise(loop_var, rng, stmt, decl_bounds, alloc_map, array_names) or "")
+        if not suggestions[-1]:
+            return None
+        # Conservative: reject if RHS references any target written in the same loop.
+        rhs_low = strip_quoted_text(rhs.lower())
+        for w in lhs_names:
+            if re.search(rf"\b{re.escape(w)}\s*\(", rhs_low):
+                return None
+    return "\n".join(suggestions)
+
+
+def maybe_nested_multi_elementwise(
+    outer_var: str,
+    outer_rng: str,
+    inner_do_stmt: str,
+    inner_body_stmts: List[str],
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    alloc_map: Dict[str, str],
+    array_names: Set[str],
+) -> Optional[str]:
+    """Detect nested loops with elementwise assignments, allowing independent remainder statements."""
+    def range_to_do_spec(r: str) -> Optional[str]:
+        parts = [p.strip() for p in r.strip().split(":")]
+        if len(parts) == 2:
+            lb = parts[0].strip()
+            ub = parts[1].strip()
+            if lb and ub:
+                return f"{lb},{ub}"
+            return None
+        if len(parts) == 3:
+            lb = parts[0].strip()
+            ub = parts[1].strip()
+            st = parts[2].strip()
+            if lb and ub and st:
+                return f"{lb},{ub},{st}"
+            return None
+        return None
+
+    m_ido = DO_RE.match(inner_do_stmt.strip())
+    if not m_ido:
+        return None
+    inner_var = m_ido.group(1)
+    inner_rng = build_range(m_ido.group(2), m_ido.group(3), m_ido.group(4))
+    elem_stmts: List[str] = []
+    rem_stmts: List[str] = []
+    lhs_written: Set[str] = set()
+    rhs_array_refs: Set[str] = set()
+    for st in inner_body_stmts:
+        ss = st.strip()
+        m_asn = ASSIGN_RE.match(ss)
+        if m_asn is not None:
+            sug = maybe_elementwise(inner_var, inner_rng, ss, decl_bounds, alloc_map, array_names)
+            if sug is not None:
+                elem_stmts.append(sug)
+                lhs0 = m_asn.group(1).strip()
+                rhs0 = m_asn.group(2).strip()
+                m_lhs = parse_lhs_indexed_by_loop(lhs0, inner_var)
+                if m_lhs is None:
+                    return None
+                lhs_written.add(m_lhs[0].lower())
+                rhs_low = strip_quoted_text(rhs0.lower())
+                for mm in CALL_LIKE_RE.finditer(rhs_low):
+                    nm = mm.group(1).lower()
+                    if nm in array_names:
+                        rhs_array_refs.add(nm)
+                continue
+        rem_stmts.append(ss)
+    if not elem_stmts:
+        return None
+    out_vec_lines: List[str] = []
+    for ln in elem_stmts:
+        s = maybe_elementwise(outer_var, outer_rng, ln.strip(), decl_bounds, alloc_map, array_names)
+        if s is None:
+            return None
+        s = simplify_section_expr_rank2(s, rank2_bounds)
+        out_vec_lines.append(s)
+
+    if not rem_stmts:
+        return "\n".join(out_vec_lines)
+
+    # Conservative: remainder must not touch vectorized targets/sources.
+    for rs in rem_stmts:
+        low = strip_quoted_text(rs.lower())
+        m_asn = ASSIGN_RE.match(rs)
+        if m_asn:
+            lhsr = m_asn.group(1).strip()
+            b = fscan.base_identifier(lhsr)
+            if b and (b in lhs_written or b in rhs_array_refs):
+                return None
+        if any(re.search(rf"\b{re.escape(nm)}\s*\(", low) for nm in lhs_written):
+            return None
+
+    m_odo = DO_RE.match(f"do {outer_var}={outer_rng}")
+    outer_spec = range_to_do_spec(outer_rng)
+    inner_spec = range_to_do_spec(inner_rng)
+    if outer_spec is None or inner_spec is None:
+        return None
+    outer_header = f"do {outer_var}={outer_spec}"
+    inner_header = f"   do {inner_var}={inner_spec}"
+    kept = [outer_header, inner_header]
+    for rs in rem_stmts:
+        kept.append(f"      {rs}")
+    kept.append("   end do")
+    kept.append("end do")
+    kept.extend(out_vec_lines)
+    return "\n".join(kept)
 
 
 def maybe_reduction_sum(
@@ -2505,6 +2777,8 @@ def has_nonarray_call(expr: str, array_names: Set[str]) -> bool:
         name = m.group(1).lower()
         if name in array_names:
             continue
+        if name in USER_ELEMENTAL_CALLS:
+            continue
         return True
     return False
 
@@ -2515,6 +2789,8 @@ def has_disallowed_function_calls(expr: str, array_names: Set[str]) -> bool:
     for m in CALL_LIKE_RE.finditer(s):
         name = m.group(1).lower()
         if name in array_names:
+            continue
+        if name in USER_ELEMENTAL_CALLS:
             continue
         if name in ELEMENTAL_INTRINSICS:
             continue
@@ -2567,23 +2843,30 @@ def maybe_masked_sum(
     body_stmt: str,
     decl_bounds: Dict[str, str],
     array_names: Set[str],
+    decl_scalar_inits: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """Detect masked sum inside IF block within loop."""
-    if prev_stmt is None:
-        return None
-    mp = ASSIGN_RE.match(prev_stmt.strip())
-    if not mp:
-        return None
-    acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
-    if not acc_prev:
-        return None
-    acc = acc_prev.group(1).lower()
     mif = IF_THEN_RE.match(if_stmt.strip())
     ml = ASSIGN_RE.match(body_stmt.strip())
     if not mif or not ml:
         return None
     lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
-    if not lhs or lhs.group(1).lower() != acc:
+    if not lhs:
+        return None
+    acc = lhs.group(1).lower()
+    init_seen = False
+    init_expr: Optional[str] = None
+    if prev_stmt is not None:
+        mp = ASSIGN_RE.match(prev_stmt.strip())
+        if mp:
+            acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+            if acc_prev and acc_prev.group(1).lower() == acc:
+                init_seen = True
+                init_expr = mp.group(2).strip()
+    if not init_seen and decl_scalar_inits is not None and acc in decl_scalar_inits:
+        init_seen = True
+        init_expr = decl_scalar_inits[acc].strip()
+    if not init_seen:
         return None
     madd = ADD_ACC_RE.match(ml.group(2).strip())
     if not madd or madd.group(1).lower() != acc:
@@ -2601,7 +2884,12 @@ def maybe_masked_sum(
     cond_s = simplify_section_expr(cond_s, decl_bounds)
     if has_disallowed_function_calls(expr_s, array_names) or has_disallowed_function_calls(cond_s, array_names):
         return None
-    return f"{acc} = sum({expr_s}, mask = {cond_s})"
+    sum_expr = f"sum({expr_s}, mask = {cond_s})"
+    if not init_expr:
+        return f"{acc} = {sum_expr}"
+    if normalize_expr(init_expr) in {"0", "+0", "0.0", "+0.0", "0d0", "+0d0", "0.0d0", "+0.0d0"}:
+        return f"{acc} = {sum_expr}"
+    return f"{acc} = {init_expr} + {sum_expr}"
 
 
 def maybe_masked_product(
@@ -2715,11 +3003,10 @@ def maybe_count_inline(
         # Avoid invalid/ambiguous rewrites like "count = count(...)".
         return None
 
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     # Exclude block IF form handled elsewhere.
     if body_stmt.lower().startswith("then"):
         return None
@@ -2800,11 +3087,10 @@ def maybe_findloc_inline(
     if not ZERO_LITERAL_RE.match(mp.group(2).strip()):
         return None
 
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
     mset = ASSIGN_RE.match(body_stmt)
@@ -2891,11 +3177,10 @@ def maybe_masked_product_inline(
         return None
     acc = acc_prev.group(1).lower()
 
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
 
@@ -2931,23 +3216,13 @@ def maybe_masked_sum_inline(
     inline_if_stmt: str,
     decl_bounds: Dict[str, str],
     array_names: Set[str],
+    decl_scalar_inits: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """Detect one-line IF masked sum reduction and build SUM replacement."""
-    if prev_stmt is None:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    mp = ASSIGN_RE.match(prev_stmt.strip())
-    if not mp:
-        return None
-    acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
-    if not acc_prev:
-        return None
-    acc = acc_prev.group(1).lower()
-
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
-        return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
 
@@ -2955,7 +3230,22 @@ def maybe_masked_sum_inline(
     if not ml:
         return None
     lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
-    if not lhs or lhs.group(1).lower() != acc:
+    if not lhs:
+        return None
+    acc = lhs.group(1).lower()
+    init_seen = False
+    init_expr: Optional[str] = None
+    if prev_stmt is not None:
+        mp = ASSIGN_RE.match(prev_stmt.strip())
+        if mp:
+            acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+            if acc_prev and acc_prev.group(1).lower() == acc:
+                init_seen = True
+                init_expr = mp.group(2).strip()
+    if not init_seen and decl_scalar_inits is not None and acc in decl_scalar_inits:
+        init_seen = True
+        init_expr = decl_scalar_inits[acc].strip()
+    if not init_seen:
         return None
     madd = ADD_ACC_RE.match(ml.group(2).strip())
     if not madd or madd.group(1).lower() != acc:
@@ -2973,7 +3263,201 @@ def maybe_masked_sum_inline(
     cond_s = simplify_section_expr(cond_s, decl_bounds)
     if has_disallowed_function_calls(expr_s, array_names) or has_disallowed_function_calls(cond_s, array_names):
         return None
-    return f"{acc} = sum({expr_s}, mask = {cond_s})"
+    sum_expr = f"sum({expr_s}, mask = {cond_s})"
+    if not init_expr:
+        return f"{acc} = {sum_expr}"
+    if normalize_expr(init_expr) in {"0", "+0", "0.0", "+0.0", "0d0", "+0d0", "0.0d0", "+0.0d0"}:
+        return f"{acc} = {sum_expr}"
+    return f"{acc} = {init_expr} + {sum_expr}"
+
+
+def collect_recent_scalar_assignments(body: List[Tuple[int, str]], do_idx: int, max_lookback: int = 6) -> Dict[str, str]:
+    """Collect recent simple scalar assignments immediately before loop start."""
+    out: Dict[str, str] = {}
+    k = do_idx - 1
+    seen = 0
+    while k >= 0 and seen < max_lookback:
+        stmt = body[k][1].strip()
+        if (
+            DO_RE.match(stmt)
+            or END_DO_RE.match(stmt)
+            or IF_THEN_RE.match(stmt)
+            or END_IF_RE.match(stmt)
+            or ELSE_RE.match(stmt)
+        ):
+            break
+        m = ASSIGN_RE.match(stmt)
+        if not m:
+            break
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        if lhs:
+            out.setdefault(lhs.group(1).lower(), m.group(2).strip())
+        k -= 1
+        seen += 1
+    return out
+
+
+def init_block_start_line_for_accs(
+    body: List[Tuple[int, str]],
+    do_idx: int,
+    acc_names: Set[str],
+    max_lookback: int = 6,
+) -> Optional[int]:
+    """Return earliest contiguous pre-loop assignment line covering all acc_names."""
+    found: Dict[str, int] = {}
+    k = do_idx - 1
+    seen = 0
+    while k >= 0 and seen < max_lookback:
+        ln_k, stmt_k = body[k]
+        st = stmt_k.strip()
+        if (
+            DO_RE.match(st)
+            or END_DO_RE.match(st)
+            or IF_THEN_RE.match(st)
+            or END_IF_RE.match(st)
+            or ELSE_RE.match(st)
+        ):
+            break
+        m = ASSIGN_RE.match(st)
+        if not m:
+            break
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        if lhs:
+            n = lhs.group(1).lower()
+            if n in acc_names and n not in found:
+                found[n] = ln_k
+        k -= 1
+        seen += 1
+    if not acc_names.issubset(set(found.keys())):
+        return None
+    return min(found.values())
+
+
+def maybe_masked_sum_product_block(
+    loop_var: str,
+    rng: str,
+    if_stmt: str,
+    stmt_a: str,
+    stmt_b: str,
+    decl_bounds: Dict[str, str],
+    array_names: Set[str],
+    init_map: Dict[str, str],
+    decl_scalar_inits: Dict[str, str],
+) -> Optional[str]:
+    """Detect IF-block with sum+= and prod*= updates under same mask."""
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    if not mif:
+        return None
+    cond = mif.group(1).strip()
+
+    def parse_acc(stmt: str) -> Optional[Tuple[str, str, str]]:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        if not lhs:
+            return None
+        acc = lhs.group(1).lower()
+        rhs = m.group(2).strip()
+        madd = ADD_ACC_RE.match(rhs)
+        if madd and madd.group(1).lower() == acc:
+            return ("sum", acc, madd.group(2).strip())
+        mmul = MUL_ACC_RE.match(rhs)
+        if mmul and mmul.group(1).lower() == acc:
+            return ("prod", acc, mmul.group(2).strip())
+        return None
+
+    p1 = parse_acc(stmt_a)
+    p2 = parse_acc(stmt_b)
+    if p1 is None or p2 is None:
+        return None
+    if p1[1] == p2[1]:
+        return None
+    kinds = {p1[0], p2[0]}
+    if kinds != {"sum", "prod"}:
+        return None
+
+    items = [p1, p2]
+    out_lines: List[str] = []
+    lb, ubtxt = rng.split(":", 1)
+    cond_s = replace_index_with_slice(cond, loop_var, lb, ubtxt)
+    cond_s = simplify_section_expr(cond_s, decl_bounds)
+    if has_loop_var(cond_s, loop_var) or cond_s == cond:
+        return None
+
+    for kind, acc, expr in items:
+        expr_s = replace_index_with_slice(expr, loop_var, lb, ubtxt)
+        if has_loop_var(expr_s, loop_var) or expr_s == expr:
+            return None
+        expr_s = simplify_section_expr(expr_s, decl_bounds)
+        if has_disallowed_function_calls(expr_s, array_names) or has_disallowed_function_calls(cond_s, array_names):
+            return None
+
+        init_expr = init_map.get(acc, decl_scalar_inits.get(acc, "")).strip()
+        if not init_expr:
+            return None
+        if kind == "sum":
+            red = f"sum({expr_s}, mask = {cond_s})"
+            if normalize_expr(init_expr) in {"0", "+0", "0.0", "+0.0", "0d0", "+0d0", "0.0d0", "+0.0d0"}:
+                out_lines.append(f"{acc} = {red}")
+            else:
+                out_lines.append(f"{acc} = {init_expr} + {red}")
+        else:
+            red = f"product({expr_s}, mask = {cond_s})"
+            if normalize_expr(init_expr) in {"1", "+1", "1.0", "+1.0", "1d0", "+1d0", "1.0d0", "+1.0d0"}:
+                out_lines.append(f"{acc} = {red}")
+            else:
+                out_lines.append(f"{acc} = {init_expr} * {red}")
+    return "\n".join(out_lines)
+
+
+def prev_stmt_assigns_name(prev_stmt: Optional[str], name: str) -> bool:
+    """True when prev_stmt is a simple assignment to NAME."""
+    if prev_stmt is None:
+        return False
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    if not mp:
+        return False
+    lhs = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    return lhs is not None and lhs.group(1).lower() == name.lower()
+
+
+def masked_sum_acc_from_block_stmt(stmt_if: str, stmt_inside: str) -> Optional[str]:
+    """Return accumulator name for `if(cond) acc=acc+...` block body, else None."""
+    if not IF_THEN_RE.match(stmt_if.strip()):
+        return None
+    ml = ASSIGN_RE.match(stmt_inside.strip())
+    if not ml:
+        return None
+    lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not lhs:
+        return None
+    acc = lhs.group(1).lower()
+    madd = ADD_ACC_RE.match(ml.group(2).strip())
+    if not madd or madd.group(1).lower() != acc:
+        return None
+    return acc
+
+
+def masked_sum_acc_from_inline_if(stmt_inline_if: str) -> Optional[str]:
+    """Return accumulator name for one-line `if(cond) acc=acc+...`, else None."""
+    parsed = parse_one_line_if(stmt_inline_if)
+    if parsed is None:
+        return None
+    _cond, body_stmt = parsed
+    if body_stmt.lower().startswith("then"):
+        return None
+    ml = ASSIGN_RE.match(body_stmt.strip())
+    if not ml:
+        return None
+    lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not lhs:
+        return None
+    acc = lhs.group(1).lower()
+    madd = ADD_ACC_RE.match(ml.group(2).strip())
+    if not madd or madd.group(1).lower() != acc:
+        return None
+    return acc
 
 
 def parse_extreme_condition(
@@ -2984,7 +3468,7 @@ def parse_extreme_condition(
     if not m:
         return None
     lhs = m.group(1).strip()
-    op = m.group(2)
+    op = canonical_relop(m.group(2))
     rhs = m.group(3).strip()
     lhs_idx = INDEXED_NAME_RE.match(lhs)
     rhs_idx = INDEXED_NAME_RE.match(rhs)
@@ -3017,11 +3501,10 @@ def maybe_extreme_value_inline(
     decl_bounds: Dict[str, str],
 ) -> Optional[str]:
     """Detect one-line IF min/max update and build MINVAL/MAXVAL replacement."""
-    mif = ONE_LINE_IF_RE.match(inline_if_stmt.strip())
-    if not mif:
+    parsed_if = parse_one_line_if(inline_if_stmt)
+    if parsed_if is None:
         return None
-    cond = mif.group(1).strip()
-    body_stmt = mif.group(2).strip()
+    cond, body_stmt = parsed_if
     if body_stmt.lower().startswith("then"):
         return None
 
@@ -3244,6 +3727,494 @@ def maybe_conditional_set(
     return where_s, "elementwise_conditional_where"
 
 
+def _rel_true_for_op(op: str, rel: int) -> bool:
+    """Evaluate op for relation rel where rel = sign(scalar - array_elem)."""
+    if op == "<":
+        return rel < 0
+    if op == "<=":
+        return rel <= 0
+    if op == ">":
+        return rel > 0
+    if op == ">=":
+        return rel >= 0
+    return False
+
+
+def parse_minmax_fold_rhs(rhs: str, scalar: str, loop_var: str) -> Optional[Tuple[str, str]]:
+    """Parse RHS as min/max fold and return (kind,min|max, array_name)."""
+    # Canonical min/max call.
+    mfun = re.match(r"^\s*(min|max)\s*\((.*)\)\s*$", rhs, re.IGNORECASE)
+    if mfun:
+        kind = mfun.group(1).lower()
+        args = split_top_level_commas(mfun.group(2))
+        if len(args) != 2:
+            return None
+        a0 = args[0].strip()
+        a1 = args[1].strip()
+        idx0 = INDEXED_NAME_RE.match(a0)
+        idx1 = INDEXED_NAME_RE.match(a1)
+        s0 = SIMPLE_NAME_RE.match(a0)
+        s1 = SIMPLE_NAME_RE.match(a1)
+        ok = False
+        arr = ""
+        if s0 and idx1:
+            ok = (
+                s0.group(1).lower() == scalar
+                and idx1.group(2).lower() == loop_var.lower()
+            )
+            arr = idx1.group(1) if ok else ""
+        if s1 and idx0:
+            ok2 = (
+                s1.group(1).lower() == scalar
+                and idx0.group(2).lower() == loop_var.lower()
+            )
+            if ok2:
+                ok = True
+                arr = idx0.group(1)
+        if ok:
+            return kind, arr
+        return None
+
+    # Equivalent MERGE forms:
+    #   merge(s, a(i), s < a(i))   -> min
+    #   merge(a(i), s, a(i) < s)   -> min
+    # and analogous max forms; < and <= treated the same (also old-style ops).
+    mm = re.match(r"^\s*merge\s*\((.*)\)\s*$", rhs, re.IGNORECASE)
+    if not mm:
+        return None
+    parts = split_top_level_commas(mm.group(1))
+    if len(parts) != 3:
+        return None
+    texpr = parts[0].strip()
+    fexpr = parts[1].strip()
+    cexpr = parts[2].strip()
+
+    def expr_kind(expr: str) -> Optional[Tuple[str, str]]:
+        ms = SIMPLE_NAME_RE.match(expr)
+        if ms and ms.group(1).lower() == scalar:
+            return ("s", "")
+        mi = INDEXED_NAME_RE.match(expr)
+        if mi and mi.group(2).lower() == loop_var.lower():
+            return ("a", mi.group(1).lower())
+        return None
+
+    tk = expr_kind(texpr)
+    fk = expr_kind(fexpr)
+    if tk is None or fk is None:
+        return None
+    if {tk[0], fk[0]} != {"s", "a"}:
+        return None
+    arr = tk[1] if tk[0] == "a" else fk[1]
+
+    mc = CMP_RE.match(cexpr)
+    if not mc:
+        return None
+    lk = expr_kind(mc.group(1).strip())
+    rk = expr_kind(mc.group(3).strip())
+    if lk is None or rk is None:
+        return None
+    if {lk[0], rk[0]} != {"s", "a"}:
+        return None
+    arr_c = lk[1] if lk[0] == "a" else rk[1]
+    if arr_c != arr:
+        return None
+    op = canonical_relop(mc.group(2))
+
+    # rel = sign(s - a): -1 means s<a, +1 means s>a
+    def selected_for_rel(rel: int) -> str:
+        cmp_rel = rel if lk[0] == "s" else -rel
+        truth = _rel_true_for_op(op, cmp_rel)
+        return tk[0] if truth else fk[0]
+
+    sel_neg = selected_for_rel(-1)  # s < a
+    sel_pos = selected_for_rel(1)   # s > a
+    if sel_neg == "s" and sel_pos == "a":
+        return ("min", arr)
+    if sel_neg == "a" and sel_pos == "s":
+        return ("max", arr)
+    return None
+
+
+def branch_init_on_true(cond: str, loop_var: str, lb: str) -> Optional[bool]:
+    """Return whether init branch is the IF-true branch for first-iteration split."""
+    c = cond.strip()
+    lbn = normalize_expr(lb)
+    vbn = normalize_expr(loop_var)
+
+    meq = EQ_RE.match(c)
+    if meq:
+        c_l = normalize_expr(meq.group(1).strip())
+        c_r = normalize_expr(meq.group(3).strip())
+        if (c_l == vbn and c_r == lbn) or (c_r == vbn and c_l == lbn):
+            return True
+        return None
+
+    mc = CMP_RE.match(c)
+    if not mc:
+        return None
+    c_l = normalize_expr(mc.group(1).strip())
+    c_r = normalize_expr(mc.group(3).strip())
+    op = canonical_relop(mc.group(2))
+
+    # Fold-on-true forms: i > lb, lb < i
+    if (c_l == vbn and c_r == lbn and op == ">") or (c_l == lbn and c_r == vbn and op == "<"):
+        return False
+    # Init-on-true forms: i <= lb, lb >= i
+    if (c_l == vbn and c_r == lbn and op == "<=") or (c_l == lbn and c_r == vbn and op == ">="):
+        return True
+
+    def int_value(expr: str) -> Optional[int]:
+        mm = INT_LITERAL_RE.match(expr.strip())
+        if not mm:
+            return None
+        try:
+            return int(mm.group(1))
+        except ValueError:
+            return None
+
+    # Optional support for >= lb+1 / <= lb+1 equivalents.
+    lb1a = normalize_expr(f"{lb}+1")
+    lb1b = normalize_expr(f"({lb})+1")
+    if (c_l == vbn and c_r in {lb1a, lb1b} and op == ">=") or (
+        c_l in {lb1a, lb1b} and c_r == vbn and op == "<="
+    ):
+        return False
+    if (c_l == vbn and c_r in {lb1a, lb1b} and op == "<") or (
+        c_l in {lb1a, lb1b} and c_r == vbn and op == ">"
+    ):
+        return True
+
+    # Numeric fallback: if loop var compared to integer constants.
+    lbv = int_value(lb)
+    lv = int_value(c_l)
+    rv = int_value(c_r)
+    if lbv is not None:
+        # loop_var op K
+        if c_l == vbn and rv is not None:
+            if op == ">=" and rv == lbv + 1:
+                return False
+            if op == ">" and rv == lbv:
+                return False
+            if op == "<=" and rv == lbv:
+                return True
+            if op == "<" and rv == lbv + 1:
+                return True
+        # K op loop_var
+        if c_r == vbn and lv is not None:
+            if op == "<=" and lv == lbv + 1:
+                return False
+            if op == "<" and lv == lbv:
+                return False
+            if op == ">=" and lv == lbv:
+                return True
+            if op == ">" and lv == lbv + 1:
+                return True
+    return None
+
+
+def maybe_extreme_init_else_fold(
+    loop_var: str,
+    rng: str,
+    if_stmt: str,
+    true_stmt: str,
+    false_stmt: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect if(i==lb) s=a(i) else s=min/max(s,a(i)) and suggest MINVAL/MAXVAL."""
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    if not mif:
+        return None
+    cond = mif.group(1).strip()
+    lb, _ub = split_range(rng)
+    init_true = branch_init_on_true(cond, loop_var, lb)
+    if init_true is None:
+        return None
+
+    init_stmt = true_stmt if init_true else false_stmt
+    fold_stmt = false_stmt if init_true else true_stmt
+    mt = ASSIGN_RE.match(init_stmt.strip())
+    mf = ASSIGN_RE.match(fold_stmt.strip())
+    if not mt or not mf:
+        return None
+    lhs_t = SIMPLE_NAME_RE.match(mt.group(1).strip())
+    lhs_f = SIMPLE_NAME_RE.match(mf.group(1).strip())
+    rhs_t = INDEXED_ANY_RE.match(mt.group(2).strip())
+    if not lhs_t or not lhs_f or not rhs_t:
+        return None
+    scalar = lhs_t.group(1).lower()
+    if lhs_f.group(1).lower() != scalar:
+        return None
+    arr = rhs_t.group(1)
+    idx_t = rhs_t.group(2).strip()
+    if not (
+        normalize_expr(idx_t) == normalize_expr(loop_var)
+        or normalize_expr(idx_t) == normalize_expr(lb)
+    ):
+        return None
+
+    parsed_fold = parse_minmax_fold_rhs(mf.group(2).strip(), scalar, loop_var)
+    if parsed_fold is None:
+        return None
+    kind, arr_fold = parsed_fold
+    if arr_fold.lower() != arr.lower():
+        return None
+
+    sec = simplify_section_expr(f"{arr}({rng})", decl_bounds)
+    fn = "minval" if kind == "min" else "maxval"
+    return f"{scalar} = {fn}({sec})"
+
+
+def maybe_extreme_init_else_fold_pair(
+    loop_var: str,
+    rng: str,
+    if_stmt: str,
+    t1: str,
+    t2: str,
+    f1: str,
+    f2: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect paired xmin/xmax init+fold IF/ELSE and suggest MINVAL+MAXVAL."""
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    if not mif:
+        return None
+    cond = mif.group(1).strip()
+    lb, _ub = split_range(rng)
+    init_true = branch_init_on_true(cond, loop_var, lb)
+    if init_true is None:
+        return None
+    init_a, init_b = (t1, t2) if init_true else (f1, f2)
+    fold_a, fold_b = (f1, f2) if init_true else (t1, t2)
+
+    def parse_init(stmt: str) -> Optional[Tuple[str, str]]:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        rhs = INDEXED_ANY_RE.match(m.group(2).strip())
+        if not lhs or not rhs:
+            return None
+        idx = rhs.group(2).strip()
+        if not (
+            normalize_expr(idx) == normalize_expr(loop_var)
+            or normalize_expr(idx) == normalize_expr(lb)
+        ):
+            return None
+        return lhs.group(1).lower(), rhs.group(1)
+
+    def parse_fold(stmt: str) -> Optional[Tuple[str, str]]:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        if not lhs:
+            return None
+        scalar = lhs.group(1).lower()
+        parsed = parse_minmax_fold_rhs(m.group(2).strip(), scalar, loop_var)
+        if parsed is None:
+            return None
+        kind, arr = parsed
+        fn = "minval" if kind == "min" else "maxval"
+        return scalar, f"{scalar} = {fn}({simplify_section_expr(f'{arr}({rng})', decl_bounds)})"
+
+    i1 = parse_init(init_a)
+    i2 = parse_init(init_b)
+    f_1 = parse_fold(fold_a)
+    f_2 = parse_fold(fold_b)
+    if not i1 or not i2 or not f_1 or not f_2:
+        return None
+
+    # Match each fold assignment to corresponding initialized scalar/array.
+    init_map = {i1[0]: i1[1].lower(), i2[0]: i2[1].lower()}
+    fold_map = {f_1[0]: f_1[1], f_2[0]: f_2[1]}
+    if len(init_map) != 2 or len(fold_map) != 2:
+        return None
+    if set(init_map.keys()) != set(fold_map.keys()):
+        return None
+
+    # Ensure each scalar initialized from the same array used in fold expression.
+    for scalar, arr in init_map.items():
+        sec = simplify_section_expr(f"{arr}({rng})", decl_bounds)
+        expr = fold_map[scalar]
+        if sec not in expr:
+            return None
+
+    return "\n".join([fold_map[k] for k in sorted(fold_map.keys())])
+
+
+def maybe_preinit_extreme_pair_then_loop(
+    if_stmt: str,
+    init1: str,
+    init2: str,
+    do_stmt: str,
+    fold1: str,
+    fold2: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect guarded xmin/xmax init followed by min/max fold loop."""
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    mdo = DO_RE.match(do_stmt.strip())
+    if not mif or not mdo:
+        return None
+    cond = mif.group(1).strip()
+    loop_var = mdo.group(1).lower()
+    lb = mdo.group(2).strip()
+    ub = mdo.group(3).strip()
+    step = mdo.group(4)
+    if normalize_expr(lb) != "2":
+        return None
+    if step is not None and normalize_expr(step.strip()) != "1":
+        return None
+
+    def parse_init(stmt: str) -> Optional[Tuple[str, str]]:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        rhs = INDEXED_ANY_RE.match(m.group(2).strip())
+        if not lhs or not rhs:
+            return None
+        idx = rhs.group(2).strip()
+        if normalize_expr(idx) != "1":
+            return None
+        return lhs.group(1).lower(), rhs.group(1).lower()
+
+    def parse_assign_xi(stmt: str) -> Optional[Tuple[str, str]]:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        rhs = INDEXED_NAME_RE.match(m.group(2).strip())
+        if not lhs or not rhs:
+            return None
+        if rhs.group(2).lower() != loop_var:
+            return None
+        return lhs.group(1).lower(), rhs.group(1).lower()
+
+    def parse_fold_assign(stmt: str) -> Optional[Tuple[str, str, str]]:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = SIMPLE_NAME_RE.match(m.group(1).strip())
+        if not lhs:
+            return None
+        scalar = lhs.group(1).lower()
+        parsed = parse_minmax_fold_rhs(m.group(2).strip(), scalar, loop_var)
+        if parsed is None:
+            return None
+        kind, arr = parsed
+        return scalar, kind, arr
+
+    def parse_fold_inline_if(stmt: str) -> Optional[Tuple[str, str, str]]:
+        p = parse_one_line_if(stmt)
+        if p is None:
+            return None
+        cond, body_stmt = p
+        ax = parse_assign_xi(body_stmt)
+        if ax is None:
+            return None
+        scalar, arr = ax
+        ext = parse_extreme_condition(cond, loop_var)
+        if ext is None:
+            return None
+        kind, scalar_c, arr_c, _strict = ext
+        if scalar_c != scalar or arr_c.lower() != arr.lower():
+            return None
+        return scalar, kind, arr
+
+    def parse_fold(stmt: str) -> Optional[Tuple[str, str, str]]:
+        return parse_fold_assign(stmt) or parse_fold_inline_if(stmt)
+
+    i1 = parse_init(init1)
+    i2 = parse_init(init2)
+    f1 = parse_fold(fold1)
+    f2 = parse_fold(fold2)
+    if not i1 or not i2 or not f1 or not f2:
+        return None
+
+    init_map = {i1[0]: i1[1], i2[0]: i2[1]}
+    if len(init_map) != 2:
+        return None
+    fold_map = {f1[0]: (f1[1], f1[2]), f2[0]: (f2[1], f2[2])}
+    if len(fold_map) != 2:
+        return None
+    if set(init_map.keys()) != set(fold_map.keys()):
+        return None
+
+    # Require one min and one max fold; arrays must match initial array.
+    kinds = {fold_map[k][0] for k in fold_map}
+    if kinds != {"min", "max"}:
+        return None
+    for s, arr_init in init_map.items():
+        kind, arr_fold = fold_map[s]
+        _ = kind
+        if arr_init != arr_fold:
+            return None
+
+    # Build guarded replacement that preserves edge-case behavior when ub < 1.
+    arr_name = next(iter(init_map.values()))
+    sec_raw = f"{arr_name}(1:max(1,{ub}))"
+    arr_bnd = decl_bounds.get(arr_name.lower())
+    # If guard implies ub is positive and ub is full declared bound, simplify to whole array.
+    arr_ub = None
+    if arr_bnd is not None:
+        arr_ub = arr_bnd.split(":", 1)[1].strip() if ":" in arr_bnd else arr_bnd.strip()
+    if arr_ub is not None and normalize_expr(arr_ub) == normalize_expr(ub):
+        mc = CMP_RE.match(cond)
+        guard_pos = False
+        if mc:
+            cl = mc.group(1).strip()
+            op = canonical_relop(mc.group(2))
+            cr = mc.group(3).strip()
+            u = normalize_expr(ub)
+            l = normalize_expr(cl)
+            r = normalize_expr(cr)
+            guard_pos = (
+                (l == u and ((op == ">" and r == "0") or (op == ">=" and r == "1")))
+                or (r == u and ((op == "<" and l == "0") or (op == "<=" and l == "1")))
+            )
+        if guard_pos:
+            sec_raw = arr_name
+    sec = simplify_section_expr(sec_raw, decl_bounds)
+    s_min = next(s for s in fold_map if fold_map[s][0] == "min")
+    s_max = next(s for s in fold_map if fold_map[s][0] == "max")
+    return "\n".join(
+        [
+            f"if ({cond}) then",
+            f"   {s_min} = minval({sec})",
+            f"   {s_max} = maxval({sec})",
+            "end if",
+        ]
+    )
+
+
+def maybe_preinit_extreme_pair_then_loop_blocks(
+    if_stmt: str,
+    init1: str,
+    init2: str,
+    do_stmt: str,
+    if1: str,
+    as1: str,
+    eif1: str,
+    if2: str,
+    as2: str,
+    eif2: str,
+    decl_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect guarded init followed by two IF-block updates for min/max."""
+    if not END_IF_RE.match(eif1.strip()) or not END_IF_RE.match(eif2.strip()):
+        return None
+    m1 = IF_THEN_RE.match(if1.strip())
+    m2 = IF_THEN_RE.match(if2.strip())
+    if not m1 or not m2:
+        return None
+    s1 = f"if ({m1.group(1).strip()}) {as1.strip()}"
+    s2 = f"if ({m2.group(1).strip()}) {as2.strip()}"
+    return maybe_preinit_extreme_pair_then_loop(
+        if_stmt, init1, init2, do_stmt, s1, s2, decl_bounds
+    )
+
+
 def maybe_if_any_all(stmt: str, decl_bounds: Dict[str, str]) -> Optional[str]:
     """Detect one-line IF with x(1).or.x(2)... or .and. chain and suggest ANY/ALL."""
     m = ONE_LINE_IF_RE.match(stmt.strip())
@@ -3317,6 +4288,31 @@ def simplify_section_expr_rank2(expr: str, rank2_bounds: Dict[str, Tuple[str, st
             r2 = m.group(2).strip()
             if normalize_expr(r1) == normalize_expr(f"1:{b1}") and normalize_expr(r2) == normalize_expr(f"1:{b2}"):
                 return name
+            return m.group(0)
+
+        s = pat.sub(repl, s)
+    return s
+
+
+def simplify_section_expr_rank2_partial(expr: str, rank2_bounds: Dict[str, Tuple[str, str]]) -> str:
+    """Simplify full first/second dimension sections to ':' when safe."""
+    s = expr
+    for name, (b1, b2) in rank2_bounds.items():
+        pat = re.compile(rf"\b{re.escape(name)}\s*\(\s*([^,]+)\s*,\s*([^)]+)\)", re.IGNORECASE)
+
+        def repl(m: re.Match[str]) -> str:
+            r1 = m.group(1).strip()
+            r2 = m.group(2).strip()
+            r1n = normalize_expr(r1)
+            r2n = normalize_expr(r2)
+            full1 = normalize_expr(f"1:{b1}")
+            full2 = normalize_expr(f"1:{b2}")
+            if r1n == full1 and r2n == full2:
+                return name
+            if r1n == full1:
+                return f"{name}(:, {r2})"
+            if r2n == full2:
+                return f"{name}({r1}, :)"
             return m.group(0)
 
         s = pat.sub(repl, s)
@@ -3494,6 +4490,134 @@ def maybe_print_loop(
     return f"print {fmt}, {item_s}"
 
 
+def _has_loop_var_ref(expr: str, loop_var: str) -> bool:
+    return re.search(rf"\b{re.escape(loop_var)}\b", expr, re.IGNORECASE) is not None
+
+
+def _parse_write_stmt(stmt: str) -> Optional[Tuple[str, str]]:
+    s = stmt.strip()
+    if not s.lower().startswith("write"):
+        return None
+    i = s.lower().find("write") + len("write")
+    while i < len(s) and s[i].isspace():
+        i += 1
+    if i >= len(s) or s[i] != "(":
+        return None
+    depth = 0
+    in_s = False
+    in_d = False
+    j = i
+    while j < len(s):
+        ch = s[j]
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        elif not in_s and not in_d:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    ctrl = s[i + 1:j].strip()
+                    tail = s[j + 1:].strip()
+                    if ctrl and tail:
+                        return ctrl, tail
+                    return None
+        j += 1
+    return None
+
+
+def maybe_io_loop_implied_do(
+    loop_var: str,
+    lb: str,
+    ub: str,
+    step: Optional[str],
+    stmt: str,
+) -> Optional[str]:
+    """Detect one-statement PRINT/WRITE loop bodies and build an implied-DO I/O list."""
+    s = stmt.strip()
+    triplet = f"{loop_var}={lb},{ub}"
+    if step is not None and step.strip() and step.strip() != "1":
+        triplet += f",{step.strip()}"
+
+    m = PRINT_STMT_RE.match(s)
+    if m:
+        rest = m.group(1).strip()
+        parts = split_top_level_commas(rest)
+        if len(parts) < 2:
+            return None
+        fmt = parts[0].strip()
+        items = [p.strip() for p in parts[1:] if p.strip()]
+        if not fmt or not items:
+            return None
+        if not any(_has_loop_var_ref(it, loop_var) for it in items):
+            return None
+        return f"print {fmt}, ({', '.join(items + [triplet])})"
+
+    pw = _parse_write_stmt(s)
+    if pw is not None:
+        ctrl, tail = pw
+        items = [p.strip() for p in split_top_level_commas(tail) if p.strip()]
+        if not items:
+            return None
+        if not any(_has_loop_var_ref(it, loop_var) for it in items):
+            return None
+        return f"write ({ctrl}) ({', '.join(items + [triplet])})"
+
+    return None
+
+
+def maybe_constructor_fill_loop(
+    loop_var: str,
+    lb: str,
+    ub: str,
+    step: Optional[str],
+    stmt: str,
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+    alloc_rank1_bounds: Dict[str, str],
+) -> Optional[str]:
+    """Detect rank-1 fill loop and rewrite as array-constructor implied-DO."""
+    m = ASSIGN_RE.match(stmt.strip())
+    if not m:
+        return None
+    lhs = m.group(1).strip()
+    rhs = m.group(2).strip()
+
+    lhs_idx = INDEXED_NAME_RE.match(lhs)
+    if lhs_idx is None:
+        return None
+    arr = lhs_idx.group(1).strip()
+    idx = lhs_idx.group(2).strip().lower()
+    if idx != loop_var.lower():
+        return None
+    if not has_loop_var(rhs, loop_var):
+        return None
+
+    # Only whole-vector fills: 1:ub with optional unit step.
+    if lb.strip() != "1":
+        return None
+    step_txt = None if step is None else step.strip()
+    if step_txt not in (None, "", "1"):
+        return None
+
+    # Ensure this loop covers whole declared/allocated vector.
+    full_ok = False
+    bnd = decl_bounds.get(arr.lower())
+    if bnd is not None and normalize_expr(f"1:{ub}") == normalize_expr(bnd):
+        full_ok = True
+    if can_collapse_lhs_alloc(arr, f"1:{ub}", alloc_map):
+        full_ok = True
+    abnd = alloc_rank1_bounds.get(arr.lower())
+    if abnd is not None and normalize_expr(f"1:{ub}") == normalize_expr(abnd):
+        full_ok = True
+    if not full_ok:
+        return None
+
+    return f"{arr} = [({rhs}, {loop_var}={lb},{ub})]"
+
+
 def maybe_random_number_loop_1d(
     loop_var: str,
     rng: str,
@@ -3546,6 +4670,29 @@ def maybe_random_number_loop_1d(
         ):
             harvest_expr = arr_name
     return f"call random_number({harvest_expr})"
+
+
+def maybe_random_fill_then_elementwise(
+    loop_var: str,
+    rng: str,
+    stmt_fill: str,
+    stmt_elem: str,
+    decl_bounds: Dict[str, str],
+    alloc_map: Dict[str, str],
+    array_names: Set[str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    rank3_bounds: Dict[str, Tuple[str, str, str]],
+) -> Optional[str]:
+    """Detect two-statement loop: random fill of one element, then elementwise update."""
+    s_fill = maybe_random_number_loop_1d(
+        loop_var, rng, stmt_fill, decl_bounds, rank2_bounds, rank3_bounds
+    )
+    if s_fill is None:
+        return None
+    s_elem = maybe_elementwise(loop_var, rng, stmt_elem, decl_bounds, alloc_map, array_names)
+    if s_elem is None:
+        return None
+    return f"{s_fill}\n{s_elem}"
 
 
 def maybe_random_number_nested_2d(
@@ -3845,6 +4992,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     complex_rank1_names = collect_rank1_complex_names(unit)
     character_scalar_names = collect_character_scalar_names(unit)
     scalar_char_lengths = collect_character_scalar_lengths(unit)
+    decl_scalar_inits = parse_scalar_decl_initializers(unit)
     array_names: Set[str] = set(decl_bounds.keys()) | set(rank2_bounds.keys()) | set(rank3_bounds.keys())
     array_names |= collect_rank1_array_names(unit)
     alloc_map: Dict[str, str] = {}
@@ -3987,6 +5135,108 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             )
             i = end_idx + 1
             continue
+        # Form P0: guarded init + subsequent min/max fold loop:
+        # if (cond) then
+        #   xmin = x(1)
+        #   xmax = x(1)
+        # end if
+        # do i=2,ub
+        #   xmin = min(xmin, x(i))
+        #   xmax = max(xmax, x(i))
+        # end do
+        if i + 7 < len(body):
+            _ln_i1, stmt_i1 = body[i + 1]
+            _ln_i2, stmt_i2 = body[i + 2]
+            _ln_eif, stmt_eif = body[i + 3]
+            _ln_do, stmt_do = body[i + 4]
+            _ln_f1, stmt_f1 = body[i + 5]
+            _ln_f2, stmt_f2 = body[i + 6]
+            ln_end, stmt_end = body[i + 7]
+            if (
+                IF_THEN_RE.match(stmt.strip())
+                and END_IF_RE.match(stmt_eif.strip())
+                and DO_RE.match(stmt_do.strip())
+                and END_DO_RE.match(stmt_end.strip())
+            ):
+                sugg_pre = maybe_preinit_extreme_pair_then_loop(
+                    stmt, stmt_i1, stmt_i2, stmt_do, stmt_f1, stmt_f2, decl_bounds
+                )
+                if sugg_pre is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_minmax_value_pair",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_pre,
+                        )
+                    )
+                    i += 8
+                    continue
+        # Form P1: guarded init + fold loop with IF-block updates:
+        # if (cond) then
+        #   xmin = x(1)
+        #   xmax = x(1)
+        # end if
+        # do i=2,ub
+        #   if (...) then
+        #      xmin = x(i)
+        #   end if
+        #   if (...) then
+        #      xmax = x(i)
+        #   end if
+        # end do
+        if i + 11 < len(body):
+            _ln_i1, stmt_i1 = body[i + 1]
+            _ln_i2, stmt_i2 = body[i + 2]
+            _ln_eif, stmt_eif = body[i + 3]
+            _ln_do, stmt_do = body[i + 4]
+            _ln_if1, stmt_if1 = body[i + 5]
+            _ln_as1, stmt_as1 = body[i + 6]
+            _ln_eif1, stmt_eif1 = body[i + 7]
+            _ln_if2, stmt_if2 = body[i + 8]
+            _ln_as2, stmt_as2 = body[i + 9]
+            _ln_eif2, stmt_eif2 = body[i + 10]
+            ln_end, stmt_end = body[i + 11]
+            if (
+                IF_THEN_RE.match(stmt.strip())
+                and END_IF_RE.match(stmt_eif.strip())
+                and DO_RE.match(stmt_do.strip())
+                and IF_THEN_RE.match(stmt_if1.strip())
+                and IF_THEN_RE.match(stmt_if2.strip())
+                and END_IF_RE.match(stmt_eif1.strip())
+                and END_IF_RE.match(stmt_eif2.strip())
+                and END_DO_RE.match(stmt_end.strip())
+            ):
+                sugg_pre_blk = maybe_preinit_extreme_pair_then_loop_blocks(
+                    stmt,
+                    stmt_i1,
+                    stmt_i2,
+                    stmt_do,
+                    stmt_if1,
+                    stmt_as1,
+                    stmt_eif1,
+                    stmt_if2,
+                    stmt_as2,
+                    stmt_eif2,
+                    decl_bounds,
+                )
+                if sugg_pre_blk is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_minmax_value_pair",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_pre_blk,
+                        )
+                    )
+                    i += 12
+                    continue
         mdo = DO_RE.match(stmt.strip())
         if not mdo:
             i += 1
@@ -4213,6 +5463,111 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 5
                     continue
+        # Form A2N: nested 2D loop with optional outer-prefix elementwise statements,
+        # then inner multi-assignment elementwise body.
+        # do i=...
+        #   p(i)=...
+        #   do j=...
+        #      a(i,j)=...
+        #      b(i,j)=...
+        #   end do
+        # end do
+        if i + 5 < len(body):
+            k = i + 1
+            prefix_stmts: List[str] = []
+            blocked_prefix = False
+            while k < len(body):
+                st = body[k][1].strip()
+                if DO_RE.match(st):
+                    break
+                if (
+                    not st
+                    or IF_THEN_RE.match(st)
+                    or ELSE_RE.match(st)
+                    or END_IF_RE.match(st)
+                    or CYCLE_RE.match(st)
+                    or EXIT_RE.match(st)
+                    or RETURN_RE.match(st)
+                    or SELECT_CASE_RE.match(st)
+                    or END_DO_RE.match(st)
+                ):
+                    blocked_prefix = True
+                    break
+                prefix_stmts.append(body[k][1])
+                k += 1
+            if blocked_prefix or k >= len(body):
+                m_ido = None
+            else:
+                _ln_ido, stmt_ido = body[k]
+                m_ido = DO_RE.match(stmt_ido.strip())
+            if m_ido is not None:
+                j = k + 1
+                inner_stmts: List[str] = []
+                inner_end = -1
+                blocked = False
+                while j < len(body):
+                    _ln_j, stmt_j = body[j]
+                    st = stmt_j.strip()
+                    if DO_RE.match(st):
+                        blocked = True
+                        break
+                    if END_DO_RE.match(st):
+                        inner_end = j
+                        break
+                    if (
+                        IF_THEN_RE.match(st)
+                        or ELSE_RE.match(st)
+                        or END_IF_RE.match(st)
+                        or CYCLE_RE.match(st)
+                        or EXIT_RE.match(st)
+                        or RETURN_RE.match(st)
+                        or SELECT_CASE_RE.match(st)
+                    ):
+                        blocked = True
+                        break
+                    if st:
+                        inner_stmts.append(stmt_j)
+                    j += 1
+                if not blocked and inner_end > i + 2 and inner_end + 1 < len(body):
+                    ln_oend, stmt_oend = body[inner_end + 1]
+                    if END_DO_RE.match(stmt_oend.strip()):
+                        prefix_suggs: List[str] = []
+                        ok_prefix = True
+                        for pst in prefix_stmts:
+                            ps = maybe_elementwise(loop_var, rng, pst, decl_bounds, alloc_map, array_names)
+                            if ps is None:
+                                ok_prefix = False
+                                break
+                            ps = simplify_section_expr_rank2_partial(ps, rank2_bounds)
+                            prefix_suggs.append(ps)
+                        if not ok_prefix:
+                            i += 1
+                            continue
+                        sugg_nmulti = maybe_nested_multi_elementwise(
+                            loop_var,
+                            rng,
+                            stmt_ido,
+                            inner_stmts,
+                            decl_bounds,
+                            rank2_bounds,
+                            alloc_map,
+                            array_names,
+                        )
+                        if sugg_nmulti is not None:
+                            sug_all = "\n".join(prefix_suggs + [sugg_nmulti]) if prefix_suggs else sugg_nmulti
+                            findings.append(
+                                Finding(
+                                    path=unit.path,
+                                    rule="elementwise_multi_nested",
+                                    unit_kind=unit.kind,
+                                    unit_name=unit.name,
+                                    start_line=ln,
+                                    end_line=ln_oend,
+                                    suggestion=sug_all,
+                                )
+                            )
+                            i = inner_end + 2
+                            continue
 
         # Form A: one-statement loop body.
         if i + 2 < len(body):
@@ -4236,6 +5591,21 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
+                sugg_io = maybe_io_loop_implied_do(loop_var, lb, ub, step, stmt_body)
+                if sugg_io is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="io_loop_implied_do",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_io,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_ploop = maybe_print_loop(loop_var, lb, ub, step, stmt_body, decl_bounds)
                 if sugg_ploop is not None:
                     findings.append(
@@ -4251,6 +5621,23 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
+                sugg_ecall = maybe_elemental_subroutine_call(
+                    loop_var, rng, stmt_body, decl_bounds, array_names
+                )
+                if sugg_ecall is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="elemental_subroutine_call",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_ecall,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_elem = maybe_elementwise(loop_var, rng, stmt_body, decl_bounds, alloc_map, array_names)
                 if sugg_elem is not None:
                     findings.append(
@@ -4262,6 +5649,23 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                             start_line=ln,
                             end_line=ln_end,
                             suggestion=sugg_elem,
+                        )
+                    )
+                    i += 3
+                    continue
+                sugg_ctor = maybe_constructor_fill_loop(
+                    loop_var, lb, ub, step, stmt_body, decl_bounds, alloc_map, alloc_rank1_bounds
+                )
+                if sugg_ctor is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="constructor_fill_loop",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_ctor,
                         )
                     )
                     i += 3
@@ -4346,33 +5750,59 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     i += 3
                     continue
                 sugg_msum_inline = maybe_masked_sum_inline(
-                    loop_var, rng, prev_stmt, stmt_body, decl_bounds, array_names
+                    loop_var, rng, prev_stmt, stmt_body, decl_bounds, array_names, decl_scalar_inits
                 )
                 if sugg_msum_inline is not None:
+                    acc_name = sugg_msum_inline.split("=", 1)[0].strip().lower()
+                    start_line_msum = body[i - 1][0] if prev_stmt_assigns_name(prev_stmt, acc_name) and i - 1 >= 0 else ln
                     findings.append(
                         Finding(
                             path=unit.path,
                             rule="reduction_masked_sum",
                             unit_kind=unit.kind,
                             unit_name=unit.name,
-                            start_line=start_line,
+                            start_line=start_line_msum,
                             end_line=ln_end,
                             suggestion=sugg_msum_inline,
                         )
                     )
                     i += 3
                     continue
+                acc_inline = masked_sum_acc_from_inline_if(stmt_body)
+                if acc_inline is not None and not prev_stmt_assigns_name(prev_stmt, acc_inline) and acc_inline not in decl_scalar_inits:
+                    fake_inits = dict(decl_scalar_inits)
+                    fake_inits[acc_inline] = "0.0"
+                    if (
+                        maybe_masked_sum_inline(
+                            loop_var, rng, prev_stmt, stmt_body, decl_bounds, array_names, fake_inits
+                        )
+                        is not None
+                    ):
+                        findings.append(
+                            Finding(
+                                path=unit.path,
+                                rule="warning_uninitialized_masked_sum",
+                                unit_kind=unit.kind,
+                                unit_name=unit.name,
+                                start_line=ln,
+                                end_line=ln,
+                                suggestion=f"! xarray warning: skipped masked-sum rewrite because '{acc_inline}' has no detected initialization",
+                                insert_only=True,
+                            )
+                        )
                 sugg_mprod_inline = maybe_masked_product_inline(
                     loop_var, rng, prev_stmt, stmt_body, decl_bounds, array_names
                 )
                 if sugg_mprod_inline is not None:
+                    acc_name = sugg_mprod_inline.split("=", 1)[0].strip().lower()
+                    start_line_mprod = body[i - 1][0] if prev_stmt_assigns_name(prev_stmt, acc_name) and i - 1 >= 0 else ln
                     findings.append(
                         Finding(
                             path=unit.path,
                             rule="reduction_masked_product",
                             unit_kind=unit.kind,
                             unit_name=unit.name,
-                            start_line=start_line,
+                            start_line=start_line_mprod,
                             end_line=ln_end,
                             suggestion=sugg_mprod_inline,
                         )
@@ -4401,6 +5831,31 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             _ln_s2, stmt_s2 = body[i + 2]
             ln_end, stmt_end = body[i + 3]
             if END_DO_RE.match(stmt_end.strip()):
+                sugg_rand_elem = maybe_random_fill_then_elementwise(
+                    loop_var,
+                    rng,
+                    stmt_s1,
+                    stmt_s2,
+                    decl_bounds,
+                    alloc_map,
+                    array_names,
+                    rank2_bounds,
+                    rank3_bounds,
+                )
+                if sugg_rand_elem is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="random_number_fill_elementwise",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_rand_elem,
+                        )
+                    )
+                    i += 4
+                    continue
                 sugg_temp_elem = maybe_temp_then_elementwise(
                     loop_var, rng, stmt_s1, stmt_s2, decl_bounds, alloc_map, array_names
                 )
@@ -4486,6 +5941,65 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 7
                     continue
+                sugg_ext_ifelse = maybe_extreme_init_else_fold(
+                    loop_var, rng, stmt_if, stmt_t, stmt_f, decl_bounds
+                )
+                if sugg_ext_ifelse is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_minmax_value",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_ext_ifelse,
+                        )
+                    )
+                    i += 7
+                    continue
+        # Form D2: IF/ELSE block with paired min/max updates:
+        # do ...
+        #   if (...) then
+        #      smin = a(i)
+        #      smax = a(i)
+        #   else
+        #      smin = min(smin,a(i))
+        #      smax = max(smax,a(i))
+        #   end if
+        # end do
+        if i + 8 < len(body):
+            _ln_if, stmt_if = body[i + 1]
+            _ln_t1, stmt_t1 = body[i + 2]
+            _ln_t2, stmt_t2 = body[i + 3]
+            _ln_else, stmt_else = body[i + 4]
+            _ln_f1, stmt_f1 = body[i + 5]
+            _ln_f2, stmt_f2 = body[i + 6]
+            _ln_eif, stmt_eif = body[i + 7]
+            ln_end, stmt_end = body[i + 8]
+            if (
+                IF_THEN_RE.match(stmt_if.strip())
+                and ELSE_RE.match(stmt_else.strip())
+                and END_IF_RE.match(stmt_eif.strip())
+                and END_DO_RE.match(stmt_end.strip())
+            ):
+                sugg_pair = maybe_extreme_init_else_fold_pair(
+                    loop_var, rng, stmt_if, stmt_t1, stmt_t2, stmt_f1, stmt_f2, decl_bounds
+                )
+                if sugg_pair is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_minmax_value_pair",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_pair,
+                        )
+                    )
+                    i += 9
+                    continue
 
         # Form B: IF-block inside loop body:
         # do ...
@@ -4501,21 +6015,47 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             if IF_THEN_RE.match(stmt_if.strip()) and END_IF_RE.match(stmt_eif.strip()) and END_DO_RE.match(stmt_end.strip()):
                 prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
                 start_line = body[i - 1][0] if i - 1 >= 0 else ln
-                sugg_msum = maybe_masked_sum(loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds, array_names)
+                sugg_msum = maybe_masked_sum(
+                    loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds, array_names, decl_scalar_inits
+                )
                 if sugg_msum is not None:
+                    acc_name = sugg_msum.split("=", 1)[0].strip().lower()
+                    start_line_msum = body[i - 1][0] if prev_stmt_assigns_name(prev_stmt, acc_name) and i - 1 >= 0 else ln
                     findings.append(
                         Finding(
                             path=unit.path,
                             rule="reduction_masked_sum",
                             unit_kind=unit.kind,
                             unit_name=unit.name,
-                            start_line=start_line,
+                            start_line=start_line_msum,
                             end_line=ln_end,
                             suggestion=sugg_msum,
                         )
                     )
                     i += 5
                     continue
+                acc_block = masked_sum_acc_from_block_stmt(stmt_if, stmt_inside)
+                if acc_block is not None and not prev_stmt_assigns_name(prev_stmt, acc_block) and acc_block not in decl_scalar_inits:
+                    fake_inits = dict(decl_scalar_inits)
+                    fake_inits[acc_block] = "0.0"
+                    if (
+                        maybe_masked_sum(
+                            loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds, array_names, fake_inits
+                        )
+                        is not None
+                    ):
+                        findings.append(
+                            Finding(
+                                path=unit.path,
+                                rule="warning_uninitialized_masked_sum",
+                                unit_kind=unit.kind,
+                                unit_name=unit.name,
+                                start_line=ln,
+                                end_line=ln,
+                                suggestion=f"! xarray warning: skipped masked-sum rewrite because '{acc_block}' has no detected initialization",
+                                insert_only=True,
+                            )
+                        )
                 sugg_find = maybe_findloc_block(loop_var, rng, step, prev_stmt, stmt_if, stmt_inside, decl_bounds)
                 if sugg_find is not None:
                     findings.append(
@@ -4535,13 +6075,15 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     loop_var, rng, prev_stmt, stmt_if, stmt_inside, decl_bounds, array_names
                 )
                 if sugg_mprod is not None:
+                    acc_name = sugg_mprod.split("=", 1)[0].strip().lower()
+                    start_line_mprod = body[i - 1][0] if prev_stmt_assigns_name(prev_stmt, acc_name) and i - 1 >= 0 else ln
                     findings.append(
                         Finding(
                             path=unit.path,
                             rule="reduction_masked_product",
                             unit_kind=unit.kind,
                             unit_name=unit.name,
-                            start_line=start_line,
+                            start_line=start_line_mprod,
                             end_line=ln_end,
                             suggestion=sugg_mprod,
                         )
@@ -4592,6 +6134,37 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             _ln_eif, stmt_eif = body[i + 4]
             ln_end, stmt_end = body[i + 5]
             if IF_THEN_RE.match(stmt_if.strip()) and END_IF_RE.match(stmt_eif.strip()) and END_DO_RE.match(stmt_end.strip()):
+                recent_inits = collect_recent_scalar_assignments(body, i)
+                sugg_msp = maybe_masked_sum_product_block(
+                    loop_var,
+                    rng,
+                    stmt_if,
+                    stmt_a,
+                    stmt_b,
+                    decl_bounds,
+                    array_names,
+                    recent_inits,
+                    decl_scalar_inits,
+                )
+                if sugg_msp is not None:
+                    acc_names = set()
+                    for sl in sugg_msp.splitlines():
+                        if "=" in sl:
+                            acc_names.add(sl.split("=", 1)[0].strip().lower())
+                    sline = init_block_start_line_for_accs(body, i, acc_names) or ln
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_masked_sum_product",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=sline,
+                            end_line=ln_end,
+                            suggestion=sugg_msp,
+                        )
+                    )
+                    i += 6
+                    continue
                 sugg_loc = maybe_extreme_loc_block(loop_var, rng, step, stmt_if, stmt_a, stmt_b, decl_bounds)
                 if sugg_loc is not None:
                     findings.append(
@@ -4607,6 +6180,62 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 6
                     continue
+        # Form AM: multi-statement elementwise loop body:
+        # do ...
+        #    a(i)=...
+        #    b(i)=...
+        # end do
+        # Conservative: no nested control flow; only top-level assignments.
+        depth = 1
+        j = i + 1
+        inner_stmts: List[str] = []
+        has_nested = False
+        end_idx = -1
+        while j < len(body):
+            _ln_j, stmt_j = body[j]
+            st = stmt_j.strip()
+            if DO_RE.match(st):
+                has_nested = True
+                break
+            if END_DO_RE.match(st):
+                depth -= 1
+                if depth == 0:
+                    end_idx = j
+                    break
+            else:
+                if (
+                    IF_THEN_RE.match(st)
+                    or ELSE_RE.match(st)
+                    or END_IF_RE.match(st)
+                    or CYCLE_RE.match(st)
+                    or EXIT_RE.match(st)
+                    or RETURN_RE.match(st)
+                    or SELECT_CASE_RE.match(st)
+                ):
+                    has_nested = True
+                    break
+                if st:
+                    inner_stmts.append(stmt_j)
+            j += 1
+        if not has_nested and end_idx > i + 2:
+            ln_end = body[end_idx][0]
+            sugg_multi = maybe_multi_elementwise(
+                loop_var, rng, inner_stmts, decl_bounds, alloc_map, array_names
+            )
+            if sugg_multi is not None:
+                findings.append(
+                    Finding(
+                        path=unit.path,
+                        rule="elementwise_multi",
+                        unit_kind=unit.kind,
+                        unit_name=unit.name,
+                        start_line=ln,
+                        end_line=ln_end,
+                        suggestion=sugg_multi,
+                    )
+                )
+                i = end_idx + 1
+                continue
         i += 1
     return findings
 
@@ -4699,6 +6328,17 @@ def analyze_file(path: Path) -> List[Finding]:
     if not infos or any_missing:
         return []
     finfo = infos[0]
+    global USER_ELEMENTAL_CALLS, USER_ELEMENTAL_SUBROUTINES
+    USER_ELEMENTAL_CALLS = {
+        p.name.lower()
+        for p in finfo.procedures
+        if p.kind == "function" and "elemental" in p.attrs
+    }
+    USER_ELEMENTAL_SUBROUTINES = {
+        p.name.lower()
+        for p in finfo.procedures
+        if p.kind == "subroutine" and "elemental" in p.attrs
+    }
     out: List[Finding] = []
     for unit in xunset.collect_units(finfo):
         out.extend(analyze_unit(unit))
@@ -4859,6 +6499,8 @@ def annotate_file(path: Path, findings: List[Finding], *, backup: bool = True) -
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     inserted = 0
     for f in sorted(findings, key=lambda x: (x.start_line, x.end_line), reverse=True):
+        if f.insert_only:
+            continue
         sidx = f.start_line - 1
         eidx = f.end_line - 1
         if sidx < 0 or eidx < 0 or sidx >= len(lines) or eidx >= len(lines) or sidx > eidx:
@@ -4912,10 +6554,21 @@ def apply_fix_file(
         return 0, None, []
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     changed = 0
+    replaced = 0
     for f in sorted(findings, key=lambda x: (x.start_line, x.end_line), reverse=True):
         sidx = f.start_line - 1
         eidx = f.end_line - 1
         if sidx < 0 or eidx < 0 or sidx >= len(lines) or eidx >= len(lines) or sidx > eidx:
+            continue
+        if f.insert_only:
+            raw_s = lines[sidx]
+            eol = "\r\n" if raw_s.endswith("\r\n") else ("\n" if raw_s.endswith("\n") else "\n")
+            indent = re.match(r"^\s*", raw_s).group(0) if raw_s else ""
+            warn_line = f"{indent}{f.suggestion}{eol}"
+            if sidx > 0 and lines[sidx - 1].strip() == f.suggestion.strip():
+                continue
+            lines.insert(sidx, warn_line)
+            changed += 1
             continue
         # Also include any immediate trailing continuation-only lines.
         while eidx + 1 < len(lines) and is_continuation_only_line(lines[eidx + 1]):
@@ -4930,9 +6583,12 @@ def apply_fix_file(
             repl_lines.append(f"{indent}{sl}{suffix}{eol}")
         lines[sidx : eidx + 1] = repl_lines
         changed += 1
+        replaced += 1
     if changed == 0:
         return 0, None, []
-    lines, removed_locals = remove_unused_locals_from_lines(lines, path)
+    removed_locals: List[str] = []
+    if replaced > 0:
+        lines, removed_locals = remove_unused_locals_from_lines(lines, path)
     backup: Optional[Path] = None
     target = out_path if out_path is not None else path
     # With explicit output path, do not create input backups.
@@ -4943,12 +6599,121 @@ def apply_fix_file(
     return changed, backup, removed_locals
 
 
+def remove_redundant_allocates_via_xalloc_assign(path: Path) -> int:
+    """Delete redundant ALLOCATE-before-assignment statements in one file."""
+    findings = xalloc_assign.analyze_file(path)
+    if not findings:
+        return 0
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    removed = 0
+    by_alloc_line: Dict[int, xalloc_assign.Finding] = {}
+    for f in findings:
+        by_alloc_line.setdefault(f.alloc_line, f)
+    for alloc_line in sorted(by_alloc_line.keys(), reverse=True):
+        f = by_alloc_line[alloc_line]
+        if not (1 <= alloc_line <= len(lines)):
+            continue
+        if f.replace_assign_rhs is not None and 1 <= f.assign_line <= len(lines):
+            lines[f.assign_line - 1] = xalloc_assign.rewrite_assignment_rhs_line(
+                lines[f.assign_line - 1], f.var, f.replace_assign_rhs
+            )
+        end_line = xalloc_assign.end_line_for_stmt_start(lines, alloc_line)
+        if end_line < alloc_line:
+            continue
+        del lines[alloc_line - 1 : end_line]
+        removed += 1
+    if removed > 0:
+        path.write_text("".join(lines), encoding="utf-8")
+    return removed
+
+
+def inline_temps_via_xno_variable(path: Path) -> Tuple[int, int]:
+    """Inline single-use temporaries using xno_variable logic on one file."""
+    total_inline = 0
+    total_decl_removed = 0
+    # Run to fixed point: one pass may inline only one temp on a shared use line.
+    while True:
+        findings = xno_variable.analyze_file(path)
+        if not findings:
+            break
+        n_inline, n_decl_removed, _n_ann, _backup = xno_variable.apply_fix_file(
+            path,
+            findings,
+            annotate=False,
+            out_path=None,
+            create_backup=False,
+        )
+        if n_inline <= 0:
+            break
+        total_inline += n_inline
+        total_decl_removed += n_decl_removed
+    return total_inline, total_decl_removed
+
+
 def count_file_lines(path: Path) -> int:
     """Return line count for a text file (best effort)."""
     try:
         return len(path.read_text(encoding="utf-8").splitlines())
     except Exception:
         return 0
+
+
+def compile_and_run_capture(
+    source: Path,
+    *,
+    exe_path: Path,
+    label: str,
+    quiet_run: bool = False,
+    keep_exe: bool = False,
+) -> Tuple[bool, str, str]:
+    compile_cmd = ["gfortran", str(source), "-o", str(exe_path)]
+    print(f"Build ({label}): {' '.join(fbuild.quote_cmd_arg(x) for x in compile_cmd)}")
+    cp = subprocess.run(compile_cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        print(f"Build ({label}): FAIL (exit {cp.returncode})")
+        if cp.stdout:
+            print(cp.stdout.rstrip())
+        if cp.stderr:
+            print(fbuild.format_linker_stderr(cp.stderr).rstrip())
+        return False, "", ""
+    print(f"Build ({label}): PASS")
+    print(f"Run ({label}): {fbuild.quote_cmd_arg(str(exe_path))}")
+    rp = subprocess.run([str(exe_path)], capture_output=True, text=True)
+    try:
+        if rp.returncode != 0:
+            print(f"Run ({label}): FAIL (exit {rp.returncode})")
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+            return False, rp.stdout or "", rp.stderr or ""
+        print(f"Run ({label}): PASS")
+        if not quiet_run:
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+        return True, rp.stdout or "", rp.stderr or ""
+    finally:
+        if not keep_exe:
+            try:
+                exe_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def compile_and_run_fortran(
+    source: Path,
+    *,
+    exe_path: Path,
+    label: str,
+    quiet_run: bool = False,
+    keep_exe: bool = False,
+) -> bool:
+    ok, _out, _err = compile_and_run_capture(
+        source, exe_path=exe_path, label=label, quiet_run=quiet_run, keep_exe=keep_exe
+    )
+    return ok
 
 
 def main() -> int:
@@ -4966,6 +6731,29 @@ def main() -> int:
     )
     parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument(
+        "--tee",
+        action="store_true",
+        help="With --fix --out, also print transformed output text to stdout",
+    )
+    parser.add_argument(
+        "--tee-both",
+        action="store_true",
+        help="With --fix --out, print original and transformed source text to stdout",
+    )
+    parser.add_argument("--run", action="store_true", help="After --fix with changes, build and run transformed source")
+    parser.add_argument(
+        "--run-both",
+        action="store_true",
+        help="Build/run original source, and build/run transformed source when changes are applied",
+    )
+    parser.add_argument(
+        "--run-diff",
+        action="store_true",
+        help="Run original and transformed executables and compare stdout/stderr",
+    )
+    parser.add_argument("--quiet-run", action="store_true", help="Do not print program stdout/stderr on successful runs")
+    parser.add_argument("--keep-exe", action="store_true", help="Keep generated executables after running")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
@@ -4982,10 +6770,26 @@ def main() -> int:
         action="store_true",
         help="Use one-line FORALL rewrite mode for eligible simple loops",
     )
+    parser.add_argument(
+        "--inline",
+        dest="post_inline_temp",
+        action="store_true",
+        help="After xarray rewrites, run xno_variable-style temporary inlining post-pass",
+    )
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         print("--limit must be >= 1.")
         return 2
+    if args.run_diff:
+        args.run_both = True
+    if args.run_both:
+        args.run = True
+    if args.tee_both:
+        args.tee = True
+    if args.tee and args.out is None:
+        args.out = Path("temp.f90")
+    if args.run and args.out is None:
+        args.out = Path("temp.f90")
     if args.out is not None:
         args.fix = True
     if args.diff and not args.fix:
@@ -5003,6 +6807,9 @@ def main() -> int:
         return 2
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
+        return 2
+    if args.run and len(files) != 1:
+        print("--run/--run-both require exactly one input source file.")
         return 2
     baseline_compile_paths = files
     after_compile_paths = [args.out] if (args.fix and args.out is not None) else files
@@ -5029,6 +6836,18 @@ def main() -> int:
     pre_lines: Dict[Path, int] = {p: count_file_lines(p) for p in files}
 
     if not findings:
+        orig_out = ""
+        orig_err = ""
+        if args.run_both:
+            src = files[0]
+            orig_exe = Path(f"{src.stem}_orig.exe")
+            ok_orig, orig_out, orig_err = compile_and_run_capture(
+                src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+            )
+            if not ok_orig:
+                return 5
+        if args.run_diff:
+            print("Run diff: SKIP (no transformations suggested)")
         if args.summary:
             for p in files:
                 before = pre_lines.get(p, 0)
@@ -5047,14 +6866,28 @@ def main() -> int:
         if args.verbose:
             print(f"  suggest: {f.suggestion}")
 
+    transformed_changed = False
+    transformed_target: Optional[Path] = None
+    orig_out = ""
+    orig_err = ""
+    xform_out = ""
+    xform_err = ""
     if args.fix:
         by_file = by_file_candidates
         touched = 0
         total = 0
+        total_alloc_removed = 0
+        total_post_inlined = 0
+        total_post_decl_removed = 0
         post_lines: Dict[Path, int] = {}
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            before = p.read_text(encoding="utf-8")
             out_path = args.out if args.out is not None else None
+            before = p.read_text(encoding="utf-8")
+            if out_path is not None and args.tee_both:
+                print(f"--- original: {p} ---")
+                print(before, end="")
+                if not before.endswith("\n"):
+                    print("")
             n, backup, removed_locals = apply_fix_file(
                 p,
                 by_file[p],
@@ -5064,13 +6897,33 @@ def main() -> int:
             )
             total += n
             if n > 0:
+                transformed_changed = True
                 touched += 1
+                target = out_path if out_path is not None else p
+                n_alloc_removed = remove_redundant_allocates_via_xalloc_assign(target)
+                total_alloc_removed += n_alloc_removed
+                n_post_inl = 0
+                n_post_decl = 0
+                if args.post_inline_temp:
+                    n_post_inl, n_post_decl = inline_temps_via_xno_variable(target)
+                    total_post_inlined += n_post_inl
+                    total_post_decl_removed += n_post_decl
                 if out_path is not None:
                     print(f"\nFixed {p.name}: replaced {n} block(s), wrote {out_path}")
+                    if args.tee:
+                        print(f"--- transformed: {out_path} ---")
+                        print((out_path).read_text(encoding="utf-8"), end="")
                 else:
                     print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
                 if args.verbose and removed_locals:
                     print(f"  removed unused locals: {', '.join(removed_locals)}")
+                if n_alloc_removed > 0:
+                    print(f"  removed redundant allocate-before-assignment: {n_alloc_removed}")
+                if n_post_inl > 0:
+                    print(
+                        f"  post-inline-temp: inlined {n_post_inl}, "
+                        f"decl-entities removed {n_post_decl}"
+                    )
                 if args.diff:
                     after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
                     diff_lines = difflib.unified_diff(
@@ -5085,9 +6938,23 @@ def main() -> int:
                         print(line)
             elif args.verbose:
                 print(f"\nNo fixes applied in {p.name}")
+            elif out_path is not None and args.tee:
+                if args.tee_both:
+                    print(f"--- transformed: {out_path} ---")
+                print((out_path).read_text(encoding="utf-8"), end="")
             target = out_path if out_path is not None else p
+            transformed_target = target
             post_lines[p] = count_file_lines(target)
-        print(f"\n--fix summary: files changed {touched}, replaced {total}")
+        summary = (
+            f"\n--fix summary: files changed {touched}, replaced {total}, "
+            f"allocates removed {total_alloc_removed}"
+        )
+        if args.post_inline_temp:
+            summary += (
+                f", post-inlined {total_post_inlined}, "
+                f"post decl-entities removed {total_post_decl_removed}"
+            )
+        print(summary)
         if args.summary:
             for p in files:
                 before_n = pre_lines.get(p, 0)
@@ -5123,6 +6990,41 @@ def main() -> int:
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
             return 5
+    if args.run_both:
+        src = files[0]
+        orig_exe = Path(f"{src.stem}_orig.exe")
+        ok_orig, orig_out, orig_err = compile_and_run_capture(
+            src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+        )
+        if not ok_orig:
+            return 5
+    if args.run and transformed_changed and transformed_target is not None:
+        out_src = transformed_target
+        out_exe = Path(f"{out_src.stem}.exe")
+        ok_xf, xform_out, xform_err = compile_and_run_capture(
+            out_src, exe_path=out_exe, label="transformed", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+        )
+        if not ok_xf:
+            return 5
+    if args.run_diff:
+        if not transformed_changed:
+            print("Run diff: SKIP (no transformations applied)")
+        else:
+            same = (orig_out == xform_out) and (orig_err == xform_err)
+            if same:
+                print("Run diff: MATCH")
+            else:
+                print("Run diff: DIFF")
+                orig_blob = f"STDOUT:\n{orig_out}\nSTDERR:\n{orig_err}\n"
+                xform_blob = f"STDOUT:\n{xform_out}\nSTDERR:\n{xform_err}\n"
+                for line in difflib.unified_diff(
+                    orig_blob.splitlines(),
+                    xform_blob.splitlines(),
+                    fromfile="original",
+                    tofile="transformed",
+                    lineterm="",
+                ):
+                    print(line)
     return 0
 
 
