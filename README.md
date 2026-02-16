@@ -140,6 +140,7 @@ Typical commands:
 ```bash
 python xintent.py
 python xintent.py --fix --iterate --compiler "gfortran -o foo.exe"
+python xintent.py --fix --infer-by-compile
 python xintent.py --fix --iterate --suggest-intent-out --warn-missing-intent --compiler "gfortran -o foo.exe"
 python xintent.py --fix --iterate --suggest-intent-inout --warn-missing-intent --compiler "gfortran -o foo.exe"
 ```
@@ -147,6 +148,8 @@ python xintent.py --fix --iterate --suggest-intent-inout --warn-missing-intent -
 Notes:
 
 - Conservative analysis; ambiguous cases are left unchanged.
+- `--infer-by-compile` provisionally adds remaining `intent(in)` candidates and keeps only edits that compile.
+- `--infer-by-compile` implies `--fix`; compile command defaults to `gfortran -c {files}` and can be overridden with `--compile-cmd` (or `--compiler`).
 - Handles multi-entity declarations (for example `integer :: i, j`) when adding intents.
 - Detailed inference rules are documented in [intent.md](intent.md) and an example of module transformed by `xintent.py` is at [intent_example.md](intent_example.md).
 
