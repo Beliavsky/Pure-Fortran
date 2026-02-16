@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import shutil
 from dataclasses import dataclass
@@ -1412,13 +1413,31 @@ def main() -> int:
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
+    parser.add_argument("--tee", action="store_true")
+    parser.add_argument("--tee-both", action="store_true")
+    parser.add_argument("--run", action="store_true")
+    parser.add_argument("--run-both", action="store_true")
+    parser.add_argument("--run-diff", action="store_true")
+    parser.add_argument("--quiet-run", action="store_true")
+    parser.add_argument("--keep-exe", action="store_true")
     args = parser.parse_args()
+    if args.run_diff:
+        args.run_both = True
+    if args.run_both:
+        args.run = True
+    if args.tee_both:
+        args.tee = True
+    if args.run and args.out is None:
+        args.out = Path("temp.f90")
     if args.out is not None:
         args.fix = True
     if args.fix_arrays:
         args.fix = True
     if args.compiler and not args.fix:
         print("--compiler requires --fix.")
+        return 2
+    if args.tee and args.out is None:
+        print("--tee requires --out.")
         return 2
 
     files = choose_files(args.fortran_files, args.exclude)
@@ -1427,6 +1446,9 @@ def main() -> int:
         return 2
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
+        return 2
+    if args.run and len(files) != 1:
+        print("--run/--run-both/--run-diff require exactly one input source file.")
         return 2
     baseline_compile_paths = files
     after_compile_paths = [args.out] if (args.fix and args.out is not None) else files
@@ -1442,11 +1464,41 @@ def main() -> int:
             by_file[p] = cands
             candidates.extend(cands)
 
+    orig_out = ""
+    orig_err = ""
+    xform_out = ""
+    xform_err = ""
+    transformed_changed = False
+    transformed_target: Optional[Path] = None
     if not candidates:
+        if args.run_both:
+            src = files[0]
+            ok_orig, orig_out, orig_err = fbuild.compile_and_run_source(
+                src,
+                label="original",
+                quiet_run=args.quiet_run,
+                keep_exe=args.keep_exe,
+                exe_path=Path(f"{src.stem}_orig.exe"),
+            )
+            if not ok_orig:
+                return 5
+        if args.run_diff:
+            print("Run diff: SKIP (no transformations suggested)")
         if args.out is not None:
             src = files[0]
             if src.resolve() != args.out.resolve():
                 shutil.copy2(src, args.out)
+            if args.tee:
+                txt = args.out.read_text(encoding="utf-8", errors="ignore")
+                if args.tee_both:
+                    print(f"--- original: {src} ---")
+                    print(src.read_text(encoding="utf-8", errors="ignore"), end="")
+                    if not txt.endswith("\n"):
+                        print("")
+                    print(f"--- transformed: {args.out} ---")
+                print(txt, end="")
+                if not txt.endswith("\n"):
+                    print("")
             print(f"No DATA-to-constant candidates found. Wrote unchanged output to {args.out}")
             return 0
         print("No DATA-to-constant candidates found.")
@@ -1478,6 +1530,12 @@ def main() -> int:
         data_removed = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             out_path = args.out if args.out is not None else None
+            old_text = p.read_text(encoding="utf-8", errors="ignore")
+            if out_path is not None and args.tee_both:
+                print(f"--- original: {p} ---")
+                print(old_text, end="")
+                if not old_text.endswith("\n"):
+                    print("")
             work_path = p
             create_backup = args.backup
             if out_path is not None and p.resolve() != out_path.resolve():
@@ -1508,12 +1566,27 @@ def main() -> int:
                 if out_path is not None:
                     work_path = out_path
             if n_decl_total == 0 and n_data_total == 0:
+                if out_path is not None and args.tee:
+                    txt = out_path.read_text(encoding="utf-8", errors="ignore")
+                    if args.tee_both:
+                        print(f"--- transformed: {out_path} ---")
+                    print(txt, end="")
+                    if not txt.endswith("\n"):
+                        print("")
                 if args.verbose:
                     print(f"\nNo conservative DATA fixes applied in {p.name}")
                 continue
+            transformed_changed = True
+            transformed_target = out_path if out_path is not None else p
             touched += 1
             decl_changed += n_decl_total
             data_removed += n_data_total
+            if out_path is not None and args.tee:
+                txt = out_path.read_text(encoding="utf-8", errors="ignore")
+                print(f"--- transformed: {out_path} ---")
+                print(txt, end="")
+                if not txt.endswith("\n"):
+                    print("")
             if out_path is not None:
                 print(
                     f"\nFixed {p.name}: declarations {n_decl_total}, "
@@ -1536,6 +1609,42 @@ def main() -> int:
         if args.fix and args.compiler:
             if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
                 return 5
+        if args.run_both:
+            src = files[0]
+            ok_orig, orig_out, orig_err = fbuild.compile_and_run_source(
+                src,
+                label="original",
+                quiet_run=args.quiet_run,
+                keep_exe=args.keep_exe,
+                exe_path=Path(f"{src.stem}_orig.exe"),
+            )
+            if not ok_orig:
+                return 5
+        if args.run and transformed_changed and transformed_target is not None:
+            ok_xf, xform_out, xform_err = fbuild.compile_and_run_source(
+                transformed_target,
+                label="transformed",
+                quiet_run=args.quiet_run,
+                keep_exe=args.keep_exe,
+                exe_path=Path(f"{transformed_target.stem}.exe"),
+            )
+            if not ok_xf:
+                return 5
+        if args.run_diff:
+            if not transformed_changed:
+                print("Run diff: SKIP (no transformations applied)")
+            else:
+                same = (orig_out == xform_out) and (orig_err == xform_err)
+                if same:
+                    print("Run diff: MATCH")
+                else:
+                    print("Run diff: DIFF")
+                    ob = f"STDOUT:\n{orig_out}\nSTDERR:\n{orig_err}\n"
+                    tb = f"STDOUT:\n{xform_out}\nSTDERR:\n{xform_err}\n"
+                    for line in difflib.unified_diff(
+                        ob.splitlines(), tb.splitlines(), fromfile="original", tofile="transformed", lineterm=""
+                    ):
+                        print(line)
     return 0
 
 
