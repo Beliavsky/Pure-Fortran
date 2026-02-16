@@ -64,7 +64,21 @@ Main programs:
 - `xfree.py` - fixed-form (`.f`) to free-form (`.f90`) converter with optional compile regression checks.
 - `xtest.py` - transform regression harness (baseline compile -> transform -> post-compile) over file lists.
 - `xcompile.py` - compile-only batch harness over file lists with resume/loop controls.
+- `xbuild.py` - executable-build harness over source-file sets (one set per line in `--codes`).
+- `xarith_if.py` - advisory checker/fixer for arithmetic IF (`if (expr) l1, l2, l3`) with structured rewrites where safe.
+- `xassign.py` - advisory checker/fixer for legacy `ASSIGN` and assigned `GO TO`/assigned `FORMAT` patterns.
+- `xassumed_shape.py` - advisory checker/fixer to wrap or replace explicit-shape procedures with assumed-shape interfaces/bodies.
+- `xassumed_shape_set.py` - set-based assumed-shape migration across related source files, including caller rewrite support.
 - `xerror.py` - summarize warning/error kinds from compile logs (files/lines/hits per diagnostic kind).
+- `xcount_goto.py` - count `goto` statements per file and compare two directories (`before` vs `after`) with totals/deltas.
+- `xdata.py` - advisory checker/fixer for `DATA`-initialized variables that can be promoted to named constants.
+- `xdep.py` - dependency resolver/build helper for main-program source sets via `use`-module graph analysis.
+- `xdp.py` - advisory checker/fixer to migrate default `real` usage toward a chosen kind parameter (for example `dp`).
+- `xformat_statement.py` - advisory checker/fixer replacing labeled `FORMAT` statements with inline or named format strings.
+- `xgoto.py` - advisory checker/fixer for reducible `goto` patterns, with extraction/report utilities for remaining goto-heavy code.
+- `xloop.py` - advisory checker/fixer for labeled DO termination modernization (`do label ...` to `end do` forms).
+- `xmodularize.py` - transforms external-procedure program sets to module-based layout and updates main-program `use` lists.
+- `xselect.py` - advisory checker/fixer to rewrite eligible IF/ELSEIF chains as `select case` (including ranges/sets).
 - `xsort_size.py` - sort a file list (such as `codes.txt`) by source file size.
 - `xoptions.py` - list option counts and option names for `x*.py` scripts.
 - `xrepeat.py` - utility helper for repeated harness execution workflows.
@@ -957,6 +971,25 @@ Typical commands:
 python xrepeat.py
 python xrepeat.py foo.f90 --verbose
 ```
+
+### 46) `xbuild.py`
+
+Build-only harness for source-file sets, where each line in `--codes` is one build set (one or more source files).
+It attempts to build an executable for each set and reports failures with resume/silent controls.
+
+Typical commands:
+
+```bash
+python xbuild.py --codes codes.txt --compile-cmd "gfortran -w -Wfatal-errors {files}"
+python xbuild.py --codes c:\python\fortran\burkardt\codes.txt --code-dir c:\python\fortran\burkardt --silent --maxfail 10 --compile-cmd "gfortran -w -Wfatal-errors {files}"
+python xbuild.py --codes codes.txt --resume --silent --maxfail 0
+```
+
+Notes:
+
+- `--compile-cmd` supports `{files}`, `{file}`, and `{exe}` placeholders.
+- If `--compile-cmd` omits `{files}` and `{file}`, all set files are appended automatically.
+- Defaults: `--state-file xbuild_state.json`, `--fail-log xbuild_fail.log`, `--exe-dir build_exe`.
 
 ## Recommended Transformation Order
 
