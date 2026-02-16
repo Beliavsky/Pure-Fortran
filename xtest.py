@@ -9,6 +9,7 @@ import glob
 import json
 import time
 import shlex
+import re
 import shutil
 import subprocess
 import difflib
@@ -19,14 +20,45 @@ from typing import Dict, List, Optional, Tuple
 SILENT_PROGRESS_PER_LINE = 20
 
 
-def load_codes(path: Path) -> List[Path]:
-    """Load source file paths from a text list (one path per line)."""
-    out: List[Path] = []
+def load_codes(path: Path) -> List[List[Path]]:
+    """Load source entries from a text list (one or more paths per line)."""
+    out: List[List[Path]] = []
     for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        out.append(Path(line))
+        toks = shlex.split(line, posix=False)
+        if not toks:
+            continue
+        out.append([Path(tok) for tok in toks])
+    return out
+
+
+def load_codes_with_lines(path: Path) -> List[Tuple[int, List[Path]]]:
+    """Load source entries with original 1-based line numbers from codes file."""
+    out: List[Tuple[int, List[Path]]] = []
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        toks = shlex.split(line, posix=False)
+        if not toks:
+            continue
+        out.append((lineno, [Path(tok) for tok in toks]))
+    return out
+
+
+def resolve_code_entries(entries: List[List[Path]], code_dir: Optional[Path]) -> List[List[Path]]:
+    """Resolve relative code entries against --code-dir when provided."""
+    if code_dir is None:
+        return entries
+    base = code_dir
+    out: List[List[Path]] = []
+    for group in entries:
+        resolved_group: List[Path] = []
+        for p in group:
+            resolved_group.append(p if p.is_absolute() else (base / p))
+        out.append(resolved_group)
     return out
 
 
@@ -84,17 +116,36 @@ def expand_inputs(specs: List[str]) -> List[Path]:
     return out
 
 
-def command_from_template(template: str, file_path: Path) -> List[str]:
-    """Build argv from a command template and target file path."""
-    if "{file}" in template:
-        cmd = template.replace("{file}", str(file_path))
-        return shlex.split(cmd, posix=False)
-
+def command_from_template(template: str, file_paths: List[Path]) -> List[str]:
+    """Build argv from a command template and target file set."""
     argv = shlex.split(template, posix=False)
-    file_token = str(file_path).lower()
-    if not any(tok.lower() == file_token for tok in argv):
-        argv.append(str(file_path))
-    return argv
+    if not file_paths:
+        return argv
+
+    primary = file_paths[0]
+    out: List[str] = []
+    seen_placeholder = False
+    for tok in argv:
+        if tok == "{files}":
+            out.extend(str(p) for p in file_paths)
+            seen_placeholder = True
+            continue
+        if tok == "{file}":
+            out.append(str(primary))
+            seen_placeholder = True
+            continue
+        if "{file}" in tok:
+            out.append(tok.replace("{file}", str(primary)))
+            seen_placeholder = True
+            continue
+        out.append(tok)
+
+    if not seen_placeholder:
+        for p in file_paths:
+            file_token = str(p).lower()
+            if not any(tok.lower() == file_token for tok in out):
+                out.append(str(p))
+    return out
 
 
 @dataclass
@@ -199,6 +250,25 @@ def normalize_path_text(path: Path) -> str:
         return str(path)
 
 
+def copy_transformed_output(
+    *,
+    out_dir: Path,
+    temp_path: Path,
+    source_paths: List[Path],
+    noclobber: bool,
+) -> Tuple[bool, str]:
+    """Copy transformed temp output to out-dir/<source-basename>.f90."""
+    if not temp_path.exists():
+        return False, f"transformed temp file not found: {temp_path}"
+    src0 = source_paths[0] if source_paths else Path("unknown.f90")
+    dest = out_dir / src0.name
+    if noclobber and dest.exists():
+        return False, f"skip (noclobber): {dest}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(temp_path, dest)
+    return True, str(dest)
+
+
 def load_state(path: Path) -> Dict[str, object]:
     """Load state JSON if present, else return empty dict."""
     if not path.exists():
@@ -214,11 +284,13 @@ def save_state(path: Path, state: Dict[str, object]) -> None:
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def find_index_by_path(sources: List[Path], path_text: str) -> Optional[int]:
-    """Find index of a source path by normalized absolute path text."""
+def find_index_by_path(sources: List[List[Path]], path_text: str) -> Optional[int]:
+    """Find index by matching the first path of each source entry."""
     want = normalize_path_text(Path(path_text))
-    for i, src in enumerate(sources):
-        if normalize_path_text(src) == want:
+    for i, srcs in enumerate(sources):
+        if not srcs:
+            continue
+        if normalize_path_text(srcs[0]) == want:
             return i
     return None
 
@@ -303,48 +375,117 @@ def default_transform_timeout(transform_cmd: str) -> Optional[float]:
     return None
 
 
+def transform_cmd_requests_verbose(transform_cmd: str) -> bool:
+    """Whether transform command template appears to request verbose output."""
+    try:
+        toks = shlex.split(transform_cmd, posix=False)
+    except Exception:
+        toks = transform_cmd.split()
+    for tok in toks:
+        t = tok.strip().lower()
+        if t == "--verbose" or t.startswith("--verbose="):
+            return True
+    return False
+
+
 def run_once(args: argparse.Namespace, *, resume: bool) -> int:
     """Run one full pass over the source list and return process-style exit code."""
     source_desc = ""
+    source_line_numbers: Optional[List[int]] = None
     if args.inputs:
-        sources = expand_inputs(args.inputs)
+        sources = [[p] for p in expand_inputs(args.inputs)]
         source_desc = f"command-line inputs ({len(args.inputs)} pattern(s))"
     else:
         if not args.codes.exists():
             print(f"Codes list not found: {args.codes}")
             return 2
-        sources = load_codes(args.codes)
+        entries = load_codes_with_lines(args.codes)
+        source_line_numbers = [ln for ln, _grp in entries]
+        sources = resolve_code_entries([grp for _ln, grp in entries], args.code_dir)
         source_desc = str(args.codes)
+    orig_sources_count = len(sources)
     if not sources:
         if args.inputs:
             print("No source entries found from command-line inputs.")
         else:
             print(f"No source entries found in {args.codes}")
         return 2
+    if args.reverse:
+        sources = list(reversed(sources))
+        if source_line_numbers is not None:
+            source_line_numbers = list(reversed(source_line_numbers))
+    if args.start is not None:
+        start_spec = str(args.start).strip()
+        if re.match(r"^\d+$", start_spec):
+            start_1 = int(start_spec)
+            if source_line_numbers is not None:
+                start_idx_by_line = None
+                for i, ln in enumerate(source_line_numbers):
+                    if ln >= start_1:
+                        start_idx_by_line = i
+                        break
+                if start_idx_by_line is None:
+                    print(f"--start line {start_1} is past end of {args.codes}. Nothing to do.")
+                    return 0
+                sources = sources[start_idx_by_line:]
+                source_line_numbers = source_line_numbers[start_idx_by_line:]
+            else:
+                if start_1 > len(sources):
+                    print(f"--start {start_1} is past available entries ({len(sources)}). Nothing to do.")
+                    return 0
+                sources = sources[start_1 - 1 :]
+        else:
+            match_idx = None
+            needle = start_spec.lower()
+            for i, grp in enumerate(sources):
+                if not grp:
+                    continue
+                first = str(grp[0])
+                if first.lower().startswith(needle) or grp[0].name.lower().startswith(needle):
+                    match_idx = i
+                    break
+            if match_idx is None:
+                print(f'No codes entry starts with "{start_spec}".')
+                return 2
+            sources = sources[match_idx:]
 
     start_idx = 0
     state = load_state(args.state_file)
     if resume:
-        status = str(state.get("status", ""))
-        failed_source = str(state.get("failed_source", ""))
-        next_index = state.get("next_index")
-
-        if failed_source:
-            idx = find_index_by_path(sources, failed_source)
-            if idx is not None:
-                start_idx = idx
-        elif isinstance(next_index, int) and 0 <= next_index < len(sources):
-            start_idx = next_index
-
-        if start_idx > 0:
+        if args.start is not None:
             if not args.silent:
-                print(f"Resuming from entry {start_idx + 1}: {sources[start_idx]}")
-        elif status:
-            if not args.silent:
-                print("Resume requested but no matching prior failing file found; starting at first entry.")
+                print("Resume note: --start is set; ignoring resume position from state.")
+        else:
+            status = str(state.get("status", ""))
+            failed_source = str(state.get("failed_source", ""))
+            next_index = state.get("next_index")
+            filtered_run = bool(args.reverse or args.start is not None)
+
+            if failed_source:
+                idx = find_index_by_path(sources, failed_source)
+                if idx is not None:
+                    start_idx = idx
+            elif (not filtered_run) and isinstance(next_index, int) and 0 <= next_index < len(sources):
+                start_idx = next_index
+
+            if start_idx > 0:
+                if not args.silent:
+                    print(f"Resuming from entry {start_idx + 1}: {' '.join(str(p) for p in sources[start_idx])}")
+            elif filtered_run and failed_source:
+                if not args.silent:
+                    print("Resume note: prior failed source is outside current filtered selection; starting at filtered start.")
+            elif status:
+                if not args.silent:
+                    print("Resume requested but no matching prior failing file found; starting at first entry.")
 
     if not args.silent:
-        print(f"Loaded {len(sources)} code path(s) from {source_desc}")
+        if len(sources) != orig_sources_count:
+            print(
+                f"Loaded {len(sources)} code entr{'y' if len(sources)==1 else 'ies'} from {source_desc} "
+                f"(filtered from {orig_sources_count})."
+            )
+        else:
+            print(f"Loaded {len(sources)} code entr{'y' if len(sources)==1 else 'ies'} from {source_desc}")
     tested = 0
     baseline_failed = 0
     post_failed = 0
@@ -360,6 +501,7 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
     n_transform = 0
     n_post = 0
     line_rows: List[Dict[str, object]] = []
+    echo_transform_output = transform_cmd_requests_verbose(args.transform_cmd)
     baseline_ok_out: Optional[Path] = None
     baseline_ok_entries: List[str] = []
     baseline_ok_seen_lower = set()
@@ -377,13 +519,13 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
     def show_problem_source() -> None:
         flush_silent_progress_line()
         if args.silent:
-            print(f"[{tested}] {src}")
+            print(f"[{tested}] {' '.join(str(p) for p in srcs)}")
 
-    def maybe_record_baseline_ok(src_path: Path) -> None:
+    def maybe_record_baseline_ok(entry_paths: List[Path]) -> None:
         nonlocal baseline_ok_entries, baseline_ok_seen_lower
         if baseline_ok_out is None:
             return
-        text = normalize_path_text(src_path)
+        text = " ".join(normalize_path_text(p) for p in entry_paths)
         key = text.lower()
         if key in baseline_ok_seen_lower:
             return
@@ -412,13 +554,15 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
         if args.lines:
             print_lines_dataframe(line_rows)
 
-    for idx, src in enumerate(sources[start_idx:], start=start_idx):
+    for idx, srcs in enumerate(sources[start_idx:], start=start_idx):
+        src = srcs[0] if srcs else Path("")
+        src_display = " ".join(str(p) for p in srcs)
         if args.limit is not None and processed_entries >= args.limit:
             limit_reached = True
             break
         processed_entries += 1
-        if not src.exists():
-            print(f"\nSkipping missing source: {src}")
+        if not srcs or any(not p.exists() for p in srcs):
+            print(f"\nSkipping missing source entry: {src_display}")
             save_state(
                 args.state_file,
                 {
@@ -435,7 +579,7 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
 
         tested += 1
         if not args.silent:
-            print(f"\n[{tested}] Testing {src}")
+            print(f"\n[{tested}] Testing {src_display}")
         else:
             print(f"{tested} ", end="", flush=True)
             silent_progress_open = True
@@ -444,24 +588,30 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
                 print("")
                 silent_progress_open = False
                 silent_progress_in_line = 0
-        shutil.copy2(src, args.temp)
-
-        base_cmd = command_from_template(args.compile_cmd, args.temp)
+        is_set = len(srcs) > 1
+        if is_set:
+            base_cmd = command_from_template(args.compile_cmd, srcs)
+            orig_lines = 0
+            orig_text = ""
+        else:
+            shutil.copy2(src, args.temp)
+            base_cmd = command_from_template(args.compile_cmd, [args.temp])
         base = run_cmd(base_cmd, timeout=args.compile_timeout)
         t_baseline += base.elapsed_sec
         n_baseline += 1
-        try:
-            orig_text = src.read_text(encoding="utf-8", errors="ignore")
-            orig_lines = count_text_lines(orig_text)
-        except Exception:
-            orig_text = ""
-            orig_lines = 0
+        if not is_set:
+            try:
+                orig_text = src.read_text(encoding="utf-8", errors="ignore")
+                orig_lines = count_text_lines(orig_text)
+            except Exception:
+                orig_text = ""
+                orig_lines = 0
         if base.returncode != 0:
             baseline_failed += 1
             line_rows.append(
                 {
                     "index": tested,
-                    "source": normalize_path_text(src),
+                    "source": src_display,
                     "orig_lines": orig_lines,
                     "transformed_lines": None,
                     "delta_lines": None,
@@ -488,28 +638,34 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
                 },
             )
             continue
-        maybe_record_baseline_ok(src)
+        maybe_record_baseline_ok(srcs)
 
-        shutil.copy2(args.temp, args.before_copy)
+        if not is_set:
+            shutil.copy2(args.temp, args.before_copy)
 
-        transform_cmd = command_from_template(args.transform_cmd, args.temp)
+        transform_cmd = command_from_template(args.transform_cmd, srcs if is_set else [args.temp])
         tx = run_cmd(transform_cmd, timeout=args.transform_timeout)
         t_transform += tx.elapsed_sec
         n_transform += 1
-        transformed_text = args.temp.read_text(encoding="utf-8", errors="ignore") if args.temp.exists() else ""
-        transformed_lines = count_text_lines(transformed_text) if transformed_text else 0
-        changed_orig = (
-            changed_original_line_count(orig_text, transformed_text)
-            if (orig_text and transformed_text)
-            else None
-        )
-        delta_lines = (transformed_lines - orig_lines) if transformed_text else None
+        transformed_text = ""
+        transformed_lines: Optional[int] = None
+        changed_orig = None
+        delta_lines = None
+        if not is_set:
+            transformed_text = args.temp.read_text(encoding="utf-8", errors="ignore") if args.temp.exists() else ""
+            transformed_lines = count_text_lines(transformed_text) if transformed_text else 0
+            changed_orig = (
+                changed_original_line_count(orig_text, transformed_text)
+                if (orig_text and transformed_text)
+                else None
+            )
+            delta_lines = (transformed_lines - orig_lines) if transformed_text else None
         line_rows.append(
             {
                 "index": tested,
-                "source": normalize_path_text(src),
+                "source": src_display,
                 "orig_lines": orig_lines,
-                "transformed_lines": transformed_lines if transformed_text else None,
+                "transformed_lines": transformed_lines,
                 "delta_lines": delta_lines,
                 "changed_orig_lines": changed_orig,
             }
@@ -518,8 +674,9 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
             if not args.silent:
                 show_problem_source()
                 print("Transform command failed. Stopping.")
-                print("Source retained at:", args.temp)
-                print("Pre-transform snapshot:", args.before_copy)
+                if not is_set:
+                    print("Source retained at:", args.temp)
+                    print("Pre-transform snapshot:", args.before_copy)
                 if tx.timed_out:
                     print("Transform command timed out.")
                 show_output("transform", tx)
@@ -553,8 +710,26 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
             print_time_summary()
             print_optional_lines_summary()
             return 3
+        if echo_transform_output and (tx.stdout.strip() or tx.stderr.strip()):
+            if args.silent:
+                flush_silent_progress_line()
+            print(f"Transform output for {src_display}:")
+            show_output("transform", tx)
+        if args.out_dir is not None:
+            copied, msg = copy_transformed_output(
+                out_dir=args.out_dir,
+                temp_path=args.temp,
+                source_paths=srcs,
+                noclobber=args.noclobber,
+            )
+            if not copied:
+                if not args.silent:
+                    print(f"Out copy: {msg}")
+            else:
+                if not args.silent:
+                    print(f"Out copy: {msg}")
 
-        post_cmd = command_from_template(args.compile_cmd, args.temp)
+        post_cmd = command_from_template(args.compile_cmd, srcs if is_set else [args.temp])
         post = run_cmd(post_cmd, timeout=args.compile_timeout)
         t_post += post.elapsed_sec
         n_post += 1
@@ -562,9 +737,10 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
             post_failed += 1
             show_problem_source()
             print("Post-transform compile failed.")
-            print("Source retained at:", args.temp)
-            print("Pre-transform snapshot:", args.before_copy)
-            print("Failing original source:", src)
+            if not is_set:
+                print("Source retained at:", args.temp)
+                print("Pre-transform snapshot:", args.before_copy)
+            print("Failing original source:", src_display)
             if post.timed_out:
                 print("Post-transform compile timed out.")
             show_output("post", post)
@@ -643,7 +819,7 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
                 "input_specs": list(args.inputs) if args.inputs else [],
                 "compile_cmd": args.compile_cmd,
                 "transform_cmd": args.transform_cmd,
-                "last_source": normalize_path_text(sources[min(start_idx + processed_entries - 1, len(sources) - 1)]),
+                "last_source": normalize_path_text(sources[min(start_idx + processed_entries - 1, len(sources) - 1)][0]),
                 "next_index": min(start_idx + processed_entries, len(sources)),
             },
         )
@@ -668,7 +844,7 @@ def run_once(args: argparse.Namespace, *, resume: bool) -> int:
             "input_specs": list(args.inputs) if args.inputs else [],
             "compile_cmd": args.compile_cmd,
             "transform_cmd": args.transform_cmd,
-            "last_source": normalize_path_text(sources[-1]) if sources else "",
+            "last_source": normalize_path_text(sources[-1][0]) if sources and sources[-1] else "",
             "next_index": len(sources),
             "post_failures": post_failed,
         },
@@ -691,7 +867,12 @@ def main() -> int:
         "--codes",
         type=Path,
         default=Path("codes.txt"),
-        help="Path to file list (default: codes.txt)",
+        help="Path to source list (default: codes.txt). Each line may contain one or more file paths.",
+    )
+    parser.add_argument(
+        "--code-dir",
+        type=Path,
+        help="Base directory for relative paths in --codes entries.",
     )
     parser.add_argument(
         "--temp",
@@ -709,7 +890,7 @@ def main() -> int:
         "--compile-cmd",
         type=str,
         default="gfortran -c {file} -o temp.o",
-        help="Compile command template; use {file} placeholder (default: gfortran -c {file} -o temp.o)",
+        help="Compile command template; use {file} or {files} placeholder (default: gfortran -c {file} -o temp.o)",
     )
     parser.add_argument(
         "--transform-cmd",
@@ -717,6 +898,7 @@ def main() -> int:
         required=True,
         help=(
             "Transform command template; may include {file}. "
+            "Use {files} for multi-file source entries. "
             "If omitted, temp file path is appended automatically."
         ),
     )
@@ -740,6 +922,20 @@ def main() -> int:
         "--resume",
         action="store_true",
         help="Resume from first failing file recorded in prior run state",
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        help=(
+            "Start point (applied after --reverse, before --resume): "
+            "either numeric start (codes-file line number when using --codes; entry index for positional inputs) "
+            "or first-file prefix (for example: foo.f90)"
+        ),
+    )
+    parser.add_argument(
+        "--reverse",
+        action="store_true",
+        help="Process source entries in reverse order",
     )
     parser.add_argument(
         "--state-file",
@@ -786,6 +982,19 @@ def main() -> int:
         help="Suppress routine progress/success output; print only problems/failures",
     )
     parser.add_argument(
+        "--out-dir",
+        type=Path,
+        help=(
+            "Directory to save each successful transformed output as <source-basename>.f90. "
+            "Must not be the current directory."
+        ),
+    )
+    parser.add_argument(
+        "--noclobber",
+        action="store_true",
+        help="With --out-dir, do not overwrite existing saved transformed files.",
+    )
+    parser.add_argument(
         "--notime",
         action="store_true",
         help="Disable elapsed-time summary output",
@@ -807,6 +1016,14 @@ def main() -> int:
     if args.limit is not None and args.limit < 1:
         print("--limit must be >= 1.")
         return 2
+    if args.start is not None:
+        s = str(args.start).strip()
+        if not s:
+            print("--start must not be empty.")
+            return 2
+        if re.match(r"^\d+$", s) and int(s) < 1:
+            print("--start numeric value must be >= 1.")
+            return 2
     if args.maxfail < 0:
         print("--maxfail must be >= 0.")
         return 2
@@ -824,6 +1041,15 @@ def main() -> int:
         args.transform_timeout = None
     if args.compile_timeout is not None and args.compile_timeout <= 0:
         args.compile_timeout = None
+    if args.out_dir is not None:
+        cwd_res = Path(".").resolve()
+        out_res = args.out_dir.resolve()
+        if out_res == cwd_res:
+            print("--out-dir must not be the current directory.")
+            return 2
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print("--out-dir exists but is not a directory.")
+            return 2
 
     if not args.loop:
         return run_once(args, resume=args.resume)
