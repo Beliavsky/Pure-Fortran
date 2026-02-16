@@ -36,14 +36,34 @@ ONE_LINE_RETURN_IF_RE = re.compile(
     r"^\s*if\s*\((.+)\)\s*(return|stop\b|error\s*stop\b)\s*$",
     re.IGNORECASE,
 )
-GUARD_LT_RE = re.compile(r"^\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*<\s*([+-]?\d+)\s*$", re.IGNORECASE)
-GUARD_LE_RE = re.compile(r"^\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*<=\s*([+-]?\d+)\s*$", re.IGNORECASE)
+GUARD_LT_RE = re.compile(
+    r"^\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*(?:<|\.lt\.)\s*([+-]?\d+)\s*$",
+    re.IGNORECASE,
+)
+GUARD_LE_RE = re.compile(
+    r"^\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*(?:<=|\.le\.)\s*([+-]?\d+)\s*$",
+    re.IGNORECASE,
+)
 GUARD_EQ_RE = re.compile(
     r"^\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*(?:==|\.eq\.)\s*([+-]?\d+)\s*$",
     re.IGNORECASE,
 )
-GUARD_VAR_GT_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*>\s*([+-]?\d+)\s*$", re.IGNORECASE)
-GUARD_VAR_GE_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*>=\s*([+-]?\d+)\s*$", re.IGNORECASE)
+GUARD_VAR_GT_RE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)\s*(?:>|\.gt\.)\s*([+-]?\d+)\s*$",
+    re.IGNORECASE,
+)
+GUARD_VAR_GE_RE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)\s*(?:>=|\.ge\.)\s*([+-]?\d+)\s*$",
+    re.IGNORECASE,
+)
+GUARD_VAR_LT_RE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)\s*(?:<|\.lt\.)\s*([+-]?\d+)\s*$",
+    re.IGNORECASE,
+)
+GUARD_VAR_LE_RE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)\s*(?:<=|\.le\.)\s*([+-]?\d+)\s*$",
+    re.IGNORECASE,
+)
 SIZE_ASSIGN_RE = re.compile(
     r"^\s*([a-z][a-z0-9_]*)\s*=\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*(?:,\s*1\s*)?\)\s*$",
     re.IGNORECASE,
@@ -922,7 +942,7 @@ def return_guard_min_sizes_with_alias(cond: str, size_alias: Dict[str, str]) -> 
             out[v] = max(out.get(v, 0), k)
             continue
         # Alias guards: n < k or n <= k-1 where n=size(arr).
-        mlt = re.match(r"^\s*([a-z][a-z0-9_]*)\s*<\s*([+-]?\d+)\s*$", pp, re.IGNORECASE)
+        mlt = GUARD_VAR_LT_RE.match(pp)
         if mlt:
             v = mlt.group(1).lower()
             k = parse_int(mlt.group(2))
@@ -930,7 +950,7 @@ def return_guard_min_sizes_with_alias(cond: str, size_alias: Dict[str, str]) -> 
             if arr is not None and k is not None:
                 out[arr] = max(out.get(arr, 0), max(0, k))
             continue
-        mle = re.match(r"^\s*([a-z][a-z0-9_]*)\s*<=\s*([+-]?\d+)\s*$", pp, re.IGNORECASE)
+        mle = GUARD_VAR_LE_RE.match(pp)
         if mle:
             v = mle.group(1).lower()
             k = parse_int(mle.group(2))
