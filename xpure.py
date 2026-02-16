@@ -24,7 +24,9 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import cli_paths as cpaths
 
 PROC_START_RE = re.compile(
-    r"^\s*(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
+    r"^\s*(?P<lead>(?:(?:double\s+precision|integer|real|logical|complex|character\b(?:\s*\([^)]*\))?"
+    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?:\([^)]*\))?\s*,?\s*)?)"
+    r"(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
     r"(?P<kind>function|subroutine)\s+"
     r"(?P<name>[a-z][a-z0-9_]*)\s*(?P<arglist>\([^)]*\))?",
     re.IGNORECASE,
@@ -65,7 +67,9 @@ ASSIGN_RE = re.compile(
 )
 ALLOC_DEALLOC_RE = re.compile(r"^\s*(allocate|deallocate)\s*\((.+)\)\s*$", re.IGNORECASE)
 DECL_RE = re.compile(
-    r"^(\s*)(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
+    r"^(\s*)(?P<lead>(?:(?:double\s+precision|integer|real|logical|complex|character\b(?:\s*\([^)]*\))?"
+    r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?:\([^)]*\))?\s*,?\s*)?)"
+    r"(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
     r"(?P<kind>function|subroutine)\b",
     re.IGNORECASE,
 )
@@ -940,7 +944,7 @@ def elemental_shape_compatible(proc: Procedure) -> bool:
         if d not in declared or d in nonscalar or d in pointer_or_allocatable:
             return False
     if proc.kind == "function":
-        if result_name not in declared or result_name in nonscalar:
+        if result_name in nonscalar:
             return False
         if result_name in pointer_or_allocatable:
             return False
@@ -1086,29 +1090,30 @@ def add_pure_to_declaration(line: str) -> Tuple[str, bool]:
     if not m:
         return line, False
     prefix = m.group("prefix") or ""
+    lead = m.group("lead") or ""
     attrs = {a.lower() for a in prefix.split()}
     if "pure" in attrs or "elemental" in attrs or "impure" in attrs:
         return line, False
     indent = m.group(1)
     kind = m.group("kind")
     tail = code[m.end("kind"):]
-    new_code = f"{indent}pure {prefix}{kind}{tail}"
+    new_code = f"{indent}{lead}pure {prefix}{kind}{tail}"
     return f"{new_code}{comment}", True
 
 
 def add_elemental_to_declaration(line: str) -> Tuple[str, bool]:
-    """Insert ELEMENTAL and remove PURE in a declaration line."""
+    """Insert ELEMENTAL (and drop PURE when present) in a declaration line."""
     code, comment = split_code_comment(line)
     m = DECL_RE.match(code)
     if not m:
         return line, False
     prefix = m.group("prefix") or ""
+    lead = m.group("lead") or ""
     attrs = [a for a in prefix.split() if a]
     attrs_l = [a.lower() for a in attrs]
     if "elemental" in attrs_l:
         return line, False
-    # This mode intentionally upgrades already-pure procedures to elemental.
-    if "pure" not in attrs_l:
+    if "impure" in attrs_l:
         return line, False
     filtered = [a for a in attrs if a.lower() != "pure"]
     indent = m.group(1)
@@ -1117,8 +1122,71 @@ def add_elemental_to_declaration(line: str) -> Tuple[str, bool]:
     new_prefix = " ".join(["elemental"] + filtered)
     if new_prefix:
         new_prefix += " "
-    new_code = f"{indent}{new_prefix}{kind}{tail}"
+    new_code = f"{indent}{lead}{new_prefix}{kind}{tail}"
     return f"{new_code}{comment}", True
+
+
+def add_impure_elemental_to_declaration(line: str) -> Tuple[str, bool]:
+    """Insert IMPURE ELEMENTAL into a procedure declaration line when missing."""
+    code, comment = split_code_comment(line)
+    m = DECL_RE.match(code)
+    if not m:
+        return line, False
+    prefix = m.group("prefix") or ""
+    lead = m.group("lead") or ""
+    attrs = [a for a in prefix.split() if a]
+    attrs_l = [a.lower() for a in attrs]
+    if "elemental" in attrs_l:
+        return line, False
+    filtered = [a for a in attrs if a.lower() not in {"pure", "impure", "elemental"}]
+    indent = m.group(1)
+    kind = m.group("kind")
+    tail = code[m.end("kind"):]
+    new_prefix = " ".join(["impure", "elemental"] + filtered)
+    if new_prefix:
+        new_prefix += " "
+    new_code = f"{indent}{lead}{new_prefix}{kind}{tail}"
+    return f"{new_code}{comment}", True
+
+
+def apply_decl_edit_at_or_continuation(
+    lines: List[str],
+    idx: int,
+    editor,
+) -> bool:
+    """Apply declaration editor at idx, or on a continued signature line."""
+    if idx < 0 or idx >= len(lines):
+        return False
+
+    new_line, did_change = editor(lines[idx])
+    if did_change:
+        lines[idx] = new_line
+        return True
+
+    code0, _comment0 = split_code_comment(lines[idx])
+    if not code0.rstrip().endswith("&"):
+        return False
+
+    j = idx + 1
+    while j < len(lines):
+        raw = lines[j]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("!"):
+            j += 1
+            continue
+        codej, commentj = split_code_comment(raw)
+        m = re.match(r"^(\s*&?\s*)(.*)$", codej)
+        if not m:
+            return False
+        lead = m.group(1)
+        core = m.group(2)
+        edited_core, did_change_core = editor(core)
+        if not did_change_core:
+            return False
+        newline = "\n" if raw.endswith("\n") and not f"{lead}{edited_core}{commentj}".endswith("\n") else ""
+        lines[j] = f"{lead}{edited_core}{commentj}{newline}"
+        return True
+    return False
 
 
 def apply_fix(
@@ -1138,11 +1206,7 @@ def apply_fix(
     changed_names: List[Tuple[str, str]] = []
     for proc in targets:
         idx = proc.start - 1
-        if idx < 0 or idx >= len(updated):
-            continue
-        new_line, did_change = add_pure_to_declaration(updated[idx])
-        if did_change:
-            updated[idx] = new_line
+        if apply_decl_edit_at_or_continuation(updated, idx, add_pure_to_declaration):
             changed += 1
             changed_names.append((proc.kind, proc.name))
 
@@ -1191,11 +1255,56 @@ def apply_elemental_fix(
     changed_names: List[Tuple[str, str]] = []
     for proc in targets:
         idx = proc.start - 1
-        if idx < 0 or idx >= len(updated):
-            continue
-        new_line, did_change = add_elemental_to_declaration(updated[idx])
-        if did_change:
-            updated[idx] = new_line
+        if apply_decl_edit_at_or_continuation(updated, idx, add_elemental_to_declaration):
+            changed += 1
+            changed_names.append((proc.kind, proc.name))
+
+    if changed == 0:
+        return 0, None, []
+
+    if show_diff:
+        diff_to = str(out_path) if out_path is not None else str(path)
+        diff = difflib.unified_diff(
+            original_lines,
+            updated,
+            fromfile=str(path),
+            tofile=diff_to,
+            lineterm="",
+        )
+        print("\nProposed diff:")
+        for line in diff:
+            print(line)
+
+    backup_path: Optional[Path] = None
+    if backup and out_path is None:
+        backup_path = path.with_name(path.name + ".bak")
+        shutil.copy2(path, backup_path)
+        print(f"\nBackup written: {backup_path}")
+
+    target = out_path if out_path is not None else path
+    with target.open("w", encoding="utf-8", newline="") as f:
+        f.write("".join(updated))
+    return changed, backup_path, changed_names
+
+
+def apply_impure_elemental_fix(
+    path: Path,
+    original_lines: List[str],
+    targets: List[Procedure],
+    backup: bool,
+    show_diff: bool,
+    out_path: Optional[Path] = None,
+) -> Tuple[int, Optional[Path], List[Tuple[str, str]]]:
+    """Apply IMPURE ELEMENTAL edits to selected procedures in one source file."""
+    if not targets:
+        return 0, None, []
+
+    updated = original_lines[:]
+    changed = 0
+    changed_names: List[Tuple[str, str]] = []
+    for proc in targets:
+        idx = proc.start - 1
+        if apply_decl_edit_at_or_continuation(updated, idx, add_impure_elemental_to_declaration):
             changed += 1
             changed_names.append((proc.kind, proc.name))
 
@@ -1377,9 +1486,6 @@ def main() -> int:
     if args.suggest_elemental and args.suggest_impure_elemental:
         print("Use only one of --suggest-elemental or --suggest-impure-elemental.")
         return 3
-    if args.fix and args.suggest_impure_elemental:
-        print("--suggest-impure-elemental is advisory only and cannot be combined with --fix.")
-        return 3
     if args.max_iter < 1:
         print("--max-iter must be >= 1.")
         return 3
@@ -1393,7 +1499,12 @@ def main() -> int:
     max_passes = args.max_iter if args.iterate else 1
     did_baseline_compile = False
     changed_summary: Dict[Tuple[str, str], List[str]] = {}
-    changed_attr_label = "elemental" if args.suggest_elemental else "pure"
+    if args.suggest_elemental:
+        changed_attr_label = "elemental"
+    elif args.suggest_impure_elemental:
+        changed_attr_label = "impure elemental"
+    else:
+        changed_attr_label = "pure"
     changed_files: Set[Path] = set()
 
     for it in range(1, max_passes + 1):
@@ -1498,10 +1609,13 @@ def main() -> int:
                 continue
 
             apply_all = args.all_candidates or not args.only
-            base_targets = elemental_suggestions if args.suggest_elemental else result.candidates
-            targets, _ = choose_targets(base_targets, args.only, apply_all)
             if args.suggest_elemental:
-                targets = [t for t in targets if ("pure" in t.attrs and "elemental" not in t.attrs)]
+                base_targets = elemental_suggestions
+            elif args.suggest_impure_elemental:
+                base_targets = impure_elemental_suggestions
+            else:
+                base_targets = result.candidates
+            targets, _ = choose_targets(base_targets, args.only, apply_all)
             selected_here = {t.selector.lower() for t in targets} | {t.name.lower() for t in targets}
             unmatched_tokens -= {tok for tok in unmatched_tokens if tok in selected_here}
 
@@ -1510,6 +1624,15 @@ def main() -> int:
 
             if args.suggest_elemental:
                 changed, backup_path, changed_names = apply_elemental_fix(
+                    finfo.path,
+                    finfo.lines,
+                    targets,
+                    backup=args.backup,
+                    show_diff=args.diff,
+                    out_path=args.out,
+                )
+            elif args.suggest_impure_elemental:
+                changed, backup_path, changed_names = apply_impure_elemental_fix(
                     finfo.path,
                     finfo.lines,
                     targets,
