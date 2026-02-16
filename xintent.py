@@ -1833,6 +1833,96 @@ def rollback_backups(backup_pairs: List[Tuple[Path, Path]]) -> None:
     fbuild.rollback_backups(backup_pairs, fscan.display_path)
 
 
+def choose_compile_command(args: argparse.Namespace) -> Optional[str]:
+    """Choose compile command from CLI options with backward compatibility."""
+    cmd = args.compile_cmd or args.compiler
+    if args.infer_by_compile and not cmd:
+        cmd = "gfortran -c {files}"
+    return cmd
+
+
+def infer_intent_in_by_compile(
+    files: List[Path],
+    compile_command: str,
+    changed_summary: Dict[Tuple[str, str], List[str]],
+    changed_files: Set[Path],
+    verbose: bool = False,
+) -> Tuple[int, int]:
+    """Try provisional INTENT(IN) on remaining missing-intent args; keep only compile-clean edits."""
+    accepted = 0
+    rejected = 0
+
+    while True:
+        source_files, any_missing = fscan.load_source_files(files)
+        if not source_files:
+            if any_missing:
+                return accepted, rejected
+            break
+        ordered_files, _ = fscan.order_files_least_dependent(source_files)
+        compile_paths, _ = fscan.build_compile_closure(ordered_files)
+
+        candidates: List[Tuple[Path, IntentSuggestion]] = []
+        for finfo in ordered_files:
+            missing = collect_missing_intent_args(finfo)
+            for m in missing:
+                # Provisional mode only attempts INTENT(IN).
+                trial = IntentSuggestion(
+                    filename=m.filename,
+                    proc_kind=m.proc_kind,
+                    proc_name=m.proc_name,
+                    proc_start=m.proc_start,
+                    dummy=m.dummy,
+                    decl_line=m.decl_line,
+                    fixable=True,
+                    intent="in",
+                )
+                candidates.append((finfo.path, trial))
+
+        if not candidates:
+            break
+
+        progress = False
+        for path, cand in candidates:
+            one_info, missing_file = fscan.load_source_files([path])
+            if not one_info or missing_file:
+                continue
+            finfo = one_info[0]
+            original_text = path.read_text(encoding="utf-8", errors="ignore")
+            changed, _backup, changed_items = apply_fix(
+                finfo,
+                [cand],
+                backup=False,
+                show_diff=False,
+                out_path=None,
+            )
+            if changed <= 0:
+                continue
+            if run_compiler_command(compile_command, compile_paths, phase="infer-by-compile"):
+                progress = True
+                accepted += changed
+                changed_files.add(path)
+                for s in changed_items:
+                    add_summary_item(changed_summary, s)
+                if verbose:
+                    print(
+                        "Accepted provisional INTENT(IN): "
+                        f"{fscan.display_path(path)} {cand.proc_kind} {cand.proc_name}:{cand.dummy}"
+                    )
+            else:
+                path.write_text(original_text, encoding="utf-8", newline="")
+                rejected += changed
+                if verbose:
+                    print(
+                        "Rejected provisional INTENT(IN): "
+                        f"{fscan.display_path(path)} {cand.proc_kind} {cand.proc_name}:{cand.dummy}"
+                    )
+
+        if not progress:
+            break
+
+    return accepted, rejected
+
+
 def main() -> int:
     """Parse CLI arguments, run intent analysis/fixes, and print summaries."""
     parser = argparse.ArgumentParser(description="Suggest or add INTENT(IN) for dummy args")
@@ -1848,6 +1938,11 @@ def main() -> int:
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--compiler", type=str, help="Compile command; supports {files} placeholder")
+    parser.add_argument(
+        "--compile-cmd",
+        type=str,
+        help="Compile command; supports {files} placeholder (preferred; --compiler kept for compatibility)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show per-file details")
     parser.add_argument("--git", action="store_true", help="Commit changed files to git after successful run")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
@@ -1887,8 +1982,18 @@ def main() -> int:
         ),
     )
     parser.add_argument("--limit", type=int, help="Maximum number of source files to process")
+    parser.add_argument(
+        "--infer-by-compile",
+        action="store_true",
+        help=(
+            "After normal --fix, provisionally mark remaining missing-intent dummies as INTENT(IN) "
+            "and keep only edits that compile"
+        ),
+    )
     args = parser.parse_args()
     if args.out is not None:
+        args.fix = True
+    if args.infer_by_compile:
         args.fix = True
     if args.iterate and not args.fix:
         print("--iterate requires --fix.")
@@ -1907,6 +2012,9 @@ def main() -> int:
         return 3
     if args.out is not None and args.git:
         print("--out is not supported with --git.")
+        return 3
+    if args.out is not None and args.infer_by_compile:
+        print("--out is not supported with --infer-by-compile.")
         return 3
 
     args.fortran_files = cpaths.expand_path_args(args.fortran_files)
@@ -1934,6 +2042,7 @@ def main() -> int:
     max_passes = args.max_iter if args.iterate else 1
     did_baseline_compile = False
     baseline_failed = False
+    compile_command = choose_compile_command(args)
 
     for it in range(1, max_passes + 1):
         source_files, any_missing = fscan.load_source_files(args.fortran_files)
@@ -1946,13 +2055,13 @@ def main() -> int:
 
         compile_paths = [f.path for f in ordered_files]
         after_compile_paths = compile_paths
-        if args.compiler:
+        if compile_command:
             compile_paths, _ = fscan.build_compile_closure(ordered_files)
             after_compile_paths = compile_paths
             if args.out is not None and args.fix:
                 after_compile_paths = [args.out]
             if args.fix and not did_baseline_compile:
-                if not run_compiler_command(args.compiler, compile_paths, phase="baseline"):
+                if not run_compiler_command(compile_command, compile_paths, phase="baseline"):
                     baseline_failed = True
                     print("Baseline compile failed; continuing to attempt intent fixes.")
                 did_baseline_compile = True
@@ -2048,10 +2157,10 @@ def main() -> int:
                 else:
                     print(f"\nApplied INTENT(IN) to {changed} declaration(s).")
 
-        if args.compiler:
+        if compile_command:
             phase = "after-fix" if args.fix else "current"
             check_paths = after_compile_paths if args.fix else compile_paths
-            if not run_compiler_command(args.compiler, check_paths, phase=phase):
+            if not run_compiler_command(compile_command, check_paths, phase=phase):
                 if args.fix and args.backup and backup_pairs:
                     rollback_backups(backup_pairs)
                 return 5
@@ -2066,6 +2175,26 @@ def main() -> int:
             break
         if it == max_passes:
             print(f"Reached max iterations ({args.max_iter}).")
+
+    if args.infer_by_compile:
+        if not compile_command:
+            compile_command = "gfortran -c {files}"
+        source_files, any_missing = fscan.load_source_files(args.fortran_files)
+        if not source_files:
+            return 2 if any_missing else 1
+        ordered_files, _ = fscan.order_files_least_dependent(source_files)
+        compile_paths, _ = fscan.build_compile_closure(ordered_files)
+        if not run_compiler_command(compile_command, compile_paths, phase="infer-baseline"):
+            print("Infer-by-compile requires a successful baseline compile.")
+            return 5
+        accepted, rejected = infer_intent_in_by_compile(
+            args.fortran_files,
+            compile_command,
+            changed_summary,
+            changed_files,
+            verbose=args.verbose,
+        )
+        print(f"\nInfer-by-compile: accepted {accepted}, rejected {rejected}.")
 
     if args.fix:
         maybe_git_commit(
