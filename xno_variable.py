@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -20,6 +22,8 @@ TYPE_DECL_RE = re.compile(
     re.IGNORECASE,
 )
 ASSIGN_RE = re.compile(r"^\s*([a-z][a-z0-9_]*(?:\s*\([^)]*\))?)\s*=\s*(.+)$", re.IGNORECASE)
+ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
+DEALLOCATE_RE = re.compile(r"^\s*deallocate\s*\((.*)\)\s*$", re.IGNORECASE)
 PLAIN_LHS_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*$", re.IGNORECASE)
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 LHS_BASE_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)", re.IGNORECASE)
@@ -41,6 +45,7 @@ class Finding:
     suggested_stmt: str
     unit_start: int
     unit_end: int
+    delete_lines: Tuple[int, ...] = ()
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -132,6 +137,32 @@ def parse_declared_scalar_locals(unit: xunset.Unit) -> Dict[str, int]:
     return out
 
 
+def parse_declared_locals(unit: xunset.Unit) -> Dict[str, int]:
+    """Return local variable names (scalar or array) to declaration line numbers."""
+    out: Dict[str, int] = {}
+    for ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low or not TYPE_DECL_RE.match(low):
+            continue
+        if "::" not in low:
+            continue
+        rhs = low.split("::", 1)[1]
+        for chunk in split_top_level_commas(rhs):
+            text = chunk.strip()
+            if not text:
+                continue
+            if "=" in text and "=>" not in text:
+                text = text.split("=", 1)[0].strip()
+            m = re.match(r"^([a-z][a-z0-9_]*)", text, re.IGNORECASE)
+            if not m:
+                continue
+            name = m.group(1).lower()
+            if name in unit.dummy_names:
+                continue
+            out.setdefault(name, ln)
+    return out
+
+
 def strip_wrapping_parens(text: str) -> str:
     """Strip balanced wrapping parentheses repeatedly."""
     s = text.strip()
@@ -183,9 +214,76 @@ def lhs_base_name(lhs: str) -> Optional[str]:
     return m.group(1).lower()
 
 
+def parse_allocate_source(stmt: str) -> Optional[Tuple[str, str]]:
+    """Return (var, source_expr) for conservative single-object allocate(source=...)."""
+    m = ALLOCATE_RE.match(stmt.strip())
+    if not m:
+        return None
+    args = split_top_level_commas(m.group(1))
+    if not args:
+        return None
+    object_specs: List[str] = []
+    source_expr: Optional[str] = None
+    for a in args:
+        s = a.strip()
+        if not s:
+            continue
+        mk = re.match(r"^([a-z][a-z0-9_]*)\s*=\s*(.+)$", s, re.IGNORECASE)
+        if mk:
+            k = mk.group(1).lower()
+            v = mk.group(2).strip()
+            # Conservative: only source= is allowed.
+            if k != "source":
+                return None
+            source_expr = v
+            continue
+        object_specs.append(s)
+    if len(object_specs) != 1 or source_expr is None:
+        return None
+    obj = object_specs[0]
+    mo = re.match(r"^([a-z][a-z0-9_]*)(?:\s*\(.*\))?$", obj, re.IGNORECASE)
+    if not mo:
+        return None
+    return mo.group(1).lower(), source_expr
+
+
+def parse_allocate_no_source(stmt: str) -> Optional[str]:
+    """Return var for conservative single-object allocate(var(...)) without keywords."""
+    m = ALLOCATE_RE.match(stmt.strip())
+    if not m:
+        return None
+    args = split_top_level_commas(m.group(1))
+    if len(args) != 1:
+        return None
+    s = args[0].strip()
+    # No keyword options in no-source mode.
+    if re.match(r"^[a-z][a-z0-9_]*\s*=", s, re.IGNORECASE):
+        return None
+    mo = re.match(r"^([a-z][a-z0-9_]*)\s*\(.*\)\s*$", s, re.IGNORECASE)
+    if not mo:
+        return None
+    return mo.group(1).lower()
+
+
+def parse_deallocate_single(stmt: str) -> Optional[str]:
+    """Return var for deallocate(var) with one simple object, else None."""
+    m = DEALLOCATE_RE.match(stmt.strip())
+    if not m:
+        return None
+    args = split_top_level_commas(m.group(1))
+    if len(args) != 1:
+        return None
+    s = args[0].strip()
+    mo = re.match(r"^([a-z][a-z0-9_]*)$", s, re.IGNORECASE)
+    if not mo:
+        return None
+    return mo.group(1).lower()
+
+
 def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     """Analyze one unit for inline-temporary opportunities."""
     local_scalars = parse_declared_scalar_locals(unit)
+    local_scalar_names = set(local_scalars.keys())
     if not local_scalars:
         return []
 
@@ -217,7 +315,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 c = count_ident(rhs, n)
                 if c > 0:
                     read_count[n] += c
-                    if rhs_is_var(rhs, n) and n not in use_line_stmt:
+                    if n not in use_line_stmt:
                         use_line_stmt[n] = (ln, s)
 
             if lhs_name and lhs_name in local_scalars:
@@ -233,6 +331,8 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             c = count_ident(low, n)
             if c > 0:
                 read_count[n] += c
+                if n not in use_line_stmt:
+                    use_line_stmt[n] = (ln, s)
 
     findings: List[Finding] = []
     for n, decl_ln in sorted(local_scalars.items(), key=lambda kv: kv[1]):
@@ -249,12 +349,12 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
         ul, use_stmt = use
         if ul <= al:
             continue
-        mm = ASSIGN_RE.match(use_stmt)
-        if not mm:
+        # Do not inline into self-overwrite assignment lhs.
+        mm = ASSIGN_RE.match(use_stmt.strip())
+        if mm and (lhs_base_name(mm.group(1)) == n):
             continue
-        lhs = mm.group(1).strip()
-        rhs = mm.group(2).strip()
-        if not rhs_is_var(rhs, n):
+        var_pat = re.compile(rf"\b{re.escape(n)}\b", re.IGNORECASE)
+        if len(var_pat.findall(use_stmt)) != 1:
             continue
         # Safety: variables referenced in temp RHS must not be written between
         # temp assignment and its only use (avoids invalid swap-style inlining).
@@ -274,7 +374,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     break
         if unsafe:
             continue
-        suggested_stmt = f"{lhs} = {expr}"
+        suggested_stmt = var_pat.sub(expr, use_stmt, count=1)
         findings.append(
             Finding(
                 path=unit.path,
@@ -289,8 +389,181 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 suggested_stmt=suggested_stmt,
                 unit_start=unit.start,
                 unit_end=unit.end,
+                delete_lines=(),
             )
         )
+
+    # Conservative array temporary pattern:
+    #   allocate(a(...), source=expr)
+    #   ... one use of a ...
+    #   deallocate(a)
+    # =>
+    #   ... use expr directly ...
+    local_vars = parse_declared_locals(unit)
+    if local_vars:
+        tracked = set(local_vars.keys())
+        read_count: Dict[str, int] = {n: 0 for n in tracked}
+        alloc_by_var: Dict[str, Tuple[int, str]] = {}
+        alloc_nosrc_line_by_var: Dict[str, int] = {}
+        assign_by_var: Dict[str, Tuple[int, str]] = {}
+        use_line_stmt: Dict[str, Tuple[int, str]] = {}
+        dealloc_line_by_var: Dict[str, int] = {}
+
+        for ln, stmt in unit.body:
+            s = stmt.strip()
+            low = s.lower()
+            if not low:
+                continue
+            if (
+                TYPE_DECL_RE.match(low)
+                or low.startswith("implicit ")
+                or low.startswith("use ")
+                or low.startswith("contains")
+            ):
+                continue
+            m_alloc = parse_allocate_source(low)
+            if m_alloc is not None:
+                aname, src = m_alloc
+                if aname in tracked:
+                    if aname in alloc_by_var:
+                        alloc_by_var[aname] = (-1, "")
+                    else:
+                        alloc_by_var[aname] = (ln, src)
+                continue
+            nsrc = parse_allocate_no_source(low)
+            if nsrc is not None and nsrc in tracked:
+                if nsrc in alloc_nosrc_line_by_var:
+                    alloc_nosrc_line_by_var[nsrc] = -1
+                else:
+                    alloc_nosrc_line_by_var[nsrc] = ln
+                continue
+            dname = parse_deallocate_single(low)
+            if dname is not None and dname in tracked:
+                if dname in dealloc_line_by_var:
+                    dealloc_line_by_var[dname] = -1
+                else:
+                    dealloc_line_by_var[dname] = ln
+                continue
+            m_as = ASSIGN_RE.match(s)
+            if m_as:
+                lhs = m_as.group(1).strip()
+                rhs = m_as.group(2).strip()
+                lhs_name = lhs_base_name(lhs)
+                # Count reads from RHS and from LHS indices only.
+                for n in tracked:
+                    c_rhs = count_ident(rhs.lower(), n)
+                    if c_rhs > 0:
+                        read_count[n] += c_rhs
+                        if n not in use_line_stmt:
+                            use_line_stmt[n] = (ln, s)
+                    c_lhs = count_ident(lhs.lower(), n)
+                    if c_lhs > 0:
+                        if lhs_name == n:
+                            c_lhs -= 1
+                        if c_lhs > 0:
+                            read_count[n] += c_lhs
+                            if n not in use_line_stmt:
+                                use_line_stmt[n] = (ln, s)
+                if lhs_name and lhs_name in tracked:
+                    if lhs_name in assign_by_var:
+                        assign_by_var[lhs_name] = (-1, "")
+                    else:
+                        assign_by_var[lhs_name] = (ln, rhs)
+                continue
+
+            for n in tracked:
+                c = count_ident(low, n)
+                if c > 0:
+                    read_count[n] += c
+                    if n not in use_line_stmt:
+                        use_line_stmt[n] = (ln, s)
+
+        for n, decl_ln in sorted(local_vars.items(), key=lambda kv: kv[1]):
+            if n in local_scalar_names:
+                continue
+            has_src_alloc = n in alloc_by_var and alloc_by_var[n][0] >= 0
+            has_nosrc_alloc = n in alloc_nosrc_line_by_var and alloc_nosrc_line_by_var[n] >= 0
+            has_assign_only = n in assign_by_var and assign_by_var[n][0] >= 0
+            if not has_src_alloc and not has_nosrc_alloc and not has_assign_only:
+                continue
+            al = -1
+            expr = ""
+            del_lines: List[int] = []
+            assign_line_for_report = -1
+            if has_src_alloc:
+                al, expr = alloc_by_var[n]
+                assign_line_for_report = al
+            elif has_nosrc_alloc:
+                al = alloc_nosrc_line_by_var[n]
+                del_lines.append(al)
+                asg = assign_by_var.get(n)
+                if asg is None:
+                    continue
+                asl, rhs = asg
+                if asl < 0:
+                    continue
+                expr = rhs
+                assign_line_for_report = asl
+            else:
+                asg = assign_by_var.get(n)
+                if asg is None:
+                    continue
+                asl, rhs = asg
+                if asl < 0:
+                    continue
+                al = asl
+                expr = rhs
+                assign_line_for_report = asl
+            if read_count.get(n, 0) != 1:
+                continue
+            use = use_line_stmt.get(n)
+            if use is None:
+                continue
+            ul, use_stmt = use
+            if ul <= al or ul <= assign_line_for_report:
+                continue
+            # Safety: vars referenced in source expr should not be assigned
+            # between allocate and single use.
+            deps = referenced_names(expr)
+            deps.discard(n)
+            unsafe = False
+            if deps:
+                for ln2, s2 in unit.body:
+                    if ln2 <= assign_line_for_report or ln2 >= ul:
+                        continue
+                    m2 = ASSIGN_RE.match(s2.strip())
+                    if not m2:
+                        continue
+                    b2 = lhs_base_name(m2.group(1))
+                    if b2 is not None and b2 in deps:
+                        unsafe = True
+                        break
+            if unsafe:
+                continue
+            var_pat = re.compile(rf"\b{re.escape(n)}\b", re.IGNORECASE)
+            if len(var_pat.findall(use_stmt)) != 1:
+                continue
+            suggested_stmt = var_pat.sub(expr, use_stmt, count=1)
+            dl = dealloc_line_by_var.get(n)
+            if dl is not None and dl > ul:
+                del_lines.append(dl)
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    var=n,
+                    decl_line=decl_ln,
+                    assign_line=assign_line_for_report,
+                    use_line=ul,
+                    expr=expr,
+                    use_stmt=use_stmt,
+                    suggested_stmt=suggested_stmt,
+                    unit_start=unit.start,
+                    unit_end=unit.end,
+                    delete_lines=tuple(del_lines),
+                )
+            )
     return findings
 
 
@@ -379,6 +652,10 @@ def apply_fix_file(
         lines[uidx] = f"{indent}{f.suggested_stmt}{eol}"
         used_use_lines.add(f.use_line)
         delete_lines.add(aidx)
+        for dl in f.delete_lines:
+            didx = dl - 1
+            if 0 <= didx < len(lines):
+                delete_lines.add(didx)
         changed += 1
         decl_remove_candidates.append((f.var, f.decl_line, f.unit_start, f.unit_end, f.assign_line))
 
@@ -491,6 +768,51 @@ def apply_fix_file(
     return changed, removed_decl_entities, annotations_inserted, backup
 
 
+def compile_and_run_capture(
+    source: Path,
+    *,
+    exe_path: Path,
+    label: str,
+    quiet_run: bool = False,
+    keep_exe: bool = False,
+) -> Tuple[bool, str, str]:
+    """Compile one source file with gfortran and run produced executable."""
+    compile_cmd = ["gfortran", str(source), "-o", str(exe_path)]
+    print(f"Build ({label}): {' '.join(fbuild.quote_cmd_arg(x) for x in compile_cmd)}")
+    cp = subprocess.run(compile_cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        print(f"Build ({label}): FAIL (exit {cp.returncode})")
+        if cp.stdout:
+            print(cp.stdout.rstrip())
+        if cp.stderr:
+            print(fbuild.format_linker_stderr(cp.stderr).rstrip())
+        return False, "", ""
+    print(f"Build ({label}): PASS")
+    print(f"Run ({label}): {fbuild.quote_cmd_arg(str(exe_path))}")
+    rp = subprocess.run([str(exe_path)], capture_output=True, text=True)
+    try:
+        if rp.returncode != 0:
+            print(f"Run ({label}): FAIL (exit {rp.returncode})")
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+            return False, rp.stdout or "", rp.stderr or ""
+        print(f"Run ({label}): PASS")
+        if not quiet_run:
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+        return True, rp.stdout or "", rp.stderr or ""
+    finally:
+        if not keep_exe:
+            try:
+                exe_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def main() -> int:
     """Run advisory checks across selected files."""
     parser = argparse.ArgumentParser(
@@ -501,6 +823,14 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="Print full suggested replacement statements")
     parser.add_argument("--fix", action="store_true", help="Inline safe candidates and remove now-unused local declarations")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--tee-orig", action="store_true", help="With --fix --out, also print original source text to stdout")
+    parser.add_argument("--tee", action="store_true", help="With --fix --out, also print transformed output text to stdout")
+    parser.add_argument("--tee-both", action="store_true", help="With --fix --out, print original and transformed source text to stdout")
+    parser.add_argument("--run", action="store_true", help="After --fix with changes, build and run transformed source")
+    parser.add_argument("--run-both", action="store_true", help="Build/run original source, and build/run transformed source when changes are applied")
+    parser.add_argument("--run-diff", action="store_true", help="Run original and transformed executables and compare stdout/stderr")
+    parser.add_argument("--quiet-run", action="store_true", help="Do not print program stdout/stderr on successful runs")
+    parser.add_argument("--keep-exe", action="store_true", help="Keep generated executables after running")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument(
@@ -510,6 +840,19 @@ def main() -> int:
     )
     parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
+    if args.run_diff:
+        args.run_both = True
+    if args.run_both:
+        args.run = True
+    if args.tee_both:
+        args.tee_orig = True
+        args.tee = True
+    if args.tee_orig and args.out is None:
+        args.out = Path("temp.f90")
+    if args.tee and args.out is None:
+        args.out = Path("temp.f90")
+    if args.run and args.out is None:
+        args.out = Path("temp.f90")
     if args.out is not None:
         args.fix = True
     if args.annotate and not args.fix:
@@ -526,6 +869,9 @@ def main() -> int:
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
         return 2
+    if args.run and len(files) != 1:
+        print("--run/--run-both require exactly one input source file.")
+        return 2
     compile_paths = [args.out] if (args.fix and args.out is not None) else files
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
@@ -536,6 +882,18 @@ def main() -> int:
         findings.extend(analyze_file(p))
 
     if not findings:
+        orig_out = ""
+        orig_err = ""
+        if args.run_both:
+            src = files[0]
+            orig_exe = Path(f"{src.stem}_orig.exe")
+            ok_orig, orig_out, orig_err = compile_and_run_capture(
+                src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+            )
+            if not ok_orig:
+                return 5
+        if args.run_diff:
+            print("Run diff: SKIP (no transformations suggested)")
         print("No inline-temporary candidates found.")
         return 0
 
@@ -558,8 +916,20 @@ def main() -> int:
         total_decl_removed = 0
         total_ann = 0
         changed_files = 0
+        transformed_changed = False
+        transformed_target: Optional[Path] = None
+        orig_out = ""
+        orig_err = ""
+        xform_out = ""
+        xform_err = ""
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             out_path = args.out if args.out is not None else None
+            before = p.read_text(encoding="utf-8")
+            if out_path is not None and args.tee_orig:
+                print(f"--- original: {p} ---")
+                print(before, end="")
+                if not before.endswith("\n"):
+                    print("")
             ninl, ndecl, nann, backup = apply_fix_file(
                 p, by_file[p], annotate=args.annotate, out_path=out_path, create_backup=args.backup
             )
@@ -567,12 +937,16 @@ def main() -> int:
             total_decl_removed += ndecl
             total_ann += nann
             if ninl > 0:
+                transformed_changed = True
                 changed_files += 1
                 if out_path is not None:
                     print(
                         f"\nFixed {p.name}: inlined {ninl}, decl-entities removed {ndecl}, "
                         f"annotations {nann}, wrote {out_path}"
                     )
+                    if args.tee:
+                        print(f"--- transformed: {out_path} ---")
+                        print((out_path).read_text(encoding="utf-8"), end="")
                 else:
                     print(
                         f"\nFixed {p.name}: inlined {ninl}, decl-entities removed {ndecl}, "
@@ -581,6 +955,11 @@ def main() -> int:
                     )
             else:
                 print(f"\nNo fixes applied to {p.name}")
+                if out_path is not None and args.tee:
+                    if args.tee_orig:
+                        print(f"--- transformed: {out_path} ---")
+                    print((out_path).read_text(encoding="utf-8"), end="")
+            transformed_target = out_path if out_path is not None else p
         print(
             f"\n--fix summary: files changed {changed_files}, "
             f"inlined {total_inline}, decl-entities removed {total_decl_removed}, "
@@ -589,6 +968,41 @@ def main() -> int:
         if args.compiler:
             if not fbuild.run_compiler_command(args.compiler, compile_paths, "after-fix", fscan.display_path):
                 return 5
+        if args.run_both:
+            src = files[0]
+            orig_exe = Path(f"{src.stem}_orig.exe")
+            ok_orig, orig_out, orig_err = compile_and_run_capture(
+                src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+            )
+            if not ok_orig:
+                return 5
+        if args.run and transformed_changed and transformed_target is not None:
+            out_src = transformed_target
+            out_exe = Path(f"{out_src.stem}.exe")
+            ok_xf, xform_out, xform_err = compile_and_run_capture(
+                out_src, exe_path=out_exe, label="transformed", quiet_run=args.quiet_run, keep_exe=args.keep_exe
+            )
+            if not ok_xf:
+                return 5
+        if args.run_diff:
+            if not transformed_changed:
+                print("Run diff: SKIP (no transformations applied)")
+            else:
+                same = (orig_out == xform_out) and (orig_err == xform_err)
+                if same:
+                    print("Run diff: MATCH")
+                else:
+                    print("Run diff: DIFF")
+                    orig_blob = f"STDOUT:\n{orig_out}\nSTDERR:\n{orig_err}\n"
+                    xform_blob = f"STDOUT:\n{xform_out}\nSTDERR:\n{xform_err}\n"
+                    for line in difflib.unified_diff(
+                        orig_blob.splitlines(),
+                        xform_blob.splitlines(),
+                        fromfile="original",
+                        tofile="transformed",
+                        lineterm="",
+                    ):
+                        print(line)
     return 0
 
 
