@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -22,6 +23,7 @@ TYPE_DECL_RE = re.compile(
     r"^\s*(integer|real|logical|character|complex|type\b|class\b|procedure\b)",
     re.IGNORECASE,
 )
+ALLOCATABLE_ATTR_RE = re.compile(r"\ballocatable\b", re.IGNORECASE)
 NO_COLON_DECL_RE = re.compile(
     r"^\s*(?P<spec>(?:integer|real|logical|complex|character)\s*(?:\([^)]*\))?"
     r"|type\s*\([^)]*\)|class\s*\([^)]*\))\s+(?P<rhs>.+)$",
@@ -32,6 +34,8 @@ ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+INT_RE = re.compile(r"^\s*([+-]?\d+)\s*$")
+RANGE_RE = re.compile(r"^\s*([+-]?\d+)?\s*:\s*([+-]?\d+)?\s*$")
 INTENT_RE = re.compile(r"\bintent\s*\(\s*(inout|out|in)\s*\)", re.IGNORECASE)
 VALUE_RE = re.compile(r"\bvalue\b", re.IGNORECASE)
 CONTROL_BARRIER_RE = re.compile(
@@ -39,6 +43,26 @@ CONTROL_BARRIER_RE = re.compile(
     re.IGNORECASE,
 )
 CALL_RE = re.compile(r"^\s*call\b", re.IGNORECASE)
+DO_ITER_RE = re.compile(r"^\s*do\b(?:\s+\d+)?\s+([a-z][a-z0-9_]*)\s*=", re.IGNORECASE)
+ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
+DEALLOCATE_RE = re.compile(r"^\s*deallocate\s*\((.*)\)\s*$", re.IGNORECASE)
+MAX_TRACKED_RANK = 3
+MAX_TRACKED_ELEMENTS = 200000
+
+
+def parse_call_stmt(stmt: str) -> Tuple[Optional[str], str]:
+    """Return (callee_name, arg_text) for CALL statement."""
+    m = re.match(r"^\s*call\s+([a-z][a-z0-9_]*)\s*(?:\((.*)\))?\s*$", stmt, re.IGNORECASE)
+    if not m:
+        return None, ""
+    return m.group(1).lower(), (m.group(2) or "").strip()
+
+
+def call_arg_chunks(arg_text: str) -> List[str]:
+    """Split CALL argument text by top-level commas."""
+    if not arg_text:
+        return []
+    return split_top_level_commas(arg_text)
 
 
 @dataclass
@@ -83,6 +107,7 @@ def split_top_level_commas(text: str) -> List[str]:
     out: List[str] = []
     cur: List[str] = []
     depth = 0
+    sq_depth = 0
     in_single = False
     in_double = False
     for ch in text:
@@ -95,7 +120,11 @@ def split_top_level_commas(text: str) -> List[str]:
                 depth += 1
             elif ch == ")" and depth > 0:
                 depth -= 1
-            elif ch == "," and depth == 0:
+            elif ch == "[":
+                sq_depth += 1
+            elif ch == "]" and sq_depth > 0:
+                sq_depth -= 1
+            elif ch == "," and depth == 0 and sq_depth == 0:
                 out.append("".join(cur).strip())
                 cur = []
                 continue
@@ -127,6 +156,241 @@ def parse_declared_entities_with_init(stmt: str) -> Dict[str, bool]:
         name = mm.group(1).lower()
         initialized = ("=" in text and "=>" not in text)
         out[name] = initialized
+    return out
+
+
+def parse_declared_constant_shapes(stmt: str) -> Dict[str, Tuple[int, ...]]:
+    """Parse rank-1/2/3 declared variables with integer-constant extents."""
+    rhs = ""
+    if "::" in stmt:
+        rhs = stmt.split("::", 1)[1]
+    else:
+        m = NO_COLON_DECL_RE.match(stmt.strip())
+        if not m:
+            return {}
+        rhs = m.group("rhs")
+    out: Dict[str, Tuple[int, ...]] = {}
+    for chunk in split_top_level_commas(rhs):
+        text = chunk.strip()
+        if not text:
+            continue
+        if "=" in text and "=>" not in text:
+            text = text.split("=", 1)[0].strip()
+        m = re.match(r"^([a-z][a-z0-9_]*)\s*\(([^)]*)\)\s*$", text, re.IGNORECASE)
+        if not m:
+            continue
+        name = m.group(1).lower()
+        dims = [d.strip() for d in split_top_level_commas(m.group(2).strip()) if d.strip()]
+        if not dims or len(dims) > MAX_TRACKED_RANK:
+            continue
+        shape: List[int] = []
+        ok = True
+        for d in dims:
+            mm = INT_RE.match(d)
+            if mm:
+                try:
+                    n = int(mm.group(1))
+                except ValueError:
+                    ok = False
+                    break
+                if n <= 0:
+                    ok = False
+                    break
+                shape.append(n)
+                continue
+            if ":" in d:
+                a, b = [p.strip() for p in d.split(":", 1)]
+                ma = INT_RE.match(a)
+                mb = INT_RE.match(b)
+                if not ma or not mb:
+                    ok = False
+                    break
+                try:
+                    lo = int(ma.group(1))
+                    hi = int(mb.group(1))
+                except ValueError:
+                    ok = False
+                    break
+                if hi < lo:
+                    ok = False
+                    break
+                shape.append(hi - lo + 1)
+                continue
+            ok = False
+            break
+        if ok and shape:
+            out[name] = tuple(shape)
+    return out
+
+
+def parse_literal_dim_indices(token: str, dim_n: int) -> Optional[Set[int]]:
+    """Parse one dimension selector into concrete indices for a known extent."""
+    s = token.strip()
+    if not s:
+        return None
+    m_int = INT_RE.match(s)
+    if m_int:
+        try:
+            return {int(m_int.group(1))}
+        except ValueError:
+            return None
+    m_rng = RANGE_RE.match(s)
+    if m_rng:
+        lo_t = m_rng.group(1)
+        hi_t = m_rng.group(2)
+        try:
+            lo = int(lo_t) if lo_t is not None else 1
+            hi = int(hi_t) if hi_t is not None else dim_n
+        except ValueError:
+            return None
+        if hi < lo:
+            return set()
+        return set(range(lo, hi + 1))
+    payload = s
+    if payload.startswith("[") and payload.endswith("]"):
+        payload = payload[1:-1].strip()
+    elif payload.startswith("(/") and payload.endswith("/)"):
+        payload = payload[2:-2].strip()
+    else:
+        return None
+    if not payload:
+        return None
+    out: Set[int] = set()
+    for part in split_top_level_commas(payload):
+        t = part.strip()
+        mm = INT_RE.match(t)
+        if not mm:
+            return None
+        try:
+            out.add(int(mm.group(1)))
+        except ValueError:
+            return None
+    return out
+
+
+def parse_literal_index_footprint(base_args: str, shape: Tuple[int, ...]) -> Optional[Set[Tuple[int, ...]]]:
+    """Parse rank-1/2/3 literal indexing into concrete tuple footprint."""
+    args = [a.strip() for a in split_top_level_commas(base_args) if a.strip()]
+    if len(args) != len(shape):
+        return None
+    dims: List[List[int]] = []
+    for tok, dim_n in zip(args, shape):
+        idxs = parse_literal_dim_indices(tok, dim_n)
+        if idxs is None:
+            return None
+        if not idxs:
+            return set()
+        # in-bounds literal indices only
+        idxs2 = [i for i in sorted(idxs) if 1 <= i <= dim_n]
+        if not idxs2:
+            return set()
+        dims.append(idxs2)
+    combos = 1
+    for d in dims:
+        combos *= len(d)
+        if combos > MAX_TRACKED_ELEMENTS:
+            return None
+    out: Set[Tuple[int, ...]] = set()
+    for tup in product(*dims):
+        out.add(tuple(int(v) for v in tup))
+    return out
+
+
+def extract_index_args(expr: str, base: str) -> Optional[List[str]]:
+    """Extract argument text for each base(...) occurrence in expr; None on parse failure."""
+    out: List[str] = []
+    s = expr
+    pat = re.compile(rf"\b{re.escape(base)}\s*\(", re.IGNORECASE)
+    pos = 0
+    while True:
+        m = pat.search(s, pos)
+        if not m:
+            break
+        i = m.end() - 1  # points at '('
+        depth = 1
+        j = i + 1
+        while j < len(s):
+            ch = s[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    out.append(s[i + 1 : j])
+                    pos = j + 1
+                    break
+            j += 1
+        else:
+            return None
+    return out
+
+
+def read_required_indices(expr: str, base: str, shape: Tuple[int, ...]) -> Optional[Set[Tuple[int, ...]]]:
+    """Return concrete read footprint for base in expr, or None when unknown/whole-array."""
+    bare_re = re.compile(rf"\b{re.escape(base)}\b(?!\s*\()", re.IGNORECASE)
+    if bare_re.search(expr):
+        return None
+    args_list = extract_index_args(expr, base)
+    if args_list is None:
+        return None
+    if not args_list:
+        return set()
+    req: Set[Tuple[int, ...]] = set()
+    for args in args_list:
+        idxs = parse_literal_index_footprint(args, shape)
+        if idxs is None:
+            return None
+        req.update(idxs)
+    return req
+
+
+def missing_detail_for_var(
+    name: str,
+    shape: Tuple[int, ...],
+    known: Set[Tuple[int, ...]],
+    read_expr: str,
+) -> str:
+    """Build specific unset-element detail for one variable read."""
+    def fmt_idx(idx: Tuple[int, ...]) -> str:
+        return f"{name}(" + ", ".join(str(v) for v in idx) + ")"
+
+    req = read_required_indices(read_expr, name, shape)
+    if req is not None:
+        miss = [k for k in sorted(req) if k not in known]
+    else:
+        miss = []
+        for idx in product(*[range(1, n + 1) for n in shape]):
+            t = tuple(int(v) for v in idx)
+            if t not in known:
+                miss.append(t)
+                if len(miss) > 6:
+                    break
+    if not miss:
+        return ""
+    if len(miss) == 1:
+        return f"array element {fmt_idx(miss[0])} may be used before being set"
+    show = ", ".join(fmt_idx(k) for k in miss[:6])
+    if len(miss) > 6:
+        show += ", ..."
+    return f"array elements may be used before being set: {show}"
+
+
+def shape_element_count(shape: Tuple[int, ...]) -> int:
+    """Return total number of elements in an array shape."""
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def full_shape_footprint(shape: Tuple[int, ...]) -> Optional[Set[Tuple[int, ...]]]:
+    """Return full tuple footprint when shape is small enough, else None."""
+    total = shape_element_count(shape)
+    if total > MAX_TRACKED_ELEMENTS:
+        return None
+    out: Set[Tuple[int, ...]] = set()
+    for idx in product(*[range(1, d + 1) for d in shape]):
+        out.add(tuple(int(v) for v in idx))
     return out
 
 
@@ -298,6 +562,7 @@ def collect_units(finfo: fscan.SourceFileInfo) -> List[Unit]:
 
 def extract_ident_reads(expr: str, tracked: Set[str]) -> List[str]:
     """Extract tracked identifiers referenced in an expression."""
+    expr = strip_shape_inquiry_calls(expr)
     out: List[str] = []
     seen: Set[str] = set()
     for m in IDENT_RE.finditer(expr.lower()):
@@ -308,6 +573,170 @@ def extract_ident_reads(expr: str, tracked: Set[str]) -> List[str]:
     return out
 
 
+def extract_allocatable_reads(expr: str, allocatable_vars: Set[str]) -> List[str]:
+    """Extract allocatable variables whose value/shape is used in expression context."""
+    out: List[str] = []
+    seen: Set[str] = set()
+    n = len(expr)
+    i = 0
+    skip_calls = {"allocated", "kind", "rank"}
+    inquiry_calls = {"size", "shape", "lbound", "ubound"}
+    while i < n:
+        ch = expr[i]
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (expr[j].isalnum() or expr[j] == "_"):
+                j += 1
+            name = expr[i:j].lower()
+            k = j
+            while k < n and expr[k].isspace():
+                k += 1
+            if k < n and expr[k] == "(":
+                depth = 1
+                m = k + 1
+                while m < n:
+                    if expr[m] == "(":
+                        depth += 1
+                    elif expr[m] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    m += 1
+                if m >= n:
+                    # malformed; fall back to identifier treatment
+                    if name in allocatable_vars and name not in seen:
+                        seen.add(name)
+                        out.append(name)
+                    i = j
+                    continue
+                inner = expr[k + 1 : m]
+                if name in skip_calls:
+                    i = m + 1
+                    continue
+                if name in inquiry_calls:
+                    for n2 in extract_ident_reads(inner, allocatable_vars):
+                        if n2 not in seen:
+                            seen.add(n2)
+                            out.append(n2)
+                    i = m + 1
+                    continue
+                # Generic call/reference: include possible variable read + recurse.
+                if name in allocatable_vars and name not in seen:
+                    seen.add(name)
+                    out.append(name)
+                for n2 in extract_allocatable_reads(inner, allocatable_vars):
+                    if n2 not in seen:
+                        seen.add(n2)
+                        out.append(n2)
+                i = m + 1
+                continue
+            if name in allocatable_vars and name not in seen:
+                seen.add(name)
+                out.append(name)
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def call_actual_exprs(arg_text: str) -> List[str]:
+    """Return actual argument expressions from CALL arg text."""
+    out: List[str] = []
+    for chunk in split_top_level_commas(arg_text):
+        t = chunk.strip()
+        if not t:
+            continue
+        if "=" in t and "=>" not in t:
+            _, val = t.split("=", 1)
+            out.append(val.strip())
+        else:
+            out.append(t)
+    return out
+
+
+def strip_shape_inquiry_calls(expr: str) -> str:
+    """Strip arguments of inquiry intrinsics so identifiers there are not treated as value reads."""
+    names = {"size", "shape", "lbound", "ubound", "kind", "rank", "allocated"}
+    out: List[str] = []
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (expr[j].isalnum() or expr[j] == "_"):
+                j += 1
+            name = expr[i:j].lower()
+            k = j
+            while k < n and expr[k].isspace():
+                k += 1
+            if name in names and k < n and expr[k] == "(":
+                depth = 1
+                m = k + 1
+                while m < n:
+                    if expr[m] == "(":
+                        depth += 1
+                    elif expr[m] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            out.append(" ")
+                            i = m + 1
+                            break
+                    m += 1
+                else:
+                    out.append(expr[i:j])
+                    i = j
+                continue
+            out.append(expr[i:j])
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def resolve_alloc_extent(expr: str, array_shapes: Dict[str, Tuple[int, ...]]) -> Optional[int]:
+    """Resolve one ALLOCATE extent when statically known."""
+    s = expr.strip()
+    m_int = INT_RE.match(s)
+    if m_int:
+        try:
+            v = int(m_int.group(1))
+        except ValueError:
+            return None
+        return v if v > 0 else None
+    m_sz = re.match(
+        r"^size\s*\(\s*([a-z][a-z0-9_]*)\s*(?:,\s*([1-9]\d*)\s*)?\)\s*$",
+        s,
+        re.IGNORECASE,
+    )
+    if m_sz:
+        base = m_sz.group(1).lower()
+        dim_txt = m_sz.group(2)
+        shp = array_shapes.get(base)
+        if not shp:
+            return None
+        if dim_txt is None:
+            return shape_element_count(shp)
+        try:
+            dim = int(dim_txt)
+        except ValueError:
+            return None
+        if dim < 1 or dim > len(shp):
+            return None
+        return shp[dim - 1]
+    return None
+
+
+def resolve_shape_from_expr(expr: str, array_shapes: Dict[str, Tuple[int, ...]]) -> Optional[Tuple[int, ...]]:
+    """Resolve whole-array shape when expression is a known array variable."""
+    s = expr.strip()
+    m = re.match(r"^([a-z][a-z0-9_]*)$", s, re.IGNORECASE)
+    if not m:
+        return None
+    return array_shapes.get(m.group(1).lower())
+
+
 def analyze_unit(unit: Unit) -> List[Issue]:
     """Run conservative v1 use-before-set analysis on one unit."""
     issues: List[Issue] = []
@@ -316,6 +745,28 @@ def analyze_unit(unit: Unit) -> List[Issue]:
     intent_out: Set[str] = set()
     local_declared: Set[str] = set()
     dummy_intent: Dict[str, str] = {}
+    allocatable_vars: Set[str] = set()
+    allocated_vars: Set[str] = set()
+    array_shapes: Dict[str, Tuple[int, ...]] = {}
+    known_set_elems: Dict[str, Set[Tuple[int, ...]]] = {}
+    partial_unknown: Set[str] = set()
+    unalloc_warned: Set[Tuple[int, str]] = set()
+
+    def warn_unallocated(var_name: str, line_no: int) -> None:
+        key = (line_no, var_name)
+        if key in unalloc_warned:
+            return
+        unalloc_warned.add(key)
+        issues.append(
+            Issue(
+                path=unit.path,
+                unit_kind=unit.kind,
+                unit_name=unit.name,
+                line=line_no,
+                var_name=var_name,
+                detail="allocatable variable may be used while unallocated",
+            )
+        )
 
     # Dummies default: treat as defined except explicit INTENT(OUT).
     for d in unit.dummy_names:
@@ -329,12 +780,19 @@ def analyze_unit(unit: Unit) -> List[Issue]:
 
         if TYPE_DECL_RE.match(low):
             decls = parse_declared_entities_with_init(low)
+            array_shapes.update(parse_declared_constant_shapes(low))
             if decls:
                 tracked.update(decls.keys())
                 local_declared.update(decls.keys())
+                if ALLOCATABLE_ATTR_RE.search(low):
+                    allocatable_vars.update(decls.keys())
                 for n, init in decls.items():
                     if init:
                         defined.add(n)
+                        if n in array_shapes:
+                            fp = full_shape_footprint(array_shapes[n])
+                            if fp is not None:
+                                known_set_elems[n] = fp
             m_int = INTENT_RE.search(low)
             if m_int:
                 intent = m_int.group(1).lower()
@@ -355,8 +813,170 @@ def analyze_unit(unit: Unit) -> List[Issue]:
 
         if low.startswith("implicit ") or low.startswith("use ") or low.startswith("contains"):
             continue
+        m_do = DO_ITER_RE.match(low)
+        if m_do:
+            iv = m_do.group(1).lower()
+            if iv in tracked:
+                defined.add(iv)
+            continue
+        m_alloc = ALLOCATE_RE.match(low)
+        if m_alloc:
+            chunks = split_top_level_commas(m_alloc.group(1))
+            has_source = False
+            mold_shape: Optional[Tuple[int, ...]] = None
+            for chunk in chunks:
+                t = chunk.strip()
+                if not t:
+                    continue
+                if "=" in t and "=>" not in t:
+                    key, val = t.split("=", 1)
+                    key_l = key.strip().lower()
+                    if key_l == "source":
+                        has_source = True
+                    elif key_l == "mold":
+                        mold_shape = resolve_shape_from_expr(val, array_shapes)
+                    continue
+            for chunk in chunks:
+                t = chunk.strip()
+                if not t:
+                    continue
+                # Option clauses, e.g. source=...
+                if "=" in t and "=>" not in t:
+                    key, val = t.split("=", 1)
+                    key = key.strip().lower()
+                    if key in {"source", "mold"}:
+                        if key == "source":
+                            has_source = True
+                            for n in extract_ident_reads(val, tracked):
+                                if n not in defined:
+                                    issues.append(
+                                        Issue(
+                                            path=unit.path,
+                                            unit_kind=unit.kind,
+                                            unit_name=unit.name,
+                                            line=ln,
+                                            var_name=n,
+                                            detail="variable may be used before being set",
+                                        )
+                                    )
+                        for n in extract_allocatable_reads(val, allocatable_vars):
+                            if n not in allocated_vars:
+                                warn_unallocated(n, ln)
+                    continue
+                base = fscan.base_identifier(t)
+                # Infer ALLOCATE target shape when extents are simple constants/size(...).
+                if base and base in tracked and "(" in t and ")" in t:
+                    idxs = extract_index_args(t, base)
+                    if idxs and len(idxs) == 1:
+                        dims = [d.strip() for d in split_top_level_commas(idxs[0]) if d.strip()]
+                        if 1 <= len(dims) <= MAX_TRACKED_RANK:
+                            resolved: List[int] = []
+                            ok = True
+                            for d in dims:
+                                v = resolve_alloc_extent(d, array_shapes)
+                                if v is None or v <= 0:
+                                    ok = False
+                                    break
+                                resolved.append(v)
+                            if ok:
+                                array_shapes[base] = tuple(resolved)
+                elif base and base in tracked and mold_shape is not None:
+                    # allocate(x, mold=y) => x gets y's shape.
+                    array_shapes[base] = mold_shape
+                # allocate(x(...)) without source does not initialize element values.
+                if has_source and base and base in tracked:
+                    defined.add(base)
+                    if base in array_shapes:
+                        fp = full_shape_footprint(array_shapes[base])
+                        if fp is not None:
+                            known_set_elems[base] = fp
+                if base and base in allocatable_vars:
+                    allocated_vars.add(base)
+                # Bounds in allocate(x(n)) may read vars (except base itself).
+                t_bounds = strip_shape_inquiry_calls(t)
+                for n in extract_ident_reads(t_bounds, tracked):
+                    if n == (base or ""):
+                        continue
+                    if n not in defined:
+                        issues.append(
+                            Issue(
+                                path=unit.path,
+                                unit_kind=unit.kind,
+                                unit_name=unit.name,
+                                line=ln,
+                                var_name=n,
+                                detail="variable may be used before being set",
+                            )
+                        )
+                for n in extract_allocatable_reads(t, allocatable_vars):
+                    if n == (base or ""):
+                        continue
+                    if n not in allocated_vars:
+                        warn_unallocated(n, ln)
+            continue
+        m_dealloc = DEALLOCATE_RE.match(low)
+        if m_dealloc:
+            for chunk in split_top_level_commas(m_dealloc.group(1)):
+                base = fscan.base_identifier(chunk.strip()) or ""
+                if base in allocated_vars:
+                    allocated_vars.remove(base)
+            continue
         if CALL_RE.match(low):
-            # Conservative v1: skip CALL argument semantics.
+            callee, arg_text = parse_call_stmt(low)
+            for expr in call_actual_exprs(arg_text):
+                for n in extract_allocatable_reads(expr, allocatable_vars):
+                    if n not in allocated_vars:
+                        warn_unallocated(n, ln)
+            if callee == "random_seed":
+                for chunk in call_arg_chunks(arg_text):
+                    t = chunk.strip()
+                    if not t:
+                        continue
+                    if "=" in t and "=>" not in t:
+                        key, val = t.split("=", 1)
+                        key = key.strip().lower()
+                        val = val.strip()
+                        base = fscan.base_identifier(val) or ""
+                        if key in {"size", "get"}:
+                            if base and base in tracked:
+                                defined.add(base)
+                        elif key == "put":
+                            for n in extract_ident_reads(val, tracked):
+                                if n not in defined:
+                                    issues.append(
+                                        Issue(
+                                            path=unit.path,
+                                            unit_kind=unit.kind,
+                                            unit_name=unit.name,
+                                            line=ln,
+                                            var_name=n,
+                                            detail="variable may be used before being set",
+                                        )
+                                    )
+                    else:
+                        # Positional random_seed args are uncommon; treat conservatively as reads.
+                        for n in extract_ident_reads(t, tracked):
+                            if n not in defined:
+                                issues.append(
+                                    Issue(
+                                        path=unit.path,
+                                        unit_kind=unit.kind,
+                                        unit_name=unit.name,
+                                        line=ln,
+                                        var_name=n,
+                                        detail="variable may be used before being set",
+                                    )
+                                )
+                continue
+            if callee == "random_number":
+                # random_number harvest) sets its argument.
+                chunks = call_arg_chunks(arg_text)
+                if chunks:
+                    base = fscan.base_identifier(chunks[0].strip()) or ""
+                    if base and base in tracked:
+                        defined.add(base)
+                continue
+            # Conservative default: skip unknown CALL semantics.
             continue
         if CONTROL_BARRIER_RE.match(low):
             # Conservative v1: skip control-flow-heavy statements.
@@ -364,15 +984,32 @@ def analyze_unit(unit: Unit) -> List[Issue]:
 
         m_assign = ASSIGN_RE.match(low)
         if m_assign:
-            lhs_full = m_assign.group(1)
-            lhs_base = fscan.base_identifier(lhs_full) or ""
+            lhs_text = low.split("=", 1)[0].strip()
+            lhs_base = fscan.base_identifier(lhs_text) or ""
             rhs = low.split("=", 1)[1] if "=" in low else ""
-            lhs_idx_reads = extract_ident_reads(lhs_full, tracked)
+            lhs_has_index = "(" in lhs_text and ")" in lhs_text
+            for n in extract_allocatable_reads(rhs, allocatable_vars):
+                if n not in allocated_vars:
+                    warn_unallocated(n, ln)
+            for n in extract_allocatable_reads(lhs_text, allocatable_vars):
+                if not lhs_has_index and n == lhs_base:
+                    continue
+                if n not in allocated_vars:
+                    warn_unallocated(n, ln)
+            lhs_idx_reads = extract_ident_reads(lhs_text, tracked)
             if lhs_base and lhs_base in lhs_idx_reads:
                 lhs_idx_reads = [x for x in lhs_idx_reads if x != lhs_base]
             reads = lhs_idx_reads + [x for x in extract_ident_reads(rhs, tracked) if x not in lhs_idx_reads]
             for n in reads:
                 if n not in defined:
+                    if n in allocatable_vars and n not in allocated_vars:
+                        continue
+                    if n in known_set_elems and n in array_shapes and n not in partial_unknown:
+                        detail = missing_detail_for_var(n, array_shapes[n], known_set_elems[n], low)
+                        if not detail:
+                            continue
+                    else:
+                        detail = "variable may be used before being set"
                     kind = "INTENT(OUT) dummy" if n in intent_out else "variable"
                     issues.append(
                         Issue(
@@ -381,16 +1018,49 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                             unit_name=unit.name,
                             line=ln,
                             var_name=n,
-                            detail=f"{kind} may be used before being set",
+                            detail=detail if kind == "variable" else f"{kind} may be used before being set",
                         )
                     )
-            if lhs_base and lhs_base in tracked:
+            # Indexed assignment (e.g. x(i)=...) does not prove whole variable initialized.
+            if lhs_base and lhs_base in tracked and not lhs_has_index:
                 defined.add(lhs_base)
+                if lhs_base in allocatable_vars:
+                    allocated_vars.add(lhs_base)
+                if lhs_base in array_shapes:
+                    fp = full_shape_footprint(array_shapes[lhs_base])
+                    if fp is not None:
+                        known_set_elems[lhs_base] = fp
+                    partial_unknown.discard(lhs_base)
+            elif lhs_base and lhs_base in tracked and lhs_has_index and lhs_base in array_shapes:
+                arg_chunks = extract_index_args(lhs_text, lhs_base)
+                if not arg_chunks or len(arg_chunks) != 1:
+                    partial_unknown.add(lhs_base)
+                else:
+                    fp = parse_literal_index_footprint(arg_chunks[0], array_shapes[lhs_base])
+                    if fp is None:
+                        partial_unknown.add(lhs_base)
+                        continue
+                    s = known_set_elems.setdefault(lhs_base, set())
+                    s.update(fp)
+                    if len(s) >= shape_element_count(array_shapes[lhs_base]):
+                        defined.add(lhs_base)
+                        partial_unknown.discard(lhs_base)
             continue
 
+        for n in extract_allocatable_reads(low, allocatable_vars):
+            if n not in allocated_vars:
+                warn_unallocated(n, ln)
         reads = extract_ident_reads(low, tracked)
         for n in reads:
             if n not in defined:
+                if n in allocatable_vars and n not in allocated_vars:
+                    continue
+                if n in known_set_elems and n in array_shapes and n not in partial_unknown:
+                    detail = missing_detail_for_var(n, array_shapes[n], known_set_elems[n], low)
+                    if not detail:
+                        continue
+                else:
+                    detail = "variable may be used before being set"
                 kind = "INTENT(OUT) dummy" if n in intent_out else "variable"
                 issues.append(
                     Issue(
@@ -399,7 +1069,7 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                         unit_name=unit.name,
                         line=ln,
                         var_name=n,
-                        detail=f"{kind} may be used before being set",
+                        detail=detail if kind == "variable" else f"{kind} may be used before being set",
                     )
                 )
     return issues
