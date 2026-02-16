@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import subprocess
+import re
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -39,8 +40,68 @@ def run_compiler_command(
     if proc.stdout:
         print(proc.stdout.rstrip())
     if proc.stderr:
-        print(proc.stderr.rstrip())
+        print(format_linker_stderr(proc.stderr).rstrip())
     return False
+
+
+def compile_and_run_source(
+    source: Path,
+    *,
+    label: str,
+    quiet_run: bool = False,
+    keep_exe: bool = False,
+    exe_path: Optional[Path] = None,
+) -> Tuple[bool, str, str]:
+    """Compile one Fortran source with gfortran, run it, and return (ok, stdout, stderr)."""
+    exe = exe_path if exe_path is not None else Path(f"{source.stem}.exe")
+    compile_cmd = ["gfortran", str(source), "-o", str(exe)]
+    print(f"Build ({label}): {' '.join(quote_cmd_arg(x) for x in compile_cmd)}")
+    cp = subprocess.run(compile_cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        print(f"Build ({label}): FAIL (exit {cp.returncode})")
+        if cp.stdout:
+            print(cp.stdout.rstrip())
+        if cp.stderr:
+            print(format_linker_stderr(cp.stderr).rstrip())
+        return False, "", ""
+    print(f"Build ({label}): PASS")
+    print(f"Run ({label}): {quote_cmd_arg(str(exe))}")
+    rp = subprocess.run([str(exe)], capture_output=True, text=True)
+    try:
+        if rp.returncode != 0:
+            print(f"Run ({label}): FAIL (exit {rp.returncode})")
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+            return False, rp.stdout or "", rp.stderr or ""
+        print(f"Run ({label}): PASS")
+        if not quiet_run:
+            if rp.stdout:
+                print(rp.stdout.rstrip())
+            if rp.stderr:
+                print(rp.stderr.rstrip())
+        return True, rp.stdout or "", rp.stderr or ""
+    finally:
+        if not keep_exe:
+            try:
+                exe.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def format_linker_stderr(stderr: str) -> str:
+    """Compact very long linker diagnostics while keeping key symbols."""
+    lines = stderr.splitlines()
+    out: List[str] = []
+    undef_re = re.compile(r"undefined reference to [`']([^`']+)[`']", re.IGNORECASE)
+    for ln in lines:
+        m = undef_re.search(ln)
+        if m:
+            out.append(f"undefined reference to '{m.group(1)}'")
+        else:
+            out.append(ln)
+    return "\n".join(out)
 
 
 def rollback_backups(
