@@ -146,6 +146,36 @@ def parse_decl_entities(stmt: str) -> Tuple[Dict[str, bool], bool]:
     return out, is_parameter
 
 
+def decl_read_names(stmt: str, tracked: Set[str], declared: Set[str]) -> Set[str]:
+    """Return tracked names used in declaration tails (dims/init), not declared names."""
+    spec = ""
+    rhs = ""
+    if "::" in stmt:
+        spec, rhs = stmt.split("::", 1)
+    else:
+        m = NO_COLON_DECL_RE.match(stmt.strip())
+        if not m:
+            return set()
+        spec = m.group("spec")
+        rhs = m.group("rhs")
+    _ = spec  # kept for symmetry/future use
+    used: Set[str] = set()
+    for chunk in split_top_level_commas(rhs):
+        text = chunk.strip()
+        if not text:
+            continue
+        m = re.match(r"^([a-z][a-z0-9_]*)", text, re.IGNORECASE)
+        if not m:
+            continue
+        name = m.group(1).lower()
+        tail = text[m.end() :]
+        for m_id in IDENT_RE.finditer(tail.lower()):
+            n = m_id.group(1).lower()
+            if n in tracked and n != name and n not in declared:
+                used.add(n)
+    return used
+
+
 def parse_program_units(finfo: fscan.SourceFileInfo) -> List[Unit]:
     """Parse explicit and implicit main program units from one file."""
     units: List[Unit] = []
@@ -276,6 +306,7 @@ def analyze_unit(unit: Unit) -> List[Issue]:
             continue
         if TYPE_DECL_RE.match(low):
             decls, param = parse_decl_entities(low)
+            declared_here = set(decls.keys())
             for n, init in decls.items():
                 tracked.add(n)
                 decl_line.setdefault(n, ln)
@@ -283,6 +314,7 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                     is_parameter.add(n)
                 if init:
                     writes.add(n)
+            reads.update(decl_read_names(low, tracked, declared_here))
             continue
 
         m_as = ASSIGN_RE.match(low)
@@ -321,6 +353,18 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                     context=f"{unit.kind} {unit.name}",
                     name=n,
                     detail="set but never read in this unit",
+                )
+            )
+        elif n not in writes and n not in reads and n in decl_line:
+            cat = "named-constant" if n in is_parameter else "variable"
+            issues.append(
+                Issue(
+                    path=unit.path,
+                    line=decl_line[n],
+                    category=cat,
+                    context=f"{unit.kind} {unit.name}",
+                    name=n,
+                    detail="declared but never used in this unit",
                 )
             )
     return issues
@@ -381,10 +425,12 @@ def analyze_unit_dead_stores(unit: Unit) -> List[Issue]:
     def apply_stmt_to_state(state: Dict[str, int], low: str, ln: int) -> None:
         if TYPE_DECL_RE.match(low):
             decls, _param = parse_decl_entities(low)
+            declared_here = set(decls.keys())
             for n, init in decls.items():
                 tracked.add(n)
                 if init and n not in skip:
                     state[n] = ln
+            consume_reads(state, list(decl_read_names(low, tracked, declared_here)))
             return
 
         m_as = ASSIGN_RE.match(low)
@@ -552,12 +598,14 @@ def build_fix_actions_for_unit(unit: Unit) -> Tuple[Dict[int, Set[str]], Set[int
             continue
         if TYPE_DECL_RE.match(low):
             decls, _param = parse_decl_entities(low)
+            declared_here = set(decls.keys())
             for n, init in decls.items():
                 tracked.add(n)
                 decl_line_by_name.setdefault(n, ln)
                 if init:
                     writes.add(n)
                     write_lines_by_name.setdefault(n, set()).add(ln)
+            reads.update(decl_read_names(low, tracked, declared_here))
             continue
         m_as = ASSIGN_RE.match(low)
         if m_as:
@@ -833,6 +881,10 @@ def main() -> int:
                 )
 
     if not issues:
+        if args.out is not None and len(files) == 1:
+            src = files[0]
+            if src != args.out:
+                args.out.write_text(src.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8", newline="")
         if args.warn_dead_store:
             print("No likely unused or dead-store findings.")
         else:
@@ -863,6 +915,10 @@ def main() -> int:
                 out_path=out_path,
             )
             total_changes += c
+        if args.out is not None and total_changes == 0 and len(files) == 1:
+            src = files[0]
+            if src != args.out:
+                args.out.write_text(src.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8", newline="")
         print(f"Applied {total_changes} conservative fix edit(s).")
 
     issues.sort(key=lambda x: (x.path.name.lower(), x.line, x.context, x.name))
