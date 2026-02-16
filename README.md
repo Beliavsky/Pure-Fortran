@@ -300,6 +300,9 @@ Notes:
 
 - Advisory only (no `--fix`).
 - Conservative static analysis; best used with manual review.
+- Tracks partial array initialization with element-level diagnostics (rank 1-3 when extents are inferable).
+- Checks allocatable-use state (`allocate`/`deallocate`) and warns on uses while unallocated.
+- Treats inquiry intrinsics (for example `size`, `lbound`, `ubound`, `shape`, `kind`, `rank`, `allocated`) as non-value reads.
 
 ### 10) `xunused.py`
 
