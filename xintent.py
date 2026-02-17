@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
 import fortran_scan as fscan
+from fortran_semantics import infer_intent_from_access
 
 TYPE_DECL_RE = re.compile(
     r"^\s*(integer(?:\s*\*\s*\d+)?|real(?:\s*\*\s*\d+)?|logical(?:\s*\*\s*\d+)?|"
@@ -1463,10 +1464,22 @@ def analyze_intent_suggestions(
             if has_intent_or_value or has_alloc_ptr:
                 continue
             if target_intent == "in":
-                if d in writes or d in maybe_written_via_call:
+                base_intent = infer_intent_from_access(
+                    is_read=(d in reads),
+                    is_written=(d in writes),
+                    first_access=(first_event.get(d)[1] if d in first_event else None),
+                )
+                if base_intent != "in" or d in maybe_written_via_call:
                     continue
             elif target_intent == "out":
                 # Conservative INTENT(OUT): must be written and not read/called before first write.
+                base_intent = infer_intent_from_access(
+                    is_read=(d in reads),
+                    is_written=(d in writes),
+                    first_access=(first_event.get(d)[1] if d in first_event else None),
+                )
+                if base_intent == "in":
+                    continue
                 if d not in writes:
                     continue
                 if nonvariable_actual_formals is not None:
@@ -1495,6 +1508,13 @@ def analyze_intent_suggestions(
                         continue
             elif target_intent == "inout":
                 # Conservative INTENT(IN OUT): written, and evidence of input usage.
+                base_intent = infer_intent_from_access(
+                    is_read=(d in reads),
+                    is_written=(d in writes),
+                    first_access=(first_event.get(d)[1] if d in first_event else None),
+                )
+                if base_intent == "in":
+                    continue
                 if d not in writes:
                     continue
                 if nonvariable_actual_formals is not None:
