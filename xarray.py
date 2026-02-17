@@ -69,6 +69,12 @@ CHAR_LITERAL_RE = re.compile(r"^\s*(['\"]).*\1\s*$", re.IGNORECASE)
 BEGIN_TAG = "!! beginning of code that xarray.py suggests replacing"
 END_TAG = "!! end of code that xarray.py suggests replacing"
 CHANGED_TAG = "!! changed by xarray.py"
+REMOVED_TAG = "!! removed by xarray.py"
+CHANGED_BLOCK_BEGIN = "! begin block changed by xarray.py"
+CHANGED_BLOCK_END = "! end block changed by xarray.py"
+REMOVED_BLOCK_BEGIN = "! begin block removed by xarray.py"
+REMOVED_BLOCK_END = "! end block removed by xarray.py"
+AGGRESSIVE_MODE = False
 
 
 @dataclass
@@ -161,10 +167,47 @@ USER_ELEMENTAL_CALLS: Set[str] = set()
 USER_ELEMENTAL_SUBROUTINES: Set[str] = set()
 
 
+LETTER_RANGE_TOKEN_RE = re.compile(r"\[([a-zA-Z\*]?):([a-zA-Z\*]?)\]")
+
+
+def translate_single_letter_range_glob(raw: str) -> str:
+    """Translate xarray pseudo-glob letter ranges to standard glob classes.
+
+    Supported tokens:
+    - [d:z] -> [d-z]
+    - [d:]  -> [d-z]
+    - [:m]  -> [a-m]
+    - [d:*] -> [d-z]*
+    - [*:m] -> [a-m]*
+    """
+    def repl(m: re.Match[str]) -> str:
+        lo = m.group(1)
+        hi = m.group(2)
+        star_suffix = ""
+        if hi == "*":
+            hi = ""
+            star_suffix = "*"
+        if lo == "*":
+            lo = ""
+            star_suffix = "*"
+        if not lo and not hi:
+            return m.group(0)
+        if not lo:
+            lo = "a" if hi.islower() else "A"
+        if not hi:
+            hi = "z" if lo.islower() else "Z"
+        if ord(lo) > ord(hi):
+            lo, hi = hi, lo
+        return f"[{lo}-{hi}]{star_suffix}"
+
+    return LETTER_RANGE_TOKEN_RE.sub(repl, raw)
+
+
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve source files from args or current-directory defaults."""
     if args_files:
-        files = cpaths.expand_path_args(args_files)
+        translated = [Path(translate_single_letter_range_glob(str(p))) for p in args_files]
+        files = cpaths.expand_source_inputs(translated)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
@@ -259,10 +302,21 @@ def split_code_comment(line: str) -> Tuple[str, str]:
     return line, ""
 
 
+def read_text_flexible(path: Path) -> str:
+    """Read text via shared scan helper with fallback encodings."""
+    return fscan.read_text_flexible(path)
+
+
 def is_continuation_only_line(line: str) -> bool:
     """True when a physical line is a free-form continuation starter (`& ...`)."""
     code, _comment = split_code_comment(line)
     return bool(re.match(r"^\s*&", code))
+
+
+def has_trailing_continuation_amp(line: str) -> bool:
+    """True when statement text (before comment) ends with free-form '&'."""
+    code, _comment = split_code_comment(line)
+    return code.rstrip().endswith("&")
 
 
 def strip_quoted_text(text: str) -> str:
@@ -402,6 +456,20 @@ def shifted_section_expr(lb: str, ub: str, delta: int) -> str:
     sec = re.sub(r"\b([a-z][a-z0-9_]*)-0\b", r"\1", sec, flags=re.IGNORECASE)
     sec = re.sub(r"\b([a-z][a-z0-9_]*)\+0\b", r"\1", sec, flags=re.IGNORECASE)
     return sec
+
+
+def section_extent_expr(sec: str) -> Optional[str]:
+    """Return extent expression for a simple section lo:hi (no explicit step)."""
+    txt = sec.strip()
+    parts = [p.strip() for p in txt.split(":")]
+    if len(parts) != 2:
+        return None
+    lo, hi = parts
+    if not lo or not hi:
+        return None
+    if normalize_expr(lo) == normalize_expr("1"):
+        return hi
+    return f"({hi})-({lo})+1"
 
 
 def parse_affine_loop_index(arg: str, loop_var: str) -> Optional[int]:
@@ -1294,6 +1362,54 @@ def collect_character_scalar_lengths(unit: xunset.Unit) -> Dict[str, int]:
     return out
 
 
+def collect_rank1_character_array_names(unit: xunset.Unit) -> Set[str]:
+    """Collect rank-1 CHARACTER array entity names in one unit."""
+    out: Set[str] = set()
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low:
+            continue
+        if not re.match(r"^\s*character\b", low, re.IGNORECASE):
+            continue
+        rhs = ""
+        if "::" in low:
+            rhs = low.split("::", 1)[1]
+        else:
+            m_no = re.match(r"^\s*character(?:\s*(?:\([^)]*\)|\*\s*\d+))?\s+(.+)$", low, re.IGNORECASE)
+            if not m_no:
+                continue
+            rhs = m_no.group(1)
+        for chunk in split_top_level_commas(rhs):
+            txt = chunk.strip()
+            if not txt:
+                continue
+            if "=" in txt and "=>" not in txt:
+                txt = txt.split("=", 1)[0].strip()
+            mname = re.match(r"^([a-z][a-z0-9_]*)", txt, re.IGNORECASE)
+            if not mname:
+                continue
+            name = mname.group(1).lower()
+            rest = txt[mname.end() :].lstrip()
+            if not rest.startswith("("):
+                continue
+            depth = 0
+            end_pos = -1
+            for j, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = j
+                        break
+            if end_pos < 0:
+                continue
+            dims = rest[1:end_pos].strip()
+            if dims and "," not in dims:
+                out.add(name)
+    return out
+
+
 def collect_rank1_class_names(unit: xunset.Unit) -> Set[str]:
     """Collect rank-1 CLASS(...) declaration names (always blocked for whole-array rewrite)."""
     out: Set[str] = set()
@@ -1525,6 +1641,37 @@ def maybe_allocate_source_pair(stmt_alloc: str, stmt_next: str) -> Optional[str]
     # Conservative: skip self-reference in SOURCE expression.
     if re.search(rf"\b{re.escape(base)}\b", strip_quoted_text(rhs), re.IGNORECASE):
         return None
+    # Conservative shape guard for constructor SOURCE:
+    # only allow when allocate bounds are literal and match constructor size.
+    ctor_vals = parse_array_constructor_values(rhs)
+    if ctor_vals is not None:
+        m_obj = re.match(r"^\s*[a-z][a-z0-9_]*\s*\((.*)\)\s*$", obj, re.IGNORECASE)
+        if m_obj is None:
+            return None
+        dims = split_top_level_commas(m_obj.group(1))
+        if len(dims) != 1:
+            return None
+        d = dims[0].strip()
+        # rank-1 shape-spec: either "ub" or "lb:ub" with integer literals only.
+        size_lit: Optional[int] = None
+        if ":" in d:
+            lo_s, hi_s = [t.strip() for t in d.split(":", 1)]
+            if not (re.fullmatch(r"[+-]?\d+", lo_s) and re.fullmatch(r"[+-]?\d+", hi_s)):
+                return None
+            lo_i = int(lo_s)
+            hi_i = int(hi_s)
+            if hi_i < lo_i:
+                return None
+            size_lit = hi_i - lo_i + 1
+        else:
+            if not re.fullmatch(r"[+-]?\d+", d):
+                return None
+            ub_i = int(d)
+            if ub_i < 0:
+                return None
+            size_lit = ub_i
+        if size_lit is None or size_lit != len(ctor_vals):
+            return None
     inner_parts: List[str] = [obj]
     inner_parts.extend(opts)
     inner_parts.append(f"source={rhs}")
@@ -1625,6 +1772,22 @@ def maybe_elementwise(
                         lambda m: f"spread({m.group(1)}({rng_txt}), dim=2, ncopies={ncopy2})",
                         rhs_sliced,
                     )
+        # Fallback broadcast for rank-2 target when RHS is a simple rank-1 section
+        # aligned with the looped dimension, e.g.
+        #   a(i, j1:j2) = key(i)  ->  a(1:n, j1:j2) = spread(key(1:n), dim=2, ncopies=j2-j1+1)
+        rhs_idx = parse_indexed_name(rhs_sliced)
+        if rhs_idx is not None and len(rhs_idx[1]) == 1:
+            rarg = rhs_idx[1][0].strip()
+            if lhs_pos == 0:
+                sec_other = lhs_args_sliced[1].strip()
+                extent = section_extent_expr(sec_other)
+                if extent is not None and normalize_expr(rarg) == normalize_expr(lhs_args_sliced[0].strip()):
+                    rhs_sliced = f"spread({rhs_idx[0]}({rarg}), dim=2, ncopies={extent})"
+            elif lhs_pos == 1:
+                sec_other = lhs_args_sliced[0].strip()
+                extent = section_extent_expr(sec_other)
+                if extent is not None and normalize_expr(rarg) == normalize_expr(lhs_args_sliced[1].strip()):
+                    rhs_sliced = f"spread({rhs_idx[0]}({rarg}), dim=1, ncopies={extent})"
     rhs_sliced = simplify_section_expr(rhs_sliced, decl_bounds)
     if has_disallowed_function_calls(rhs_sliced, array_names):
         return None
@@ -1774,6 +1937,138 @@ def maybe_multi_elementwise(
             if re.search(rf"\b{re.escape(w)}\s*\(", rhs_low):
                 return None
     return "\n".join(suggestions)
+
+
+def _normalize_affine_subscripts(
+    expr: str, loop_var: str
+) -> Tuple[Optional[str], Optional[List[int]]]:
+    """Normalize rank-1 affine subscripts to IDX and return collected deltas."""
+    out: List[str] = []
+    deltas: List[int] = []
+    i = 0
+    n = len(expr)
+    lv = loop_var.lower()
+    while i < n:
+        m = re.match(r"[a-z][a-z0-9_]*", expr[i:], re.IGNORECASE)
+        if not m:
+            ch = expr[i]
+            # Any remaining loop-var token outside recognized rank-1 subscripts
+            # makes this pattern unsafe.
+            if re.match(r"[a-z]", ch, re.IGNORECASE):
+                m_id = re.match(r"[a-z][a-z0-9_]*", expr[i:], re.IGNORECASE)
+                if m_id and m_id.group(0).lower() == lv:
+                    return None, None
+            out.append(ch)
+            i += 1
+            continue
+        name = m.group(0)
+        j = i + len(name)
+        while j < n and expr[j].isspace():
+            j += 1
+        if j >= n or expr[j] != "(":
+            out.append(expr[i])
+            i += 1
+            continue
+        close = find_matching_paren(expr, j)
+        if close < 0:
+            return None, None
+        inside = expr[j + 1 : close]
+        args = split_top_level_commas(inside)
+        if len(args) != 1:
+            return None, None
+        delta = parse_affine_loop_index(args[0], loop_var)
+        if delta is None:
+            return None, None
+        deltas.append(delta)
+        out.append(f"{name}(IDX)")
+        i = close + 1
+    return "".join(out), deltas
+
+
+def maybe_unrolled_elementwise_chunked(
+    loop_var: str,
+    lb: str,
+    ub: str,
+    step: Optional[str],
+    body_stmts: List[str],
+    array_names: Set[str],
+    *,
+    aggressive: bool,
+) -> Optional[str]:
+    """Detect fixed-width unrolled elementwise loop and collapse it."""
+    if step is None:
+        return None
+    step_txt = step.strip()
+    if not re.fullmatch(r"[+-]?\d+", step_txt):
+        return None
+    k = int(step_txt)
+    if k <= 1:
+        return None
+    if len(body_stmts) != k:
+        return None
+
+    lhs_name: Optional[str] = None
+    rhs_norm_ref: Optional[str] = None
+    rhs_ref: Optional[str] = None
+    seen_lhs_deltas: Set[int] = set()
+    required_deltas = set(range(k))
+
+    for st in body_stmts:
+        m = ASSIGN_RE.match(st.strip())
+        if not m:
+            return None
+        lhs = m.group(1).strip()
+        rhs = m.group(2).strip()
+        lhs_parsed = parse_indexed_name(lhs)
+        if lhs_parsed is None:
+            return None
+        l_name, l_args = lhs_parsed
+        if len(l_args) != 1:
+            return None
+        d_lhs = parse_affine_loop_index(l_args[0], loop_var)
+        if d_lhs is None:
+            return None
+        seen_lhs_deltas.add(d_lhs)
+        if lhs_name is None:
+            lhs_name = l_name
+        elif l_name.lower() != lhs_name.lower():
+            return None
+
+        # Avoid potential write-after-read ambiguity on target.
+        if re.search(rf"\b{re.escape(l_name)}\s*\(", strip_quoted_text(rhs), re.IGNORECASE):
+            return None
+
+        rhs_norm, rhs_deltas = _normalize_affine_subscripts(rhs, loop_var)
+        if rhs_norm is None or rhs_deltas is None or not rhs_deltas:
+            return None
+        # Each statement should be an offset-shifted clone.
+        if any(d != d_lhs for d in rhs_deltas):
+            return None
+        if rhs_norm_ref is None:
+            rhs_norm_ref = rhs_norm
+            rhs_ref = rhs
+        elif rhs_norm != rhs_norm_ref:
+            return None
+
+    if seen_lhs_deltas != required_deltas:
+        return None
+    if lhs_name is None or rhs_ref is None:
+        return None
+
+    chunk_ub = f"{loop_var}+{k-1}"
+    rhs_chunk = replace_affine_index_anydim(rhs_ref, loop_var, loop_var, chunk_ub, array_names=array_names)
+
+    if aggressive:
+        rhs_full = replace_affine_index_anydim(rhs_ref, loop_var, lb, ub, array_names=array_names)
+        if has_loop_var(rhs_full, loop_var):
+            return None
+        return f"{lhs_name}({lb}:{ub}) = {rhs_full}"
+
+    return (
+        f"do {loop_var}={lb},{ub},{k}\n"
+        f"   {lhs_name}({loop_var}:{chunk_ub}) = {rhs_chunk}\n"
+        f"end do"
+    )
 
 
 def maybe_nested_multi_elementwise(
@@ -2209,6 +2504,127 @@ def is_numeric_literal_text(text: str) -> bool:
     return NUM_LITERAL_RE.match(text.strip()) is not None
 
 
+REAL_LITERAL_KIND_RE = re.compile(
+    r"^\s*[+-]?(?:(?:\d+\.\d*|\.\d+|\d+\.)(?:[eEdDqQ][+-]?\d+)?|\d+[eEdDqQ][+-]?\d+)"
+    r"(?:_([a-z][a-z0-9_]*|\d+))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def real_literal_kind_tag(text: str) -> Optional[str]:
+    """Return normalized kind tag for a real literal, else None."""
+    t = text.strip()
+    m = REAL_LITERAL_KIND_RE.match(t)
+    if not m:
+        return None
+    ksuffix = m.group(1)
+    if ksuffix:
+        return f"_{ksuffix.lower()}"
+    if re.search(r"[dDqQ][+-]?\d+", t):
+        return "d"
+    return "default"
+
+
+def has_mixed_real_literal_kinds(parts: List[str]) -> bool:
+    """True when constructor parts contain mixed real literal kinds."""
+    tags: Set[str] = set()
+    for p in parts:
+        tag = real_literal_kind_tag(p)
+        if tag is not None:
+            tags.add(tag)
+            if len(tags) > 1:
+                return True
+    return False
+
+
+def neutral_real_literal_base(text: str) -> Optional[str]:
+    """Return neutral base ('0.0' or '1.0') for promotable default real literals."""
+    t = text.strip()
+    if t in {"0.0", "+0.0", "-0.0"}:
+        return "0.0"
+    if t in {"1.0", "+1.0", "-1.0"}:
+        return "1.0" if not t.startswith("-") else "-1.0"
+    return None
+
+
+def format_promoted_real_literal(base: str, target_tag: str) -> str:
+    """Render promoted real literal in the target kind tag format."""
+    if target_tag == "d":
+        return f"{base}D0"
+    if target_tag.startswith("_"):
+        return f"{base}{target_tag}"
+    return base
+
+
+def normalize_constructor_real_literal_kinds(parts: List[str]) -> Optional[List[str]]:
+    """
+    Normalize mixed real-literal kinds when safely possible.
+
+    Strategy:
+    - Keep as-is when there is no kind mixing.
+    - If exactly one non-default real kind is present, promote default neutral
+      literals (0.0/-0.0/1.0/+1.0/-1.0) to that non-default kind.
+    - Otherwise, return None (unsafe to rewrite).
+    """
+    tags: Set[str] = set()
+    for p in parts:
+        tag = real_literal_kind_tag(p)
+        if tag is not None:
+            tags.add(tag)
+    if len(tags) <= 1:
+        return list(parts)
+    nondefault = {t for t in tags if t != "default"}
+    if len(nondefault) != 1:
+        return None
+    target = next(iter(nondefault))
+    out: List[str] = []
+    for p in parts:
+        tag = real_literal_kind_tag(p)
+        if tag != "default":
+            out.append(p)
+            continue
+        base = neutral_real_literal_base(p)
+        if base is None:
+            return None
+        out.append(format_promoted_real_literal(base, target))
+    return out
+
+
+def format_constructor_rhs(parts: List[str], *, lhs_name: str, lhs_is_char_rank1: bool) -> str:
+    """Format constructor RHS; add CHARACTER type-spec and wrap long constructors."""
+    joined = ", ".join(parts)
+    if len(parts) <= 16 and len(joined) <= 120:
+        if lhs_is_char_rank1:
+            return f"[character(len=len({lhs_name})) :: {joined}]"
+        return f"[{joined}]"
+
+    prefix = f"character(len=len({lhs_name})) :: " if lhs_is_char_rank1 else ""
+    max_width = 100
+    lines: List[str] = []
+    current = ""
+    for p in parts:
+        piece = p if not current else f", {p}"
+        if current and (len(current) + len(piece) > max_width):
+            lines.append(current)
+            current = p
+        else:
+            current += piece
+    if current:
+        lines.append(current)
+
+    out: List[str] = []
+    if prefix:
+        out.append(f"[{prefix}&")
+    else:
+        out.append("[ &")
+    for i, line in enumerate(lines):
+        if i + 1 < len(lines):
+            out.append(f"{line}, &")
+        else:
+            out.append(f"{line} ]")
+    return "\n".join(out)
+
+
 def allow_constructor_for_nondefault_real_with_scalars(
     parts: List[str], scalar_nondefault_real_names: Set[str]
 ) -> bool:
@@ -2234,6 +2650,7 @@ def maybe_constructor_pack(
     scalar_nondefault_real_names: Set[str],
     complex_rank1_names: Set[str],
     character_scalar_names: Set[str],
+    character_rank1_array_names: Set[str],
 ) -> Optional[Tuple[int, str]]:
     """Detect consecutive rank-1 const-index assignments packable into one constructor."""
     if start_idx >= len(body):
@@ -2286,6 +2703,10 @@ def maybe_constructor_pack(
 
     if end_idx == start_idx:
         return None
+    normalized_parts = normalize_constructor_real_literal_kinds(parts)
+    if normalized_parts is None:
+        return None
+    parts = normalized_parts
     if name.lower() in nondefault_real_names and not allow_constructor_for_nondefault_real_with_scalars(
         parts, scalar_nondefault_real_names
     ):
@@ -2300,7 +2721,10 @@ def maybe_constructor_pack(
             and normalize_expr(str(last_hi)) == normalize_expr(b_hi)
         ):
             lhs_expr = name
-    suggestion = f"{lhs_expr} = [{', '.join(parts)}]"
+    suggestion = (
+        f"{lhs_expr} = "
+        f"{format_constructor_rhs(parts, lhs_name=name, lhs_is_char_rank1=name.lower() in character_rank1_array_names)}"
+    )
     return end_idx, suggestion
 
 
@@ -2311,6 +2735,7 @@ def maybe_constructor_pack_sparse(
     scalar_nondefault_real_names: Set[str],
     complex_rank1_names: Set[str],
     character_scalar_names: Set[str],
+    character_rank1_array_names: Set[str],
 ) -> Optional[Tuple[int, str]]:
     """Detect consecutive scalar-index assignments to same rank-1 array with sparse indices."""
     if start_idx >= len(body):
@@ -2368,14 +2793,20 @@ def maybe_constructor_pack_sparse(
             break
     if is_contig:
         return None
+    normalized_vals = normalize_constructor_real_literal_kinds(vals)
+    if normalized_vals is None:
+        return None
+    vals = normalized_vals
     if name0.lower() in nondefault_real_names and not allow_constructor_for_nondefault_real_with_scalars(
         vals, scalar_nondefault_real_names
     ):
         return None
 
     idx_vec = ", ".join(str(k) for k in idxs)
-    val_vec = ", ".join(vals)
-    suggestion = f"{name0}([{idx_vec}]) = [{val_vec}]"
+    rhs = format_constructor_rhs(
+        vals, lhs_name=name0, lhs_is_char_rank1=name0.lower() in character_rank1_array_names
+    )
+    suggestion = f"{name0}([{idx_vec}]) = {rhs}"
     return end_idx, suggestion
 
 
@@ -2798,6 +3229,72 @@ def has_disallowed_function_calls(expr: str, array_names: Set[str]) -> bool:
     return False
 
 
+def bound_expr_has_indexing_on_var(bound_expr: str, loop_var: str) -> bool:
+    """True if bound expression contains indexed call/reference mentioning loop_var."""
+    s = strip_quoted_text(bound_expr)
+    i = 0
+    n = len(s)
+    lv = loop_var.lower()
+    while i < n:
+        m = re.match(r"[a-z][a-z0-9_]*", s[i:], re.IGNORECASE)
+        if not m:
+            i += 1
+            continue
+        j = i + len(m.group(0))
+        while j < n and s[j].isspace():
+            j += 1
+        if j < n and s[j] == "(":
+            close = find_matching_paren(s, j)
+            if close < 0:
+                return True
+            inside = s[j + 1 : close].lower()
+            if re.search(rf"\b{re.escape(lv)}\b", inside):
+                return True
+            i = close + 1
+            continue
+        i = j
+    return False
+
+
+def paren_bracket_balanced(text: str) -> bool:
+    """Check balanced (), [], {} outside quotes."""
+    s = strip_quoted_text(text)
+    depth_par = 0
+    depth_brk = 0
+    depth_brc = 0
+    for ch in s:
+        if ch == "(":
+            depth_par += 1
+        elif ch == ")":
+            depth_par -= 1
+            if depth_par < 0:
+                return False
+        elif ch == "[":
+            depth_brk += 1
+        elif ch == "]":
+            depth_brk -= 1
+            if depth_brk < 0:
+                return False
+        elif ch == "{":
+            depth_brc += 1
+        elif ch == "}":
+            depth_brc -= 1
+            if depth_brc < 0:
+                return False
+    return depth_par == 0 and depth_brk == 0 and depth_brc == 0
+
+
+def do_triplet_fields_well_formed(lb: str, ub: str, step: Optional[str]) -> bool:
+    """Conservative check: each parsed DO triplet field must be internally balanced."""
+    if not paren_bracket_balanced(lb):
+        return False
+    if not paren_bracket_balanced(ub):
+        return False
+    if step is not None and not paren_bracket_balanced(step):
+        return False
+    return True
+
+
 def maybe_loop_to_concurrent_or_forall(
     loop_var: str,
     rng: str,
@@ -2807,7 +3304,7 @@ def maybe_loop_to_concurrent_or_forall(
     allow_forall: bool,
     array_names: Set[str],
 ) -> Optional[Tuple[str, str]]:
-    """Detect simple one-statement loop and suggest one-line DO CONCURRENT or FORALL."""
+    """Detect simple one-statement loop and suggest DO CONCURRENT block or one-line FORALL."""
     m = ASSIGN_RE.match(body_stmt.strip())
     if not m:
         return None
@@ -2820,6 +3317,9 @@ def maybe_loop_to_concurrent_or_forall(
     lhs_idx = m_lhs.group(2).lower()
     if lhs_idx != loop_var.lower():
         return None
+    # Conservative legality guard for dependent/indirect bounds.
+    if bound_expr_has_indexing_on_var(rng, loop_var):
+        return None
 
     # Conservative dependence block: if rhs references lhs at all, skip.
     if re.search(rf"\b{re.escape(lhs_name)}\s*\(", rhs, re.IGNORECASE):
@@ -2828,10 +3328,76 @@ def maybe_loop_to_concurrent_or_forall(
     if allow_concurrent:
         # Conservative purity proxy for concurrent mode: reject non-array calls.
         if not has_nonarray_call(rhs, array_names):
-            return f"do concurrent ({loop_var} = {rng}) {body_stmt.strip()}", "one_line_do_concurrent"
+            return (
+                f"do concurrent ({loop_var} = {rng})\n"
+                f"   {body_stmt.strip()}\n"
+                f"end do",
+                "do_concurrent",
+            )
 
     if allow_forall:
         return f"forall ({loop_var} = {rng}) {body_stmt.strip()}", "one_line_forall"
+    return None
+
+
+def maybe_loopnest_to_concurrent_or_forall(
+    loop_vars: List[str],
+    ranges: List[str],
+    body_stmt: str,
+    *,
+    allow_concurrent: bool,
+    allow_forall: bool,
+    array_names: Set[str],
+) -> Optional[Tuple[str, str]]:
+    """Detect simple one-statement nested loop and suggest DO CONCURRENT block/one-line FORALL."""
+    if not loop_vars or len(loop_vars) != len(ranges):
+        return None
+    # Conservative legality guard: in DO CONCURRENT/FORALL control lists,
+    # each triplet must not reference peer control variables.
+    lv_lows = [v.lower() for v in loop_vars]
+    for idx, r in enumerate(ranges):
+        if bound_expr_has_indexing_on_var(r, loop_vars[idx]):
+            return None
+        rr = strip_quoted_text(r.lower())
+        for jdx, v in enumerate(lv_lows):
+            if jdx == idx:
+                continue
+            if re.search(rf"\b{re.escape(v)}\b", rr):
+                return None
+    m = ASSIGN_RE.match(body_stmt.strip())
+    if not m:
+        return None
+    lhs = m.group(1).strip()
+    rhs = m.group(2).strip()
+
+    lhs_idx = parse_indexed_name(lhs)
+    if lhs_idx is None:
+        return None
+    lhs_name, lhs_args = lhs_idx
+
+    # Require each loop variable to appear exactly once across LHS subscripts.
+    for v in loop_vars:
+        n = sum(1 for a in lhs_args if a.strip().lower() == v.lower())
+        if n != 1:
+            return None
+
+    # Conservative dependence block: if rhs references lhs at all, skip.
+    if re.search(rf"\b{re.escape(lhs_name)}\s*\(", rhs, re.IGNORECASE):
+        return None
+
+    control = ", ".join(f"{v} = {r}" for v, r in zip(loop_vars, ranges))
+    if allow_concurrent:
+        # Conservative purity proxy for concurrent mode: reject non-array calls.
+        if not has_nonarray_call(rhs, array_names):
+            return (
+                f"do concurrent ({control})\n"
+                f"   {body_stmt.strip()}\n"
+                f"end do",
+                "do_concurrent",
+            )
+
+    if allow_forall:
+        return f"forall ({control}) {body_stmt.strip()}", "one_line_forall"
     return None
 
 
@@ -4991,6 +5557,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     scalar_nondefault_real_names = collect_scalar_nondefault_real_names(unit)
     complex_rank1_names = collect_rank1_complex_names(unit)
     character_scalar_names = collect_character_scalar_names(unit)
+    character_rank1_array_names = collect_rank1_character_array_names(unit)
     scalar_char_lengths = collect_character_scalar_lengths(unit)
     decl_scalar_inits = parse_scalar_decl_initializers(unit)
     array_names: Set[str] = set(decl_bounds.keys()) | set(rank2_bounds.keys()) | set(rank3_bounds.keys())
@@ -5096,6 +5663,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             scalar_nondefault_real_names,
             complex_rank1_names,
             character_scalar_names,
+            character_rank1_array_names,
         )
         if pack is not None:
             end_idx, sugg_pack = pack
@@ -5119,6 +5687,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             scalar_nondefault_real_names,
             complex_rank1_names,
             character_scalar_names,
+            character_rank1_array_names,
         )
         if pack_sparse is not None:
             end_idx, sugg_pack = pack_sparse
@@ -6219,6 +6788,29 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             j += 1
         if not has_nested and end_idx > i + 2:
             ln_end = body[end_idx][0]
+            sugg_unroll = maybe_unrolled_elementwise_chunked(
+                loop_var,
+                lb.strip(),
+                ub.strip(),
+                step,
+                inner_stmts,
+                array_names,
+                aggressive=AGGRESSIVE_MODE,
+            )
+            if sugg_unroll is not None:
+                findings.append(
+                    Finding(
+                        path=unit.path,
+                        rule="elementwise_unrolled_chunk",
+                        unit_kind=unit.kind,
+                        unit_name=unit.name,
+                        start_line=ln,
+                        end_line=ln_end,
+                        suggestion=sugg_unroll,
+                    )
+                )
+                i = end_idx + 1
+                continue
             sugg_multi = maybe_multi_elementwise(
                 loop_var, rng, inner_stmts, decl_bounds, alloc_map, array_names
             )
@@ -6258,6 +6850,111 @@ def analyze_unit_concurrent_forall(
         if not mdo:
             i += 1
             continue
+        if not do_triplet_fields_well_formed(mdo.group(2), mdo.group(3), mdo.group(4)):
+            i += 1
+            continue
+        # 3D nested form:
+        # do o
+        #   do m
+        #     do i
+        #       stmt
+        #     end do
+        #   end do
+        # end do
+        if i + 6 < len(body):
+            ln_mdo, stmt_mdo = body[i + 1]
+            ln_ido, stmt_ido = body[i + 2]
+            _ln_body, stmt_body3 = body[i + 3]
+            ln_iend, stmt_iend = body[i + 4]
+            ln_mend, stmt_mend = body[i + 5]
+            ln_oend, stmt_oend = body[i + 6]
+            m_mdo = DO_RE.match(stmt_mdo.strip())
+            m_ido = DO_RE.match(stmt_ido.strip())
+            if (
+                m_mdo
+                and m_ido
+                and END_DO_RE.match(stmt_iend.strip())
+                and END_DO_RE.match(stmt_mend.strip())
+                and END_DO_RE.match(stmt_oend.strip())
+            ):
+                if not do_triplet_fields_well_formed(m_mdo.group(2), m_mdo.group(3), m_mdo.group(4)):
+                    i += 1
+                    continue
+                if not do_triplet_fields_well_formed(m_ido.group(2), m_ido.group(3), m_ido.group(4)):
+                    i += 1
+                    continue
+                loop_var_o = mdo.group(1)
+                loop_var_m = m_mdo.group(1)
+                loop_var_i = m_ido.group(1)
+                rng_o = build_range(mdo.group(2), mdo.group(3), mdo.group(4))
+                rng_m = build_range(m_mdo.group(2), m_mdo.group(3), m_mdo.group(4))
+                rng_i = build_range(m_ido.group(2), m_ido.group(3), m_ido.group(4))
+                sug3 = maybe_loopnest_to_concurrent_or_forall(
+                    [loop_var_o, loop_var_m, loop_var_i],
+                    [rng_o, rng_m, rng_i],
+                    stmt_body3,
+                    allow_concurrent=allow_concurrent,
+                    allow_forall=allow_forall,
+                    array_names=array_names,
+                )
+                if sug3 is not None:
+                    suggestion, rule = sug3
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule=rule,
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=suggestion,
+                        )
+                    )
+                    i += 7
+                    continue
+        # 2D nested form:
+        # do o
+        #   do i
+        #     stmt
+        #   end do
+        # end do
+        if i + 4 < len(body):
+            ln_ido, stmt_ido = body[i + 1]
+            _ln_body, stmt_body2 = body[i + 2]
+            ln_iend, stmt_iend = body[i + 3]
+            ln_oend, stmt_oend = body[i + 4]
+            m_ido = DO_RE.match(stmt_ido.strip())
+            if m_ido and END_DO_RE.match(stmt_iend.strip()) and END_DO_RE.match(stmt_oend.strip()):
+                if not do_triplet_fields_well_formed(m_ido.group(2), m_ido.group(3), m_ido.group(4)):
+                    i += 1
+                    continue
+                loop_var_o = mdo.group(1)
+                loop_var_i = m_ido.group(1)
+                rng_o = build_range(mdo.group(2), mdo.group(3), mdo.group(4))
+                rng_i = build_range(m_ido.group(2), m_ido.group(3), m_ido.group(4))
+                sug2d = maybe_loopnest_to_concurrent_or_forall(
+                    [loop_var_o, loop_var_i],
+                    [rng_o, rng_i],
+                    stmt_body2,
+                    allow_concurrent=allow_concurrent,
+                    allow_forall=allow_forall,
+                    array_names=array_names,
+                )
+                if sug2d is not None:
+                    suggestion, rule = sug2d
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule=rule,
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=suggestion,
+                        )
+                    )
+                    i += 5
+                    continue
         if i + 2 >= len(body):
             i += 1
             continue
@@ -6496,7 +7193,7 @@ def annotate_file(path: Path, findings: List[Finding], *, backup: bool = True) -
     """Insert begin/end markers and replacement comment around suggested blocks."""
     if not findings:
         return 0, None
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines = read_text_flexible(path).splitlines(keepends=True)
     inserted = 0
     for f in sorted(findings, key=lambda x: (x.start_line, x.end_line), reverse=True):
         if f.insert_only:
@@ -6505,8 +7202,10 @@ def annotate_file(path: Path, findings: List[Finding], *, backup: bool = True) -
         eidx = f.end_line - 1
         if sidx < 0 or eidx < 0 or sidx >= len(lines) or eidx >= len(lines) or sidx > eidx:
             continue
-        # Also include any immediate trailing continuation-only lines.
-        while eidx + 1 < len(lines) and is_continuation_only_line(lines[eidx + 1]):
+        # Also include physical continuation lines of this statement.
+        while eidx + 1 < len(lines) and (
+            has_trailing_continuation_amp(lines[eidx]) or is_continuation_only_line(lines[eidx + 1])
+        ):
             eidx += 1
         raw_s = lines[sidx]
         raw_e = lines[eidx]
@@ -6546,13 +7245,14 @@ def apply_fix_file(
     findings: List[Finding],
     *,
     annotate: bool = False,
+    annotate_removed: bool = False,
     out_path: Optional[Path] = None,
     create_backup: bool = True,
 ) -> Tuple[int, Optional[Path], List[str]]:
     """Replace suggested blocks with array-operation statements and prune unused locals."""
     if not findings:
         return 0, None, []
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines = read_text_flexible(path).splitlines(keepends=True)
     changed = 0
     replaced = 0
     for f in sorted(findings, key=lambda x: (x.start_line, x.end_line), reverse=True):
@@ -6570,18 +7270,33 @@ def apply_fix_file(
             lines.insert(sidx, warn_line)
             changed += 1
             continue
-        # Also include any immediate trailing continuation-only lines.
-        while eidx + 1 < len(lines) and is_continuation_only_line(lines[eidx + 1]):
+        # Also include physical continuation lines of this statement.
+        while eidx + 1 < len(lines) and (
+            has_trailing_continuation_amp(lines[eidx]) or is_continuation_only_line(lines[eidx + 1])
+        ):
             eidx += 1
         raw_s = lines[sidx]
         eol = "\r\n" if raw_s.endswith("\r\n") else ("\n" if raw_s.endswith("\n") else "\n")
         indent = re.match(r"^\s*", raw_s).group(0) if raw_s else ""
+        removed_lines: List[str] = []
+        if annotate_removed:
+            removed_lines.append(f"{indent}{REMOVED_BLOCK_BEGIN}{eol}")
+            for old_raw in lines[sidx : eidx + 1]:
+                old_body = old_raw.rstrip("\r\n")
+                removed_lines.append(f"{indent}! {old_body}{eol}")
+            removed_lines.append(f"{indent}{REMOVED_BLOCK_END}{eol}")
         sug_lines = f.suggestion.splitlines() if "\n" in f.suggestion else [f.suggestion]
         repl_lines: List[str] = []
-        for j, sl in enumerate(sug_lines):
-            suffix = f"  {CHANGED_TAG}" if (annotate and j == len(sug_lines) - 1) else ""
-            repl_lines.append(f"{indent}{sl}{suffix}{eol}")
-        lines[sidx : eidx + 1] = repl_lines
+        if annotate and len(sug_lines) > 1:
+            repl_lines.append(f"{indent}{CHANGED_BLOCK_BEGIN}{eol}")
+            for sl in sug_lines:
+                repl_lines.append(f"{indent}{sl}{eol}")
+            repl_lines.append(f"{indent}{CHANGED_BLOCK_END}{eol}")
+        else:
+            for j, sl in enumerate(sug_lines):
+                suffix = f"  {CHANGED_TAG}" if (annotate and j == len(sug_lines) - 1) else ""
+                repl_lines.append(f"{indent}{sl}{suffix}{eol}")
+        lines[sidx : eidx + 1] = [*removed_lines, *repl_lines]
         changed += 1
         replaced += 1
     if changed == 0:
@@ -6589,6 +7304,17 @@ def apply_fix_file(
     removed_locals: List[str] = []
     if replaced > 0:
         lines, removed_locals = remove_unused_locals_from_lines(lines, path)
+    # Remove stale xarray annotation artifacts from prior annotate runs so
+    # repeated fix/annotate cycles stay readable and idempotent.
+    cleaned: List[str] = []
+    for raw in lines:
+        low = raw.lower()
+        if BEGIN_TAG.lower() in low or END_TAG.lower() in low:
+            continue
+        if "suggested replacement by xarray.py" in low:
+            continue
+        cleaned.append(raw)
+    lines = cleaned
     backup: Optional[Path] = None
     target = out_path if out_path is not None else path
     # With explicit output path, do not create input backups.
@@ -6604,7 +7330,7 @@ def remove_redundant_allocates_via_xalloc_assign(path: Path) -> int:
     findings = xalloc_assign.analyze_file(path)
     if not findings:
         return 0
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines = read_text_flexible(path).splitlines(keepends=True)
     removed = 0
     by_alloc_line: Dict[int, xalloc_assign.Finding] = {}
     for f in findings:
@@ -6629,6 +7355,14 @@ def remove_redundant_allocates_via_xalloc_assign(path: Path) -> int:
 
 def inline_temps_via_xno_variable(path: Path) -> Tuple[int, int]:
     """Inline single-use temporaries using xno_variable logic on one file."""
+    def has_attached_comment(raw_lines: List[str], line_no: int) -> bool:
+        """Heuristic: treat trailing inline comments as attached to this line."""
+        if line_no < 1 or line_no > len(raw_lines):
+            return False
+        body = raw_lines[line_no - 1].rstrip("\r\n")
+        _code, comment = split_code_comment(body)
+        return bool(comment.strip())
+
     total_inline = 0
     total_decl_removed = 0
     # Run to fixed point: one pass may inline only one temp on a shared use line.
@@ -6636,9 +7370,17 @@ def inline_temps_via_xno_variable(path: Path) -> Tuple[int, int]:
         findings = xno_variable.analyze_file(path)
         if not findings:
             break
+        raw_lines = read_text_flexible(path).splitlines(keepends=True)
+        filtered: List[xno_variable.Finding] = []
+        for f in findings:
+            if has_attached_comment(raw_lines, f.assign_line) or has_attached_comment(raw_lines, f.use_line):
+                continue
+            filtered.append(f)
+        if not filtered:
+            break
         n_inline, n_decl_removed, _n_ann, _backup = xno_variable.apply_fix_file(
             path,
-            findings,
+            filtered,
             annotate=False,
             out_path=None,
             create_backup=False,
@@ -6650,12 +7392,214 @@ def inline_temps_via_xno_variable(path: Path) -> Tuple[int, int]:
     return total_inline, total_decl_removed
 
 
-def count_file_lines(path: Path) -> int:
-    """Return line count for a text file (best effort)."""
-    try:
-        return len(path.read_text(encoding="utf-8").splitlines())
-    except Exception:
+def relocate_section_comments(path: Path) -> int:
+    """Move standalone section comments to a more relevant nearby statement."""
+    lines = read_text_flexible(path).splitlines(keepends=True)
+    if not lines:
         return 0
+
+    stop = {
+        "a",
+        "an",
+        "and",
+        "by",
+        "compute",
+        "computed",
+        "create",
+        "de",
+        "for",
+        "from",
+        "in",
+        "is",
+        "of",
+        "set",
+        "the",
+        "to",
+        "values",
+        "with",
+    }
+    token_re = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+    search_window = 80
+    moved = 0
+
+    def is_comment_line(raw: str) -> bool:
+        return raw.lstrip().startswith("!")
+
+    def is_blank_line(raw: str) -> bool:
+        return not raw.strip()
+
+    def is_exec_line(raw: str) -> bool:
+        t, _comment = split_code_comment(raw)
+        t = t.strip()
+        return bool(t) and not t.startswith("!")
+
+    def comment_tokens(raw: str) -> List[str]:
+        txt = raw.lstrip()
+        while txt.startswith("!"):
+            txt = txt[1:]
+        out: List[str] = []
+        seen: Set[str] = set()
+        for m in token_re.finditer(txt.lower()):
+            tok = m.group(1)
+            if tok in stop:
+                continue
+            if tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+        return out
+
+    def stmt_score(stmt: str, toks: List[str]) -> int:
+        low = stmt.lower()
+        s = 0
+        for tok in toks:
+            if re.search(rf"\b{re.escape(tok)}\b", low):
+                s += 1
+        return s
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        if not is_comment_line(raw) or is_blank_line(raw):
+            i += 1
+            continue
+        # Keep xarray-generated audit/marker comments in place.
+        low_raw = raw.lower()
+        if (
+            "changed by xarray.py" in low_raw
+            or "removed by xarray.py" in low_raw
+            or "suggested replacement by xarray.py" in low_raw
+            or "begin block changed by xarray.py" in low_raw
+            or "end block changed by xarray.py" in low_raw
+            or "begin block removed by xarray.py" in low_raw
+            or "end block removed by xarray.py" in low_raw
+            or BEGIN_TAG.lower() in low_raw
+            or END_TAG.lower() in low_raw
+        ):
+            i += 1
+            continue
+
+        toks = comment_tokens(raw)
+        if len(toks) < 1:
+            i += 1
+            continue
+
+        next_exec = -1
+        j = i + 1
+        while j < len(lines):
+            if is_exec_line(lines[j]):
+                next_exec = j
+                break
+            j += 1
+        if next_exec < 0:
+            i += 1
+            continue
+
+        cur_stmt, _comment = split_code_comment(lines[next_exec])
+        cur_stmt = cur_stmt.strip()
+        cur_score = stmt_score(cur_stmt, toks)
+        best_idx = next_exec
+        best_score = cur_score
+
+        end = min(len(lines), i + 1 + search_window)
+        j = next_exec + 1
+        while j < end:
+            if not is_exec_line(lines[j]):
+                j += 1
+                continue
+            stmt_j, _comment = split_code_comment(lines[j])
+            s = stmt_score(stmt_j.strip(), toks)
+            if s > best_score:
+                best_score = s
+                best_idx = j
+            j += 1
+
+        # Move only when clearly better and sufficiently specific.
+        if best_idx > next_exec and best_score >= 2 and best_score > cur_score:
+            line = lines.pop(i)
+            insert_at = best_idx - 1
+            lines.insert(insert_at, line)
+            moved += 1
+            # Continue after the moved line.
+            i = insert_at + 1
+            continue
+
+        i += 1
+
+    if moved > 0:
+        path.write_text("".join(lines), encoding="utf-8")
+    return moved
+
+
+def count_file_lines(path: Path) -> int:
+    """Return LOC count excluding blank and comment-only lines."""
+    return fscan.count_loc(path, exclude_blank=True, exclude_comment=True)
+
+
+def print_summary_table(rows: List[Tuple[str, int, int, int]]) -> None:
+    """Print aligned LOC summary using shared helper."""
+    fscan.print_loc_summary_table(rows, source_col="source", blocks_col="blocks_rep")
+
+
+def compile_one_for_summary(source: Path, command: str, *, phase: str) -> bool:
+    """Compile one source using command template; return True on success.
+
+    On failure, print command and compiler diagnostics.
+    """
+    q = fbuild.quote_cmd_arg(str(source))
+    if "{file}" in command:
+        cmd = command.replace("{file}", q)
+    elif "{files}" in command:
+        cmd = command.replace("{files}", q)
+    else:
+        cmd = f"{command} {q}".strip()
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if proc.returncode == 0:
+        return True
+    print(f"Compile ({phase}): FAIL (exit {proc.returncode})")
+    print(f"  source: {source}")
+    print(f"  command: {cmd}")
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print(fbuild.format_linker_stderr(proc.stderr).rstrip())
+    return False
+
+
+def compute_compile_maps(
+    files: List[Path],
+    transformed_paths: Dict[Path, Path],
+    *,
+    do_compile_both: bool,
+    compiler_cmd: Optional[str],
+    did_fix: bool,
+    maxfail: Optional[int] = None,
+) -> Tuple[Optional[Dict[str, Optional[bool]]], Optional[Dict[str, Optional[bool]]]]:
+    """Build per-source compile status maps for summary output."""
+    if not do_compile_both:
+        return None, None
+    cmd = compiler_cmd or "gfortran -c -w -Wfatal-errors {file}"
+    old_map: Dict[str, Optional[bool]] = {}
+    new_map: Dict[str, Optional[bool]] = {}
+    regressions = 0
+    for p in files:
+        key = fscan.display_path(p)
+        ok_old = compile_one_for_summary(p, cmd, phase="old")
+        old_map[key] = ok_old
+        if did_fix:
+            tp = transformed_paths.get(p, p)
+            ok_new = compile_one_for_summary(tp, cmd, phase="new")
+            new_map[key] = ok_new
+            if ok_old and not ok_new:
+                regressions += 1
+                if maxfail is not None and regressions >= maxfail:
+                    print(
+                        f"Compile-both stopped at maxfail={maxfail} "
+                        f"(old compiled, new failed)."
+                    )
+                    break
+        else:
+            new_map[key] = ok_old
+    return old_map, new_map
 
 
 def compile_and_run_capture(
@@ -6724,6 +7668,7 @@ def main() -> int:
     parser.add_argument("fortran_files", type=Path, nargs="*")
     parser.add_argument("--exclude", action="append", default=[], help="Glob pattern to exclude files")
     parser.add_argument("--verbose", action="store_true", help="Print full replacement suggestions")
+    parser.add_argument("--progress", action="store_true", help="Print per-file progress while processing")
     parser.add_argument(
         "--summary",
         action="store_true",
@@ -6731,6 +7676,7 @@ def main() -> int:
     )
     parser.add_argument("--fix", action="store_true", help="Apply suggested replacements in-place")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--out-dir", type=Path, help="With --fix, write transformed outputs to this directory")
     parser.add_argument(
         "--tee",
         action="store_true",
@@ -6755,10 +7701,25 @@ def main() -> int:
     parser.add_argument("--quiet-run", action="store_true", help="Do not print program stdout/stderr on successful runs")
     parser.add_argument("--keep-exe", action="store_true", help="Keep generated executables after running")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
+    parser.add_argument(
+        "--annotate-removed",
+        action="store_true",
+        help="When fixing, keep removed source lines as comments above replacements",
+    )
     parser.add_argument("--diff", action="store_true", help="With --fix, print unified diffs for changed files")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
+    parser.add_argument(
+        "--compile-both",
+        action="store_true",
+        help="With --summary, add per-file compile_old/compile_new booleans",
+    )
+    parser.add_argument(
+        "--maxfail",
+        type=int,
+        help="With --compile-both, stop compile checks after N old-pass/new-fail cases",
+    )
     parser.add_argument("--limit", type=int, help="Maximum number of source files to process")
     parser.add_argument(
         "--concurrent",
@@ -6776,9 +7737,19 @@ def main() -> int:
         action="store_true",
         help="After xarray rewrites, run xno_variable-style temporary inlining post-pass",
     )
+    parser.add_argument(
+        "--aggressive",
+        action="store_true",
+        help="Enable more aggressive rewrites (e.g., collapse unrolled chunk loops to full-section assignments)",
+    )
     args = parser.parse_args()
+    global AGGRESSIVE_MODE
+    AGGRESSIVE_MODE = bool(args.aggressive)
     if args.limit is not None and args.limit < 1:
         print("--limit must be >= 1.")
+        return 2
+    if args.maxfail is not None and args.maxfail < 1:
+        print("--maxfail must be >= 1.")
         return 2
     if args.run_diff:
         args.run_both = True
@@ -6786,17 +7757,26 @@ def main() -> int:
         args.run = True
     if args.tee_both:
         args.tee = True
-    if args.tee and args.out is None:
+    if args.tee and args.out is None and args.out_dir is None:
         args.out = Path("temp.f90")
-    if args.run and args.out is None:
+    if args.run and args.out is None and args.out_dir is None:
         args.out = Path("temp.f90")
-    if args.out is not None:
+    if args.out is not None or args.out_dir is not None:
         args.fix = True
+    if args.out is not None and args.out_dir is not None:
+        print("Use only one of --out or --out-dir.")
+        return 2
     if args.diff and not args.fix:
         print("--diff requires --fix.")
         return 2
+    if args.annotate_removed and not args.fix:
+        print("--annotate-removed requires --fix.")
+        return 2
     if args.compiler and not args.fix:
         print("--compiler requires --fix.")
+        return 2
+    if args.maxfail is not None and not args.compile_both:
+        print("--maxfail requires --compile-both.")
         return 2
 
     files = choose_files(args.fortran_files, args.exclude)
@@ -6808,27 +7788,52 @@ def main() -> int:
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
         return 2
+    if args.out_dir is not None:
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print("--out-dir exists but is not a directory.")
+            return 2
+        args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.run and len(files) != 1:
         print("--run/--run-both require exactly one input source file.")
         return 2
     baseline_compile_paths = files
-    after_compile_paths = [args.out] if (args.fix and args.out is not None) else files
-    if args.fix and args.compiler:
+    if args.fix and args.out is not None:
+        after_compile_paths = [args.out]
+    elif args.fix and args.out_dir is not None:
+        after_compile_paths = [args.out_dir / p.name for p in files]
+    else:
+        after_compile_paths = files
+    if args.fix and args.compiler and not args.compile_both:
         if not fbuild.run_compiler_command(args.compiler, baseline_compile_paths, "baseline", fscan.display_path):
             return 5
 
     findings: List[Finding] = []
-    for p in files:
+    total_files = len(files)
+    for i_file, p in enumerate(files, start=1):
+        if args.progress:
+            print(f"[{i_file}/{total_files}] Analyze {p}")
+        base_findings = analyze_file(p)
         if args.concurrent or args.forall:
-            findings.extend(
-                analyze_file_concurrent_forall(
-                    p,
-                    allow_concurrent=args.concurrent,
-                    allow_forall=args.forall,
-                )
+            cf_findings = analyze_file_concurrent_forall(
+                p,
+                allow_concurrent=args.concurrent,
+                allow_forall=args.forall,
             )
+            # Prefer canonical array-operation rewrites.
+            # Concurrent/FORALL suggestions are fallback-only for loop ranges
+            # not already handled by the main analyzer.
+            base_keys = {
+                (f.path, f.unit_kind, f.unit_name, f.start_line, f.end_line)
+                for f in base_findings
+            }
+            findings.extend(base_findings)
+            for f in cf_findings:
+                k = (f.path, f.unit_kind, f.unit_name, f.start_line, f.end_line)
+                if k in base_keys:
+                    continue
+                findings.append(f)
         else:
-            findings.extend(analyze_file(p))
+            findings.extend(base_findings)
 
     by_file_candidates: Dict[Path, List[Finding]] = {}
     for f in findings:
@@ -6849,9 +7854,25 @@ def main() -> int:
         if args.run_diff:
             print("Run diff: SKIP (no transformations suggested)")
         if args.summary:
+            rows: List[Tuple[str, int, int, int]] = []
             for p in files:
                 before = pre_lines.get(p, 0)
-                print(f"{fscan.display_path(p)} 0 {before} {before} 0")
+                rows.append((fscan.display_path(p), before, before, 0))
+            compile_old_map, compile_new_map = compute_compile_maps(
+                files,
+                {},
+                do_compile_both=args.compile_both,
+                compiler_cmd=args.compiler,
+                did_fix=False,
+                maxfail=args.maxfail,
+            )
+            fscan.print_loc_summary_table(
+                rows,
+                source_col="source",
+                blocks_col="blocks_rep",
+                compile_old=compile_old_map,
+                compile_new=compile_new_map,
+            )
         else:
             print("No array-operation replacement candidates found.")
         return 0
@@ -6879,10 +7900,43 @@ def main() -> int:
         total_alloc_removed = 0
         total_post_inlined = 0
         total_post_decl_removed = 0
+        total_comments_relocated = 0
+        replaced_by_file: Dict[Path, int] = {}
+        transformed_by_file: Dict[Path, Path] = {}
         post_lines: Dict[Path, int] = {}
-        for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            out_path = args.out if args.out is not None else None
-            before = p.read_text(encoding="utf-8")
+        compile_old_map_run: Optional[Dict[str, Optional[bool]]] = {} if args.compile_both else None
+        compile_new_map_run: Optional[Dict[str, Optional[bool]]] = {} if args.compile_both else None
+        compile_cmd = args.compiler or "gfortran -c -w -Wfatal-errors {file}"
+        regressions = 0
+        stop_early = False
+        fix_files = sorted(by_file.keys(), key=lambda x: x.name.lower())
+        process_files = files if args.compile_both else fix_files
+        fix_total = len(process_files)
+        for i_fix, p in enumerate(process_files, start=1):
+            if stop_early:
+                break
+            if args.progress:
+                print(f"\n[{i_fix}/{fix_total}] Fix {p}")
+            out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
+            key = fscan.display_path(p)
+            if args.compile_both:
+                ok_old = compile_one_for_summary(p, compile_cmd, phase="old")
+                compile_old_map_run[key] = ok_old
+                if not ok_old:
+                    # Skip transformation/new compile for this source.
+                    compile_new_map_run[key] = None
+                    replaced_by_file[p] = 0
+                    transformed_by_file[p] = out_path if out_path is not None else p
+                    post_lines[p] = pre_lines.get(p, count_file_lines(p))
+                    continue
+            if p not in by_file:
+                replaced_by_file[p] = 0
+                transformed_by_file[p] = out_path if out_path is not None else p
+                post_lines[p] = pre_lines.get(p, count_file_lines(p))
+                if args.compile_both:
+                    compile_new_map_run[key] = compile_old_map_run.get(key)
+                continue
+            before = read_text_flexible(p)
             if out_path is not None and args.tee_both:
                 print(f"--- original: {p} ---")
                 print(before, end="")
@@ -6892,10 +7946,12 @@ def main() -> int:
                 p,
                 by_file[p],
                 annotate=args.annotate,
+                annotate_removed=args.annotate_removed,
                 out_path=out_path,
                 create_backup=args.backup,
             )
             total += n
+            replaced_by_file[p] = n
             if n > 0:
                 transformed_changed = True
                 touched += 1
@@ -6908,11 +7964,16 @@ def main() -> int:
                     n_post_inl, n_post_decl = inline_temps_via_xno_variable(target)
                     total_post_inlined += n_post_inl
                     total_post_decl_removed += n_post_decl
+                    n_comments = 0
+                    # Keep audit annotations stable and local.
+                    if not (args.annotate or args.annotate_removed):
+                        n_comments = relocate_section_comments(target)
+                        total_comments_relocated += n_comments
                 if out_path is not None:
                     print(f"\nFixed {p.name}: replaced {n} block(s), wrote {out_path}")
                     if args.tee:
                         print(f"--- transformed: {out_path} ---")
-                        print((out_path).read_text(encoding="utf-8"), end="")
+                        print(read_text_flexible(out_path), end="")
                 else:
                     print(f"\nFixed {p.name}: replaced {n} block(s), backup {backup.name if backup else '(none)'}")
                 if args.verbose and removed_locals:
@@ -6924,8 +7985,10 @@ def main() -> int:
                         f"  post-inline-temp: inlined {n_post_inl}, "
                         f"decl-entities removed {n_post_decl}"
                     )
+                if args.post_inline_temp and n_comments > 0:
+                    print(f"  relocated section comments: {n_comments}")
                 if args.diff:
-                    after = (out_path if out_path is not None else p).read_text(encoding="utf-8")
+                    after = read_text_flexible(out_path if out_path is not None else p)
                     diff_lines = difflib.unified_diff(
                         before.splitlines(),
                         after.splitlines(),
@@ -6941,10 +8004,22 @@ def main() -> int:
             elif out_path is not None and args.tee:
                 if args.tee_both:
                     print(f"--- transformed: {out_path} ---")
-                print((out_path).read_text(encoding="utf-8"), end="")
+                print(read_text_flexible(out_path), end="")
             target = out_path if out_path is not None else p
             transformed_target = target
+            transformed_by_file[p] = target
             post_lines[p] = count_file_lines(target)
+            if args.compile_both:
+                ok_new = compile_one_for_summary(target, compile_cmd, phase="new")
+                compile_new_map_run[key] = ok_new
+                if compile_old_map_run.get(key) and not ok_new:
+                    regressions += 1
+                    if args.maxfail is not None and regressions >= args.maxfail:
+                        print(
+                            f"Compile-both stopped at maxfail={args.maxfail} "
+                            f"(old compiled, new failed)."
+                        )
+                        stop_early = True
         summary = (
             f"\n--fix summary: files changed {touched}, replaced {total}, "
             f"allocates removed {total_alloc_removed}"
@@ -6952,15 +8027,36 @@ def main() -> int:
         if args.post_inline_temp:
             summary += (
                 f", post-inlined {total_post_inlined}, "
-                f"post decl-entities removed {total_post_decl_removed}"
+                f"post decl-entities removed {total_post_decl_removed}, "
+                f"comments relocated {total_comments_relocated}"
             )
         print(summary)
         if args.summary:
+            rows = []
             for p in files:
                 before_n = pre_lines.get(p, 0)
                 after_n = post_lines.get(p, before_n)
-                cand_n = len(by_file_candidates.get(p, []))
-                print(f"{fscan.display_path(p)} {cand_n} {before_n} {after_n} {after_n - before_n}")
+                blocks_n = replaced_by_file.get(p, 0)
+                rows.append((fscan.display_path(p), before_n, after_n, blocks_n))
+            if args.compile_both:
+                compile_old_map = compile_old_map_run
+                compile_new_map = compile_new_map_run
+            else:
+                compile_old_map, compile_new_map = compute_compile_maps(
+                    files,
+                    transformed_by_file,
+                    do_compile_both=False,
+                    compiler_cmd=args.compiler,
+                    did_fix=True,
+                    maxfail=args.maxfail,
+                )
+            fscan.print_loc_summary_table(
+                rows,
+                source_col="source",
+                blocks_col="blocks_rep",
+                compile_old=compile_old_map,
+                compile_new=compile_new_map,
+            )
     elif args.annotate:
         by_file = by_file_candidates
         total = 0
@@ -6977,17 +8073,48 @@ def main() -> int:
             post_lines[p] = count_file_lines(p)
         print(f"\n--annotate summary: files changed {touched}, inserted {total}")
         if args.summary:
+            rows = []
             for p in files:
                 before_n = pre_lines.get(p, 0)
                 after_n = post_lines.get(p, before_n)
-                cand_n = len(by_file_candidates.get(p, []))
-                print(f"{fscan.display_path(p)} {cand_n} {before_n} {after_n} {after_n - before_n}")
+                rows.append((fscan.display_path(p), before_n, after_n, 0))
+            compile_old_map, compile_new_map = compute_compile_maps(
+                files,
+                {},
+                do_compile_both=args.compile_both,
+                compiler_cmd=args.compiler,
+                did_fix=False,
+                maxfail=args.maxfail,
+            )
+            fscan.print_loc_summary_table(
+                rows,
+                source_col="source",
+                blocks_col="blocks_rep",
+                compile_old=compile_old_map,
+                compile_new=compile_new_map,
+            )
     elif args.summary:
+        rows = []
         for p in files:
             before_n = pre_lines.get(p, 0)
             cand_n = len(by_file_candidates.get(p, []))
-            print(f"{fscan.display_path(p)} {cand_n} {before_n} {before_n} 0")
-    if args.fix and args.compiler:
+            rows.append((fscan.display_path(p), before_n, before_n, cand_n))
+        compile_old_map, compile_new_map = compute_compile_maps(
+            files,
+            {},
+            do_compile_both=args.compile_both,
+            compiler_cmd=args.compiler,
+            did_fix=False,
+            maxfail=args.maxfail,
+        )
+        fscan.print_loc_summary_table(
+            rows,
+            source_col="source",
+            blocks_col="blocks_rep",
+            compile_old=compile_old_map,
+            compile_new=compile_new_map,
+        )
+    if args.fix and args.compiler and not args.compile_both:
         if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
             return 5
     if args.run_both:
