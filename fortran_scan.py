@@ -66,6 +66,83 @@ def display_path(path: Path) -> str:
     return path.name
 
 
+def read_text_flexible(path: Path) -> str:
+    """Read text with fallback encodings for legacy source files."""
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return path.read_text(encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def count_loc(
+    path: Path,
+    *,
+    exclude_blank: bool = True,
+    exclude_comment: bool = True,
+) -> int:
+    """Count lines of code in a source file with configurable exclusions."""
+    try:
+        text = read_text_flexible(path)
+    except Exception:
+        return 0
+    count = 0
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if exclude_blank and not stripped:
+            continue
+        code = strip_comment(raw).strip()
+        if exclude_comment and not code:
+            continue
+        count += 1
+    return count
+
+
+def print_loc_summary_table(
+    rows: List[Tuple[str, int, int, int]],
+    *,
+    source_col: str = "source",
+    blocks_col: str = "blocks_rep",
+    compile_old: Optional[Dict[str, Optional[bool]]] = None,
+    compile_new: Optional[Dict[str, Optional[bool]]] = None,
+) -> None:
+    """Print aligned LOC summary rows: source, old/new/diff/ratio, blocks."""
+    include_compile = (compile_old is not None) or (compile_new is not None)
+    headers = [source_col, "lines_old", "lines_new", "diff", "ratio", blocks_col]
+    if include_compile:
+        headers.extend(["compile_old", "compile_new"])
+    formatted: List[List[str]] = []
+    for src, old_loc, new_loc, blocks in rows:
+        diff = old_loc - new_loc
+        ratio = "inf" if new_loc == 0 else f"{(old_loc / new_loc):.2f}"
+        rec = [src, str(old_loc), str(new_loc), str(diff), ratio, str(blocks)]
+        if include_compile:
+            def _fmt(v: Optional[bool]) -> str:
+                if v is None:
+                    return "NA"
+                return "True" if v else "False"
+
+            rec.append(_fmt((compile_old or {}).get(src)))
+            rec.append(_fmt((compile_new or {}).get(src)))
+        formatted.append(rec)
+
+    widths = [len(h) for h in headers]
+    for r in formatted:
+        for i, cell in enumerate(r):
+            if len(cell) > widths[i]:
+                widths[i] = len(cell)
+
+    print("  ".join(headers[i].ljust(widths[i]) if i == 0 else headers[i].rjust(widths[i]) for i in range(len(headers))))
+    for r in formatted:
+        print(
+            "  ".join(
+                r[i].ljust(widths[i]) if i == 0 else r[i].rjust(widths[i])
+                for i in range(len(r))
+            )
+        )
+
+
 def apply_excludes(paths: Iterable[Path], exclude_patterns: Iterable[str]) -> List[Path]:
     """Filter paths by glob-style exclusion patterns."""
     pats = [p for p in exclude_patterns if p]
