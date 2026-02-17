@@ -64,7 +64,7 @@ class Candidate:
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve source files from args or current-directory defaults."""
     if args_files:
-        files = cpaths.expand_path_args(args_files)
+        files = cpaths.expand_source_inputs(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
@@ -1410,6 +1410,7 @@ def main() -> int:
         help="With --fix, also rewrite simple full rank-1 array DATA constants as PARAMETERs",
     )
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--out-dir", type=Path, help="With --fix, write transformed outputs to this directory")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
@@ -1427,17 +1428,20 @@ def main() -> int:
         args.run = True
     if args.tee_both:
         args.tee = True
-    if args.run and args.out is None:
-        args.out = Path("temp.f90")
-    if args.out is not None:
+    if args.out is not None or args.out_dir is not None:
         args.fix = True
+    if args.run and args.out is None and args.out_dir is None:
+        args.out = Path("temp.f90")
     if args.fix_arrays:
         args.fix = True
+    if args.out is not None and args.out_dir is not None:
+        print("Use only one of --out or --out-dir.")
+        return 2
     if args.compiler and not args.fix:
         print("--compiler requires --fix.")
         return 2
-    if args.tee and args.out is None:
-        print("--tee requires --out.")
+    if args.tee and args.out is None and args.out_dir is None:
+        print("--tee requires --out or --out-dir.")
         return 2
 
     files = choose_files(args.fortran_files, args.exclude)
@@ -1447,11 +1451,21 @@ def main() -> int:
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
         return 2
+    if args.out_dir is not None:
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print("--out-dir exists but is not a directory.")
+            return 2
+        args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.run and len(files) != 1:
         print("--run/--run-both/--run-diff require exactly one input source file.")
         return 2
     baseline_compile_paths = files
-    after_compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.out is not None:
+        after_compile_paths = [args.out]
+    elif args.fix and args.out_dir is not None:
+        after_compile_paths = [args.out_dir / p.name for p in files]
+    else:
+        after_compile_paths = files
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, baseline_compile_paths, "baseline", fscan.display_path):
             return 5
@@ -1484,22 +1498,23 @@ def main() -> int:
                 return 5
         if args.run_diff:
             print("Run diff: SKIP (no transformations suggested)")
-        if args.out is not None:
+        if args.out is not None or args.out_dir is not None:
             src = files[0]
-            if src.resolve() != args.out.resolve():
-                shutil.copy2(src, args.out)
+            target = args.out if args.out is not None else (args.out_dir / src.name)
+            if src.resolve() != target.resolve():
+                shutil.copy2(src, target)
             if args.tee:
-                txt = args.out.read_text(encoding="utf-8", errors="ignore")
+                txt = target.read_text(encoding="utf-8", errors="ignore")
                 if args.tee_both:
                     print(f"--- original: {src} ---")
                     print(src.read_text(encoding="utf-8", errors="ignore"), end="")
                     if not txt.endswith("\n"):
                         print("")
-                    print(f"--- transformed: {args.out} ---")
+                    print(f"--- transformed: {target} ---")
                 print(txt, end="")
                 if not txt.endswith("\n"):
                     print("")
-            print(f"No DATA-to-constant candidates found. Wrote unchanged output to {args.out}")
+            print(f"No DATA-to-constant candidates found. Wrote unchanged output to {target}")
             return 0
         print("No DATA-to-constant candidates found.")
         return 0
@@ -1529,7 +1544,7 @@ def main() -> int:
         decl_changed = 0
         data_removed = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
-            out_path = args.out if args.out is not None else None
+            out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
             old_text = p.read_text(encoding="utf-8", errors="ignore")
             if out_path is not None and args.tee_both:
                 print(f"--- original: {p} ---")
@@ -1601,11 +1616,12 @@ def main() -> int:
             f"\n--fix summary: files changed {touched}, declaration edits {decl_changed}, "
             f"data lines removed {data_removed}"
         )
-        if args.out is not None and touched == 0:
+        if (args.out is not None or args.out_dir is not None) and touched == 0:
             src = files[0]
-            if src.resolve() != args.out.resolve():
-                shutil.copy2(src, args.out)
-            print(f"No conservative fixes were applicable. Wrote unchanged output to {args.out}")
+            target = args.out if args.out is not None else (args.out_dir / src.name)
+            if src.resolve() != target.resolve():
+                shutil.copy2(src, target)
+            print(f"No conservative fixes were applicable. Wrote unchanged output to {target}")
         if args.fix and args.compiler:
             if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
                 return 5
