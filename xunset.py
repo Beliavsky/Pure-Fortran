@@ -42,6 +42,10 @@ CONTROL_BARRIER_RE = re.compile(
     r"^\s*(if\b|else\b|elseif\b|end\s+if\b|do\b|end\s+do\b|select\b|case\b|where\b|forall\b|cycle\b|exit\b|goto\b)",
     re.IGNORECASE,
 )
+IF_THEN_RE = re.compile(r"^\s*if\s*\(.*\)\s*then\b", re.IGNORECASE)
+ELSE_IF_RE = re.compile(r"^\s*else\s*if\s*\(.*\)\s*then\b", re.IGNORECASE)
+ELSE_RE = re.compile(r"^\s*else\b", re.IGNORECASE)
+END_IF_RE = re.compile(r"^\s*(end\s*if|endif)\b", re.IGNORECASE)
 CALL_RE = re.compile(r"^\s*call\b", re.IGNORECASE)
 DO_ITER_RE = re.compile(r"^\s*do\b(?:\s+\d+)?\s+([a-z][a-z0-9_]*)\s*=", re.IGNORECASE)
 ALLOCATE_RE = re.compile(r"^\s*allocate\s*\((.*)\)\s*$", re.IGNORECASE)
@@ -563,14 +567,111 @@ def collect_units(finfo: fscan.SourceFileInfo) -> List[Unit]:
 def extract_ident_reads(expr: str, tracked: Set[str]) -> List[str]:
     """Extract tracked identifiers referenced in an expression."""
     expr = strip_shape_inquiry_calls(expr)
+    implied_idx_vars = implied_do_index_vars(expr)
     out: List[str] = []
     seen: Set[str] = set()
     for m in IDENT_RE.finditer(expr.lower()):
         n = m.group(1).lower()
+        if n in implied_idx_vars:
+            continue
         if n in tracked and n not in seen:
             seen.add(n)
             out.append(n)
     return out
+
+
+def implied_do_index_vars(expr: str) -> Set[str]:
+    """Collect implied-DO index variable names used in array constructors."""
+    out: Set[str] = set()
+
+    def scan_payload(payload: str) -> None:
+        # In implied-DO controls, the index appears after a comma: "(..., i=...)"
+        for m in re.finditer(r",\s*([a-z][a-z0-9_]*)\s*=", payload, re.IGNORECASE):
+            out.add(m.group(1).lower())
+
+    s = expr
+    # Bracket constructors: [ ... ]
+    i = 0
+    while i < len(s):
+        if s[i] == "[":
+            depth = 1
+            j = i + 1
+            while j < len(s):
+                if s[j] == "[":
+                    depth += 1
+                elif s[j] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        scan_payload(s[i + 1 : j])
+                        i = j + 1
+                        break
+                j += 1
+            else:
+                break
+            continue
+        i += 1
+
+    # F77-style constructors: (/ ... /)
+    for m in re.finditer(r"\(/\s*(.*?)\s*/\)", s, re.IGNORECASE):
+        scan_payload(m.group(1))
+
+    return out
+
+
+def extract_if_condition(stmt: str) -> str:
+    """Extract condition text from an IF ... THEN statement."""
+    s = stmt.strip()
+    m = re.match(r"^\s*if\s*\(", s, re.IGNORECASE)
+    if not m:
+        return ""
+    i = m.end() - 1
+    depth = 0
+    in_single = False
+    in_double = False
+    for j in range(i, len(s)):
+        ch = s[j]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return s[i + 1 : j].strip()
+    return ""
+
+
+def split_one_line_if(stmt: str) -> Optional[Tuple[str, str]]:
+    """Split one-line IF statement into (condition, tail statement)."""
+    s = stmt.strip()
+    m = re.match(r"^\s*if\s*\(", s, re.IGNORECASE)
+    if not m:
+        return None
+    i = m.end() - 1
+    depth = 0
+    in_single = False
+    in_double = False
+    for j in range(i, len(s)):
+        ch = s[j]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    cond = s[i + 1 : j].strip()
+                    tail = s[j + 1 :].strip()
+                    if not tail or tail.lower().startswith("then"):
+                        return None
+                    return cond, tail
+    return None
 
 
 def extract_allocatable_reads(expr: str, allocatable_vars: Set[str]) -> List[str]:
@@ -751,6 +852,8 @@ def analyze_unit(unit: Unit) -> List[Issue]:
     known_set_elems: Dict[str, Set[Tuple[int, ...]]] = {}
     partial_unknown: Set[str] = set()
     unalloc_warned: Set[Tuple[int, str]] = set()
+    if_stack: List[Dict[str, object]] = []
+    conditional_unset_reason: Dict[str, str] = {}
 
     def warn_unallocated(var_name: str, line_no: int) -> None:
         key = (line_no, var_name)
@@ -768,6 +871,32 @@ def analyze_unit(unit: Unit) -> List[Issue]:
             )
         )
 
+    def warn_unset_read(var_name: str, line_no: int, stmt_text: str) -> None:
+        if var_name in allocatable_vars and var_name not in allocated_vars:
+            return
+        if var_name in defined:
+            return
+        if var_name in known_set_elems and var_name in array_shapes and var_name not in partial_unknown:
+            detail = missing_detail_for_var(var_name, array_shapes[var_name], known_set_elems[var_name], stmt_text)
+            if not detail:
+                return
+        else:
+            detail = "variable may be used before being set"
+            cond = conditional_unset_reason.get(var_name)
+            if cond:
+                detail = f"variable may be used before being set if condition ({cond}) not met"
+        kind = "INTENT(OUT) dummy" if var_name in intent_out else "variable"
+        issues.append(
+            Issue(
+                path=unit.path,
+                unit_kind=unit.kind,
+                unit_name=unit.name,
+                line=line_no,
+                var_name=var_name,
+                detail=detail if kind == "variable" else f"{kind} may be used before being set",
+            )
+        )
+
     # Dummies default: treat as defined except explicit INTENT(OUT).
     for d in unit.dummy_names:
         tracked.add(d)
@@ -776,6 +905,114 @@ def analyze_unit(unit: Unit) -> List[Issue]:
     for ln, stmt in unit.body:
         low = stmt.lower().strip()
         if not low:
+            continue
+
+        one_if = split_one_line_if(low)
+        if one_if is not None:
+            cond, tail = one_if
+            # Condition reads.
+            for n in extract_allocatable_reads(cond, allocatable_vars):
+                if n not in allocated_vars:
+                    warn_unallocated(n, ln)
+            for n in extract_ident_reads(cond, tracked):
+                warn_unset_read(n, ln, cond)
+
+            # Handle assignment tails with conditional-set reasoning.
+            m_tail_as = ASSIGN_RE.match(tail)
+            if m_tail_as:
+                lhs_text = tail.split("=", 1)[0].strip()
+                lhs_base = fscan.base_identifier(lhs_text) or ""
+                rhs = tail.split("=", 1)[1] if "=" in tail else ""
+                lhs_has_index = "(" in lhs_text and ")" in lhs_text
+
+                for n in extract_allocatable_reads(rhs, allocatable_vars):
+                    if n not in allocated_vars:
+                        warn_unallocated(n, ln)
+                for n in extract_allocatable_reads(lhs_text, allocatable_vars):
+                    if not lhs_has_index and n == lhs_base:
+                        continue
+                    if n not in allocated_vars:
+                        warn_unallocated(n, ln)
+
+                lhs_idx_reads = extract_ident_reads(lhs_text, tracked)
+                if lhs_base and lhs_base in lhs_idx_reads:
+                    lhs_idx_reads = [x for x in lhs_idx_reads if x != lhs_base]
+                reads = lhs_idx_reads + [x for x in extract_ident_reads(rhs, tracked) if x not in lhs_idx_reads]
+                for n in reads:
+                    warn_unset_read(n, ln, tail)
+
+                if lhs_base and lhs_base in tracked and not lhs_has_index and lhs_base not in defined:
+                    conditional_unset_reason[lhs_base] = cond
+            else:
+                # Non-assignment one-line IF tail: still process reads conservatively.
+                for n in extract_allocatable_reads(tail, allocatable_vars):
+                    if n not in allocated_vars:
+                        warn_unallocated(n, ln)
+                for n in extract_ident_reads(tail, tracked):
+                    warn_unset_read(n, ln, tail)
+            continue
+
+        if IF_THEN_RE.match(low):
+            for n in extract_allocatable_reads(low, allocatable_vars):
+                if n not in allocated_vars:
+                    warn_unallocated(n, ln)
+            for n in extract_ident_reads(low, tracked):
+                warn_unset_read(n, ln, low)
+            if_stack.append(
+                {
+                    "pre": set(defined),
+                    "branches": [],  # type: List[Set[str]]
+                    "has_else": False,
+                    "has_elseif": False,
+                    "cond": extract_if_condition(low),
+                }
+            )
+            continue
+
+        if ELSE_IF_RE.match(low):
+            if if_stack:
+                frame = if_stack[-1]
+                frame["branches"].append(set(defined))  # type: ignore[index]
+                frame["has_elseif"] = True
+                defined.clear()
+                defined.update(frame["pre"])  # type: ignore[arg-type]
+            for n in extract_allocatable_reads(low, allocatable_vars):
+                if n not in allocated_vars:
+                    warn_unallocated(n, ln)
+            for n in extract_ident_reads(low, tracked):
+                warn_unset_read(n, ln, low)
+            continue
+
+        if ELSE_RE.match(low) and not ELSE_IF_RE.match(low):
+            if if_stack:
+                frame = if_stack[-1]
+                frame["branches"].append(set(defined))  # type: ignore[index]
+                frame["has_else"] = True
+                defined.clear()
+                defined.update(frame["pre"])  # type: ignore[arg-type]
+            continue
+
+        if END_IF_RE.match(low):
+            if if_stack:
+                frame = if_stack.pop()
+                branches: List[Set[str]] = frame["branches"]  # type: ignore[assignment]
+                branches.append(set(defined))
+                pre_set: Set[str] = set(frame["pre"])  # type: ignore[arg-type]
+                # Simple IF(no else/elseif): remember vars defined only in THEN branch
+                # to enrich future unset-read diagnostics.
+                if not frame["has_else"] and not frame["has_elseif"] and branches:
+                    then_only = branches[0] - pre_set
+                    cond = str(frame.get("cond") or "").strip()
+                    if cond:
+                        for v in then_only:
+                            conditional_unset_reason[v] = cond
+                if not frame["has_else"]:  # type: ignore[index]
+                    branches.append(set(frame["pre"]))  # type: ignore[arg-type]
+                merged = set(branches[0]) if branches else set(frame["pre"])  # type: ignore[arg-type]
+                for b in branches[1:]:
+                    merged.intersection_update(b)
+                defined.clear()
+                defined.update(merged)
             continue
 
         if TYPE_DECL_RE.match(low):
@@ -789,6 +1026,7 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                 for n, init in decls.items():
                     if init:
                         defined.add(n)
+                        conditional_unset_reason.pop(n, None)
                         if n in array_shapes:
                             fp = full_shape_footprint(array_shapes[n])
                             if fp is not None:
@@ -886,6 +1124,7 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                 # allocate(x(...)) without source does not initialize element values.
                 if has_source and base and base in tracked:
                     defined.add(base)
+                    conditional_unset_reason.pop(base, None)
                     if base in array_shapes:
                         fp = full_shape_footprint(array_shapes[base])
                         if fp is not None:
@@ -1001,29 +1240,11 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                 lhs_idx_reads = [x for x in lhs_idx_reads if x != lhs_base]
             reads = lhs_idx_reads + [x for x in extract_ident_reads(rhs, tracked) if x not in lhs_idx_reads]
             for n in reads:
-                if n not in defined:
-                    if n in allocatable_vars and n not in allocated_vars:
-                        continue
-                    if n in known_set_elems and n in array_shapes and n not in partial_unknown:
-                        detail = missing_detail_for_var(n, array_shapes[n], known_set_elems[n], low)
-                        if not detail:
-                            continue
-                    else:
-                        detail = "variable may be used before being set"
-                    kind = "INTENT(OUT) dummy" if n in intent_out else "variable"
-                    issues.append(
-                        Issue(
-                            path=unit.path,
-                            unit_kind=unit.kind,
-                            unit_name=unit.name,
-                            line=ln,
-                            var_name=n,
-                            detail=detail if kind == "variable" else f"{kind} may be used before being set",
-                        )
-                    )
+                warn_unset_read(n, ln, low)
             # Indexed assignment (e.g. x(i)=...) does not prove whole variable initialized.
             if lhs_base and lhs_base in tracked and not lhs_has_index:
                 defined.add(lhs_base)
+                conditional_unset_reason.pop(lhs_base, None)
                 if lhs_base in allocatable_vars:
                     allocated_vars.add(lhs_base)
                 if lhs_base in array_shapes:
@@ -1052,27 +1273,26 @@ def analyze_unit(unit: Unit) -> List[Issue]:
                 warn_unallocated(n, ln)
         reads = extract_ident_reads(low, tracked)
         for n in reads:
-            if n not in defined:
-                if n in allocatable_vars and n not in allocated_vars:
-                    continue
-                if n in known_set_elems and n in array_shapes and n not in partial_unknown:
-                    detail = missing_detail_for_var(n, array_shapes[n], known_set_elems[n], low)
-                    if not detail:
-                        continue
-                else:
-                    detail = "variable may be used before being set"
-                kind = "INTENT(OUT) dummy" if n in intent_out else "variable"
-                issues.append(
-                    Issue(
-                        path=unit.path,
-                        unit_kind=unit.kind,
-                        unit_name=unit.name,
-                        line=ln,
-                        var_name=n,
-                        detail=detail if kind == "variable" else f"{kind} may be used before being set",
-                    )
-                )
+            warn_unset_read(n, ln, low)
     return issues
+
+
+def analyze_infos(infos: List[fscan.SourceFile]) -> List[Issue]:
+    """Analyze loaded sources and return all use-before-set issues."""
+    ordered_infos, _ = fscan.order_files_least_dependent(infos)
+    all_issues: List[Issue] = []
+    for finfo in ordered_infos:
+        for unit in collect_units(finfo):
+            all_issues.extend(analyze_unit(unit))
+    return all_issues
+
+
+def analyze_paths(paths: List[Path]) -> List[Issue]:
+    """Load and analyze source files by path."""
+    infos, _any_missing = fscan.load_source_files(paths)
+    if not infos:
+        return []
+    return analyze_infos(infos)
 
 
 def main() -> int:
@@ -1093,12 +1313,7 @@ def main() -> int:
     infos, any_missing = fscan.load_source_files(files)
     if not infos:
         return 2 if any_missing else 1
-    ordered_infos, _ = fscan.order_files_least_dependent(infos)
-
-    all_issues: List[Issue] = []
-    for finfo in ordered_infos:
-        for unit in collect_units(finfo):
-            all_issues.extend(analyze_unit(unit))
+    all_issues = analyze_infos(infos)
 
     if not all_issues:
         print("No possible use-before-set findings.")
