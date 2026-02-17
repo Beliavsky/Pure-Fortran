@@ -37,6 +37,7 @@ ASSIGN_RE = re.compile(
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 ACCESS_RE = re.compile(r"^\s*(public|private)\b(.*)$", re.IGNORECASE)
 CONTAINS_RE = re.compile(r"^\s*contains\b", re.IGNORECASE)
+CALL_STMT_RE = re.compile(r"^\s*call\s+([a-z][a-z0-9_]*)\s*(?:\((.*)\))?\s*$", re.IGNORECASE)
 
 
 @dataclass
@@ -81,7 +82,7 @@ class Issue:
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve source files from args or current-directory defaults."""
     if args_files:
-        files = cpaths.expand_path_args(args_files)
+        files = cpaths.expand_source_inputs(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
@@ -287,6 +288,78 @@ def extract_reads(stmt: str, tracked: Set[str]) -> List[str]:
     return out
 
 
+def add_unique(dst: List[str], src: List[str]) -> None:
+    """Append names from src into dst preserving first-seen order."""
+    have = set(dst)
+    for n in src:
+        if n not in have:
+            dst.append(n)
+            have.add(n)
+
+
+def call_reads_writes(stmt: str, tracked: Set[str]) -> Tuple[List[str], List[str], bool]:
+    """Return (reads, writes, handled) for CALL statements, with intrinsic special-cases."""
+    m = CALL_STMT_RE.match(stmt.strip())
+    if not m:
+        return [], [], False
+    callee = m.group(1).lower()
+    arg_text = (m.group(2) or "").strip()
+    chunks = split_top_level_commas(arg_text) if arg_text else []
+    reads: List[str] = []
+    writes: List[str] = []
+
+    if callee == "random_number":
+        target_expr = ""
+        for i, chunk in enumerate(chunks):
+            t = chunk.strip()
+            if not t:
+                continue
+            if "=" in t and "=>" not in t:
+                k, v = t.split("=", 1)
+                if k.strip().lower() == "harvest":
+                    target_expr = v.strip()
+                else:
+                    add_unique(reads, extract_reads(v, tracked))
+            elif i == 0 and not target_expr:
+                target_expr = t
+            else:
+                add_unique(reads, extract_reads(t, tracked))
+        if target_expr:
+            base = fscan.base_identifier(target_expr) or ""
+            idx_reads = extract_reads(target_expr, tracked)
+            if base:
+                idx_reads = [x for x in idx_reads if x != base]
+            add_unique(reads, idx_reads)
+            if base in tracked and base not in writes:
+                writes.append(base)
+        return reads, writes, True
+
+    if callee == "random_seed":
+        for chunk in chunks:
+            t = chunk.strip()
+            if not t:
+                continue
+            if "=" in t and "=>" not in t:
+                k, v = t.split("=", 1)
+                key = k.strip().lower()
+                val = v.strip()
+                base = fscan.base_identifier(val) or ""
+                if key in {"size", "get"} and base in tracked:
+                    if base not in writes:
+                        writes.append(base)
+                elif key == "put":
+                    add_unique(reads, extract_reads(val, tracked))
+                else:
+                    add_unique(reads, extract_reads(val, tracked))
+            else:
+                add_unique(reads, extract_reads(t, tracked))
+        return reads, writes, True
+
+    # Generic CALL: treat actual arguments conservatively as reads.
+    add_unique(reads, extract_reads(stmt, tracked))
+    return reads, writes, True
+
+
 def analyze_unit(unit: Unit) -> List[Issue]:
     """Find locals/constants written but never read in a unit body."""
     issues: List[Issue] = []
@@ -332,6 +405,15 @@ def analyze_unit(unit: Unit) -> List[Issue]:
             if lhs_base in tracked:
                 writes.add(lhs_base)
                 decl_line.setdefault(lhs_base, ln)
+            continue
+
+        call_r, call_w, handled_call = call_reads_writes(low, tracked)
+        if handled_call:
+            for n in call_r:
+                reads.add(n)
+            for n in call_w:
+                writes.add(n)
+                decl_line.setdefault(n, ln)
             continue
 
         for n in extract_reads(low, tracked):
@@ -448,6 +530,17 @@ def analyze_unit_dead_stores(unit: Unit) -> List[Issue]:
                 if prev_ln is not None:
                     emit_issue(prev_ln, lhs_base, "assigned value is overwritten before being read")
                 state[lhs_base] = ln
+            return
+
+        call_r, call_w, handled_call = call_reads_writes(low, tracked)
+        if handled_call:
+            consume_reads(state, call_r)
+            for n in call_w:
+                if n in tracked and n not in skip:
+                    prev_ln = state.get(n)
+                    if prev_ln is not None:
+                        emit_issue(prev_ln, n, "assigned value is overwritten before being read")
+                    state[n] = ln
             return
 
         consume_reads(state, extract_reads(low, tracked))
@@ -622,6 +715,14 @@ def build_fix_actions_for_unit(unit: Unit) -> Tuple[Dict[int, Set[str]], Set[int
                 write_lines_by_name.setdefault(lhs_base, set()).add(ln)
                 if can_remove_assignment(low, lhs_base):
                     removable_write_lines_by_name.setdefault(lhs_base, set()).add(ln)
+            continue
+        call_r, call_w, handled_call = call_reads_writes(low, tracked)
+        if handled_call:
+            reads.update(call_r)
+            for n in call_w:
+                if n in tracked:
+                    writes.add(n)
+                    write_lines_by_name.setdefault(n, set()).add(ln)
             continue
         reads.update(extract_reads(low, tracked))
 
@@ -827,12 +928,16 @@ def main() -> int:
         help="Also warn about likely dead-store assignments (advisory)",
     )
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--out-dir", type=Path, help="With --fix, write outputs to this directory")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--diff", action="store_true")
     parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
-    if args.out is not None:
+    if args.out is not None and args.out_dir is not None:
+        print("--out and --out-dir are mutually exclusive.")
+        return 2
+    if args.out is not None or args.out_dir is not None:
         args.fix = True
     if args.compiler and not args.fix:
         print("--compiler requires --fix.")
@@ -842,10 +947,22 @@ def main() -> int:
     if not files:
         print("No source files remain after applying --exclude filters.")
         return 2
+    if args.out_dir is not None:
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print("--out-dir exists but is not a directory.")
+            return 2
+        args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
         return 2
-    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.out_dir is not None:
+        for p in files:
+            (args.out_dir / p.name).write_text(p.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+    compile_paths = (
+        [args.out]
+        if (args.fix and args.out is not None)
+        else ([args.out_dir / p.name for p in files] if (args.fix and args.out_dir is not None) else files)
+    )
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
             return 5
@@ -905,7 +1022,7 @@ def main() -> int:
 
         total_changes = 0
         for p in sorted({*per_file_decl_actions.keys(), *per_file_remove_assign.keys()}, key=lambda x: x.name.lower()):
-            out_path = args.out if args.out is not None else None
+            out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
             c, _bak = apply_fix(
                 p,
                 per_file_decl_actions.get(p, {}),
