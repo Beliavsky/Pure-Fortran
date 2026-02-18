@@ -1,6 +1,7 @@
 # Pure-Fortran
 
-Pure-Fortran is a set of conservative Python tools that help modernize and tighten Fortran codebases by adding:
+Pure-Fortran is a set of Python tools written by Codex and prompted and tested by
+me that help modernize and tighten Fortran codebases by adding:
 
 - `INTENT(...)` on dummy arguments
 - `PURE` / `ELEMENTAL` on procedures
@@ -74,11 +75,16 @@ Main programs:
 - `xdata.py` - advisory checker/fixer for `DATA`-initialized variables that can be promoted to named constants.
 - `xdep.py` - dependency resolver/build helper for main-program source sets via `use`-module graph analysis.
 - `xdp.py` - advisory checker/fixer to migrate default `real` usage toward a chosen kind parameter (for example `dp`).
+- `xformat_mismatch.py` - advisory checker for likely type/descriptor mismatches in `print`/`write` format usage.
 - `xformat_statement.py` - advisory checker/fixer replacing labeled `FORMAT` statements with inline or named format strings.
 - `xgoto.py` - advisory checker/fixer for reducible `goto` patterns, with extraction/report utilities for remaining goto-heavy code.
+- `xinit.py` - advisory checker/fixer to add explicit variable initialization (with configurable sentinels/NaN and uncertain-only mode).
 - `xloop.py` - advisory checker/fixer for labeled DO termination modernization (`do label ...` to `end do` forms).
 - `xmodularize.py` - transforms external-procedure program sets to module-based layout and updates main-program `use` lists.
+- `xoptional.py` - advisory checker for optional-dummy arguments that may be used without guaranteed `present(...)` guards.
+- `xproc_index.py` - procedure index/report tool listing discovered procedure names and duplicate definitions across file sets.
 - `xselect.py` - advisory checker/fixer to rewrite eligible IF/ELSEIF chains as `select case` (including ranges/sets).
+- `xsubroutine.py` - extracts marked code blocks (or auto-selected loops) into new module procedures, with argument/local inference, optional function extraction, and compile/run validation modes.
 - `xsort_size.py` - sort a file list (such as `codes.txt`) by source file size.
 - `xoptions.py` - list option counts and option names for `x*.py` scripts.
 - `xrepeat.py` - utility helper for repeated harness execution workflows.
