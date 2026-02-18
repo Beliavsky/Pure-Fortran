@@ -116,7 +116,7 @@ Before:
 do i = 1, ni
    do j = 1, nj
       do k = 1, nk
-         a(i,j,k) = b(i,j,k) + c(i,j,k)
+         a(i,j,k) = real(i + 2 * j + 3 * k, kind = rk)
       end do
    end do
 end do
@@ -125,7 +125,7 @@ end do
 After:
 ```fortran
 do concurrent (i = 1:ni, j = 1:nj, k = 1:nk)
-   a(i,j,k) = b(i,j,k) + c(i,j,k)
+   a(i,j,k) = real(i + 2 * j + 3 * k, kind = rk)
 end do
 ```
 
