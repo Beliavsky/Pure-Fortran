@@ -45,7 +45,7 @@ class Finding:
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     if args_files:
-        files = cpaths.expand_path_args(args_files)
+        files = cpaths.expand_source_inputs(args_files)
     else:
         files = sorted(set(Path('.').glob('*.f90')) | set(Path('.').glob('*.F90')), key=lambda p: p.name.lower())
     return fscan.apply_excludes(files, exclude)
@@ -328,13 +328,17 @@ def main() -> int:
     parser.add_argument('--verbose', action='store_true', help='Print full suggestions')
     parser.add_argument('--fix', action='store_true', help='Apply rewrites in-place')
     parser.add_argument('--out', type=Path, help='With --fix, write transformed output to this file (single input)')
+    parser.add_argument('--out-dir', type=Path, help='With --fix, write outputs to this directory')
     parser.add_argument('--backup', dest='backup', action='store_true', default=True)
     parser.add_argument('--no-backup', dest='backup', action='store_false')
     parser.add_argument('--annotate', action='store_true', help='Insert suggestion comments (or changed tag with --fix)')
     parser.add_argument('--diff', '-diff', action='store_true', help='With --fix, print unified diffs')
     parser.add_argument('--compiler', type=str, help='Compile command for baseline/after-fix validation')
     args = parser.parse_args()
-    if args.out is not None:
+    if args.out is not None and args.out_dir is not None:
+        print('--out and --out-dir are mutually exclusive.')
+        return 2
+    if args.out is not None or args.out_dir is not None:
         args.fix = True
 
     if args.diff and not args.fix:
@@ -348,10 +352,22 @@ def main() -> int:
     if not files:
         print('No source files remain after applying --exclude filters.')
         return 2
+    if args.out_dir is not None:
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print('--out-dir exists but is not a directory.')
+            return 2
+        args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.out is not None and len(files) != 1:
         print('--out requires exactly one input source file.')
         return 2
-    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.out_dir is not None:
+        for p in files:
+            (args.out_dir / p.name).write_text(p.read_text(encoding='utf-8'), encoding='utf-8')
+    compile_paths = (
+        [args.out]
+        if (args.fix and args.out is not None)
+        else ([args.out_dir / p.name for p in files] if (args.fix and args.out_dir is not None) else files)
+    )
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
             return 5
@@ -382,7 +398,7 @@ def main() -> int:
         total = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding='utf-8')
-            out_path = args.out if args.out is not None else None
+            out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
             n, backup = apply_fix(
                 p, by_file[p], annotate=args.annotate, out_path=out_path, create_backup=args.backup
             )

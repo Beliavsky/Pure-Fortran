@@ -90,7 +90,7 @@ def has_nonparam_dp_symbol_decl(stmt: str) -> bool:
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve input sources; default to *.f90 in cwd."""
     if args_files:
-        files = cpaths.expand_path_args(args_files)
+        files = cpaths.expand_source_inputs(args_files)
     else:
         files = sorted(
             set(Path(".").glob("*.f90")) | set(Path(".").glob("*.F90")),
@@ -975,6 +975,7 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="Print suggested rewritten lines")
     parser.add_argument("--fix", action="store_true", help="Rewrite default real declarations/literals to dp")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--out-dir", type=Path, help="With --fix, write transformed outputs to this directory")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--annotate", action="store_true", help="Insert suggestion comments (or changed tags with --fix)")
@@ -1000,18 +1001,21 @@ def main() -> int:
         args.run = True
     if args.tee_both:
         args.tee = True
-    if args.run and args.out is None:
-        args.out = Path("temp.f90")
-    if args.out is not None:
+    if args.out is not None or args.out_dir is not None:
         args.fix = True
+    if args.run and args.out is None and args.out_dir is None:
+        args.out = Path("temp.f90")
+    if args.out is not None and args.out_dir is not None:
+        print("Use only one of --out or --out-dir.")
+        return 2
     if args.diff and not args.fix:
         print("--diff requires --fix.")
         return 2
     if args.compiler and not args.fix:
         print("--compiler requires --fix.")
         return 2
-    if args.tee and args.out is None:
-        print("--tee requires --out.")
+    if args.tee and args.out is None and args.out_dir is None:
+        print("--tee requires --out or --out-dir.")
         return 2
     if not args.dp or not args.dp.strip():
         print("--dp must be a non-empty expression, e.g. --dp \"kind(1.0d0)\".")
@@ -1026,11 +1030,21 @@ def main() -> int:
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
         return 2
+    if args.out_dir is not None:
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print("--out-dir exists but is not a directory.")
+            return 2
+        args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.run and len(files) != 1:
         print("--run/--run-both/--run-diff require exactly one input source file.")
         return 2
 
-    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.out is not None:
+        compile_paths = [args.out]
+    elif args.fix and args.out_dir is not None:
+        compile_paths = [args.out_dir / p.name for p in files]
+    else:
+        compile_paths = files
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, files, "baseline", fscan.display_path):
             return 5
@@ -1064,22 +1078,23 @@ def main() -> int:
                 return 5
         if args.run_diff:
             print("Run diff: SKIP (no transformations suggested)")
-        if args.out is not None:
+        if args.out is not None or args.out_dir is not None:
             src = files[0]
-            if src.resolve() != args.out.resolve():
-                shutil.copy2(src, args.out)
+            target = args.out if args.out is not None else (args.out_dir / src.name)
+            if src.resolve() != target.resolve():
+                shutil.copy2(src, target)
             if args.tee:
-                txt = args.out.read_text(encoding="utf-8", errors="ignore")
+                txt = target.read_text(encoding="utf-8", errors="ignore")
                 if args.tee_both:
                     print(f"--- original: {src} ---")
                     print(src.read_text(encoding="utf-8", errors="ignore"), end="")
                     if not txt.endswith("\n"):
                         print("")
-                    print(f"--- transformed: {args.out} ---")
+                    print(f"--- transformed: {target} ---")
                 print(txt, end="")
                 if not txt.endswith("\n"):
                     print("")
-            print(f"No dp rewrite candidates found. Wrote unchanged output to {args.out}")
+            print(f"No dp rewrite candidates found. Wrote unchanged output to {target}")
             return 0
         print("No dp rewrite candidates found.")
         return 0
@@ -1102,7 +1117,7 @@ def main() -> int:
         total = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding="utf-8", errors="ignore")
-            out_path = args.out if args.out is not None else None
+            out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
             if out_path is not None and args.tee_both:
                 print(f"--- original: {p} ---")
                 print(before, end="")

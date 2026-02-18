@@ -339,6 +339,7 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="Print full original body and suggestion")
     parser.add_argument("--fix", action="store_true", help="Rewrite matching 3-line IF blocks to one-line IF")
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
+    parser.add_argument("--out-dir", type=Path, help="With --fix, write transformed outputs to this directory")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
     parser.add_argument("--annotate", action="store_true", help="Insert suggested one-line IF comments")
@@ -346,8 +347,11 @@ def main() -> int:
     parser.add_argument("--reverse", action="store_true", help="Operate in reverse: one-line IF -> 3-line IF block")
     parser.add_argument("--compiler", type=str, help="Compile command for baseline/after-fix validation")
     args = parser.parse_args()
-    if args.out is not None:
+    if args.out is not None or args.out_dir is not None:
         args.fix = True
+    if args.out is not None and args.out_dir is not None:
+        print("Use only one of --out or --out-dir.")
+        return 2
 
     if args.diff and not (args.fix or args.annotate):
         print("--diff requires --fix or --annotate.")
@@ -366,7 +370,12 @@ def main() -> int:
     if args.out is not None and len(files) != 1:
         print("--out requires exactly one input source file.")
         return 2
-    compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.out_dir is not None:
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print("--out-dir exists but is not a directory.")
+            return 2
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+    compile_paths = [args.out] if (args.fix and args.out is not None) else ([args.out_dir / p.name for p in files] if (args.fix and args.out_dir is not None) else files)
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, compile_paths, "baseline", fscan.display_path):
             return 5
@@ -397,7 +406,7 @@ def main() -> int:
             touched = 0
             for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
                 before = p.read_text(encoding="utf-8")
-                out_path = args.out if args.out is not None else None
+                out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
                 ch, rem, backup = apply_edits(
                     p,
                     by_file[p],
@@ -465,7 +474,7 @@ def main() -> int:
         touched = 0
         for p in sorted(by_file.keys(), key=lambda x: x.name.lower()):
             before = p.read_text(encoding="utf-8")
-            out_path = args.out if args.out is not None else None
+            out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
             ch, ins, backup = apply_reverse_edits(
                 p,
                 by_file[p],

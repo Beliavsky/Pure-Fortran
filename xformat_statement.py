@@ -935,6 +935,7 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--fix", action="store_true", help="Apply fixes in place.")
     ap.add_argument("--out", type=Path, help="Write fixed output to separate file (single input file only).")
+    ap.add_argument("--out-dir", type=Path, help="With --fix, write transformed outputs to this directory.")
     ap.add_argument(
         "--style",
         choices=["auto", "const", "inline"],
@@ -962,18 +963,15 @@ def main() -> int:
         args.run = True
     if args.tee_both:
         args.tee = True
-    if args.run and args.out is None:
-        args.out = Path("temp.f90")
-    if args.out is not None:
+    if args.out is not None or args.out_dir is not None:
         args.fix = True
-    if args.out is not None and len(args.files) != 1:
-        print("--out supports exactly one input file.")
+    if args.run and args.out is None and args.out_dir is None:
+        args.out = Path("temp.f90")
+    if args.out is not None and args.out_dir is not None:
+        print("Use only one of --out or --out-dir.")
         return 2
-    if args.tee and args.out is None:
-        print("--tee requires --out.")
-        return 2
-    if args.run and len(args.files) != 1:
-        print("--run/--run-both/--run-diff require exactly one input file.")
+    if args.tee and args.out is None and args.out_dir is None:
+        print("--tee requires --out or --out-dir.")
         return 2
     if args.diff and not args.fix:
         print("--diff requires --fix.")
@@ -991,9 +989,25 @@ def main() -> int:
             print("--limit must be >= 1.")
             return 2
         files = files[: args.limit]
+    if args.out is not None and len(files) != 1:
+        print("--out supports exactly one input file.")
+        return 2
+    if args.out_dir is not None:
+        if args.out_dir.exists() and not args.out_dir.is_dir():
+            print("--out-dir exists but is not a directory.")
+            return 2
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+    if args.run and len(files) != 1:
+        print("--run/--run-both/--run-diff require exactly one input file.")
+        return 2
 
     baseline_compile_paths = files
-    after_compile_paths = [args.out] if (args.fix and args.out is not None) else files
+    if args.fix and args.out is not None:
+        after_compile_paths = [args.out]
+    elif args.fix and args.out_dir is not None:
+        after_compile_paths = [args.out_dir / p.name for p in files]
+    else:
+        after_compile_paths = files
     if args.fix and args.compiler:
         if not fbuild.run_compiler_command(args.compiler, baseline_compile_paths, "baseline", fscan.display_path):
             return 5
@@ -1047,7 +1061,7 @@ def main() -> int:
         if not rewrites and not const_decls and not remove_lines:
             continue
         old_text = p.read_text(encoding="utf-8", errors="ignore")
-        out_path = args.out if args.out is not None else None
+        out_path = args.out if args.out is not None else (args.out_dir / p.name if args.out_dir is not None else None)
         if out_path is not None and args.tee_both:
             print(f"--- original: {p} ---")
             print(old_text, end="")
@@ -1093,7 +1107,7 @@ def main() -> int:
     if args.compiler and changed_files:
         ok = fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path)
         if not ok:
-            if args.out is None:
+            if args.out is None and args.out_dir is None:
                 fbuild.rollback_backups(backup_pairs, fscan.display_path)
             return 5
 

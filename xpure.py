@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cli_paths as cpaths
+from fortran_semantics import has_stop_without_error_stop
 
 PROC_START_RE = re.compile(
     r"^\s*(?P<lead>(?:(?:double\s+precision|integer|real|logical|complex|character\b(?:\s*\([^)]*\))?"
@@ -741,8 +742,7 @@ def analyze_lines(
                                     reasons.append(
                                         f"line {ln}: internal WRITE target '{unit_base}' is non-local"
                                     )
-            stop_check = ERROR_STOP_RE.sub("", low)
-            if STOP_RE.search(stop_check):
+            if has_stop_without_error_stop(low):
                 reasons.append(f"line {ln}: STOP statement")
 
             for intr in IMPURE_INTRINSICS:
