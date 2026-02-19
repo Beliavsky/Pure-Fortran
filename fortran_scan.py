@@ -320,6 +320,61 @@ def iter_fortran_statements(lines: Iterable[str]) -> List[Tuple[int, str]]:
     return out
 
 
+def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
+    """Indent Fortran control blocks (do/if/select/case/block) consistently.
+
+    This is a lightweight, line-based indenter intended for generated code.
+    It keeps blank lines and re-indents code/comment lines according to
+    surrounding control-flow nesting.
+    """
+    lines = text.splitlines()
+    out: List[str] = []
+    level = 0
+    step = " " * max(0, indent_step)
+
+    dedent_before = re.compile(
+        r"^\s*(?:"
+        r"end\s+(?:do|if|select|block|associate|where)"
+        r"|else(?:\s+if\b.*\bthen)?"
+        r"|case\b(?:\s+default|\s*\()?"
+        r")\b",
+        re.IGNORECASE,
+    )
+    indent_after = re.compile(
+        r"^\s*(?:"
+        r"do\b"
+        r"|if\b.*\bthen\b\s*$"
+        r"|select\s+case\b"
+        r"|block\b"
+        r"|else(?:\s+if\b.*\bthen)?\b"
+        r"|case\b(?:\s+default|\s*\()?"
+        r")",
+        re.IGNORECASE,
+    )
+
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped:
+            out.append("")
+            continue
+
+        code = strip_comment(raw).strip()
+        if code and dedent_before.match(code):
+            level = max(0, level - 1)
+
+        out.append(f"{step * level}{stripped}")
+
+        if code and indent_after.match(code):
+            # Exclude one-line IF from opening a new block unless it ends with THEN.
+            if re.match(r"^\s*if\b", code, re.IGNORECASE) and not re.search(r"\bthen\s*$", code, re.IGNORECASE):
+                continue
+            # END lines already handled as dedent-only.
+            if not re.match(r"^\s*end\b", code, re.IGNORECASE):
+                level += 1
+
+    return "\n".join(out) + ("\n" if text.endswith("\n") or out else "")
+
+
 def split_statements_to_lines(lines: Iterable[str]) -> List[str]:
     """Expand semicolon-delimited statements so each returned item is one statement."""
     out: List[str] = []
