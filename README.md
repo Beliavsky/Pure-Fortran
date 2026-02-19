@@ -863,6 +863,7 @@ python xc2f.py foo.c
 python xc2f.py xfactors.c --out xfactors.f90
 python xc2f.py xmatmul.c --out xmatmul.f90
 ```
+The C directory has examples of C codes and their translations.
 
 Notes:
 
