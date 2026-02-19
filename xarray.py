@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import math
 import re
 import shutil
 import subprocess
+import tempfile
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -19,8 +22,9 @@ import xalloc_assign
 import xno_variable
 import xunset
 
+_DO_EXPR = r"(?:[^(),]|\([^()]*\))+"
 DO_RE = re.compile(
-    r"^\s*do\s+([a-z][a-z0-9_]*)\s*=\s*([^,]+?)\s*,\s*([^,]+?)(?:\s*,\s*([^,]+?))?\s*$",
+    rf"^\s*do\s+([a-z][a-z0-9_]*)\s*=\s*({_DO_EXPR})\s*,\s*({_DO_EXPR})(?:\s*,\s*({_DO_EXPR}))?\s*$",
     re.IGNORECASE,
 )
 END_DO_RE = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
@@ -148,13 +152,23 @@ ELEMENTAL_INTRINSICS = {
     "min",
     "mod",
     "modulo",
+    "norm2",
     "nint",
     "real",
+    "reshape",
     "sign",
     "sin",
     "sind",
     "sinh",
+    "size",
+    "lbound",
+    "ubound",
+    "shape",
+    "rank",
+    "kind",
     "spacing",
+    "spread",
+    "matmul",
     "sqrt",
     "tan",
     "tand",
@@ -168,6 +182,7 @@ USER_ELEMENTAL_SUBROUTINES: Set[str] = set()
 
 
 LETTER_RANGE_TOKEN_RE = re.compile(r"\[([a-zA-Z\*]?):([a-zA-Z\*]?)\]")
+NUM_TOKEN_RE = re.compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+-]?\d+)?")
 
 
 def translate_single_letter_range_glob(raw: str) -> str:
@@ -214,6 +229,40 @@ def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
             key=lambda p: p.name.lower(),
         )
     return fscan.apply_excludes(files, exclude)
+
+
+def outputs_match_tolerant(
+    a: str,
+    b: str,
+    *,
+    rtol: float = 1.0e-6,
+    atol: float = 1.0e-9,
+) -> bool:
+    """Compare output text allowing tiny floating-point formatting/roundoff drift."""
+    if a == b:
+        return True
+    a_txt = a.rstrip()
+    b_txt = b.rstrip()
+    if a_txt == b_txt:
+        return True
+    # Non-numeric parts must match exactly for conservative behavior.
+    a_non = NUM_TOKEN_RE.sub("#", a_txt)
+    b_non = NUM_TOKEN_RE.sub("#", b_txt)
+    if a_non != b_non:
+        return False
+    a_nums = NUM_TOKEN_RE.findall(a_txt)
+    b_nums = NUM_TOKEN_RE.findall(b_txt)
+    if len(a_nums) != len(b_nums):
+        return False
+    try:
+        for xa, xb in zip(a_nums, b_nums):
+            va = float(xa.replace("d", "e").replace("D", "E"))
+            vb = float(xb.replace("d", "e").replace("D", "E"))
+            if not math.isclose(va, vb, rel_tol=rtol, abs_tol=atol):
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def make_backup_path(path: Path) -> Path:
@@ -413,6 +462,42 @@ def replace_index_with_slice(expr: str, idx_var: str, lb: str, ub: str) -> str:
         re.IGNORECASE,
     )
     out = pat_idx.sub(lambda m: f"{m.group(1)}({section(0)})", out)
+    return out
+
+
+def replace_index_var_in_multidim_refs(expr: str, idx_var: str, lb: str, ub: str) -> str:
+    """Replace exact index variable in rank-2/3 array refs with lb:ub section."""
+    sec = f"{lb.strip()}:{ub.strip()}"
+
+    def repl2(m: re.Match[str]) -> str:
+        nm = m.group(1)
+        a1 = m.group(2).strip()
+        a2 = m.group(3).strip()
+        if normalize_expr(a1) == normalize_expr(idx_var):
+            a1 = sec
+        if normalize_expr(a2) == normalize_expr(idx_var):
+            a2 = sec
+        return f"{nm}({a1}, {a2})"
+
+    out = re.sub(
+        rf"\b([a-z][a-z0-9_]*)\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)",
+        repl2,
+        expr,
+        flags=re.IGNORECASE,
+    )
+
+    def repl3(m: re.Match[str]) -> str:
+        nm = m.group(1)
+        args = [m.group(2).strip(), m.group(3).strip(), m.group(4).strip()]
+        args = [sec if normalize_expr(a) == normalize_expr(idx_var) else a for a in args]
+        return f"{nm}({args[0]}, {args[1]}, {args[2]})"
+
+    out = re.sub(
+        rf"\b([a-z][a-z0-9_]*)\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*,\s*([^,()]+)\s*\)",
+        repl3,
+        out,
+        flags=re.IGNORECASE,
+    )
     return out
 
 
@@ -1528,7 +1613,10 @@ def maybe_whole_array_assign(
             return None
     if not full:
         return None
-    return f"{name} = {rhs}"
+    simp_bounds = dict(decl_bounds)
+    simp_bounds.update(alloc_rank1_bounds)
+    rhs_s = simplify_section_expr(rhs, simp_bounds)
+    return f"{name} = {rhs_s}"
 
 
 def parse_alloc_rank1_bounds(stmt: str) -> Dict[str, str]:
@@ -1772,6 +1860,39 @@ def maybe_elementwise(
                         lambda m: f"spread({m.group(1)}({rng_txt}), dim=2, ncopies={ncopy2})",
                         rhs_sliced,
                     )
+        # Prefer MATMUL form for simple 2D broadcast created above:
+        # spread(v(1:n), dim=2, ncopies=m) -> matmul(reshape(v(1:n), [n,1]), reshape(spread(1.0,...), [1,m]))
+        if len(lhs_args_sliced) == 2:
+            if lhs_pos == 0:
+                rows = section_extent_expr(lhs_args_sliced[0].strip())
+                m_sp = re.match(
+                    rf"^\s*spread\(\s*([a-z][a-z0-9_]*)\s*\(\s*{re.escape(lhs_args_sliced[0].strip())}\s*\)\s*,\s*dim\s*=\s*2\s*,\s*ncopies\s*=\s*(.+)\)\s*$",
+                    rhs_sliced,
+                    re.IGNORECASE,
+                )
+                if m_sp and rows is not None:
+                    cols = m_sp.group(2).strip()
+                    rhs_sliced = (
+                        f"matmul("
+                        f"reshape({m_sp.group(1)}({lhs_args_sliced[0].strip()}), [{rows}, 1]), "
+                        f"reshape(spread(1.0, dim=1, ncopies={cols}), [1, {cols}])"
+                        f")"
+                    )
+            elif lhs_pos == 1:
+                cols = section_extent_expr(lhs_args_sliced[1].strip())
+                m_sp = re.match(
+                    rf"^\s*spread\(\s*([a-z][a-z0-9_]*)\s*\(\s*{re.escape(lhs_args_sliced[1].strip())}\s*\)\s*,\s*dim\s*=\s*1\s*,\s*ncopies\s*=\s*(.+)\)\s*$",
+                    rhs_sliced,
+                    re.IGNORECASE,
+                )
+                if m_sp and cols is not None:
+                    rows = m_sp.group(2).strip()
+                    rhs_sliced = (
+                        f"matmul("
+                        f"reshape(spread(1.0, dim=1, ncopies={rows}), [{rows}, 1]), "
+                        f"reshape({m_sp.group(1)}({lhs_args_sliced[1].strip()}), [1, {cols}])"
+                        f")"
+                    )
         # Fallback broadcast for rank-2 target when RHS is a simple rank-1 section
         # aligned with the looped dimension, e.g.
         #   a(i, j1:j2) = key(i)  ->  a(1:n, j1:j2) = spread(key(1:n), dim=2, ncopies=j2-j1+1)
@@ -1781,13 +1902,33 @@ def maybe_elementwise(
             if lhs_pos == 0:
                 sec_other = lhs_args_sliced[1].strip()
                 extent = section_extent_expr(sec_other)
-                if extent is not None and normalize_expr(rarg) == normalize_expr(lhs_args_sliced[0].strip()):
-                    rhs_sliced = f"spread({rhs_idx[0]}({rarg}), dim=2, ncopies={extent})"
+                rows = section_extent_expr(lhs_args_sliced[0].strip())
+                if (
+                    extent is not None
+                    and rows is not None
+                    and normalize_expr(rarg) == normalize_expr(lhs_args_sliced[0].strip())
+                ):
+                    rhs_sliced = (
+                        f"matmul("
+                        f"reshape({rhs_idx[0]}({rarg}), [{rows}, 1]), "
+                        f"reshape(spread(1.0, dim=1, ncopies={extent}), [1, {extent}])"
+                        f")"
+                    )
             elif lhs_pos == 1:
                 sec_other = lhs_args_sliced[0].strip()
                 extent = section_extent_expr(sec_other)
-                if extent is not None and normalize_expr(rarg) == normalize_expr(lhs_args_sliced[1].strip()):
-                    rhs_sliced = f"spread({rhs_idx[0]}({rarg}), dim=1, ncopies={extent})"
+                cols = section_extent_expr(lhs_args_sliced[1].strip())
+                if (
+                    extent is not None
+                    and cols is not None
+                    and normalize_expr(rarg) == normalize_expr(lhs_args_sliced[1].strip())
+                ):
+                    rhs_sliced = (
+                        f"matmul("
+                        f"reshape(spread(1.0, dim=1, ncopies={extent}), [{extent}, 1]), "
+                        f"reshape({rhs_idx[0]}({rarg}), [1, {cols}])"
+                        f")"
+                    )
     rhs_sliced = simplify_section_expr(rhs_sliced, decl_bounds)
     if has_disallowed_function_calls(rhs_sliced, array_names):
         return None
@@ -1900,6 +2041,164 @@ def maybe_temp_then_elementwise(
     return f"{lhs_expr} = {rhs2_inlined}"
 
 
+def maybe_reshape_from_vector_fill(
+    loop_var: str,
+    lb: str,
+    ub: str,
+    step: Optional[str],
+    stmt_temp: str,
+    stmt_body: str,
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """
+    Detect:
+      do j=1,n2
+         k = 1 + (j-1)*n1
+         a(:,j) = x(k:k+n1-1)
+      end do
+    and rewrite to:
+      a = reshape(x, [n1, n2])
+    """
+    if lb.strip() != "1":
+        return None
+    if step is not None and step.strip() not in ("", "1"):
+        return None
+
+    m1 = ASSIGN_RE.match(stmt_temp.strip())
+    m2 = ASSIGN_RE.match(stmt_body.strip())
+    if not m1 or not m2:
+        return None
+    m_temp = SIMPLE_NAME_RE.match(m1.group(1).strip())
+    if not m_temp:
+        return None
+    temp_name = m_temp.group(1)
+    temp_rhs = m1.group(2).strip()
+
+    lhs = m2.group(1).strip()
+    rhs = m2.group(2).strip()
+    lhs_idx = parse_indexed_name(lhs)
+    rhs_idx = parse_indexed_name(rhs)
+    if lhs_idx is None or rhs_idx is None:
+        return None
+    lhs_name, lhs_args = lhs_idx
+    rhs_name, rhs_args = rhs_idx
+    if len(lhs_args) != 2 or len(rhs_args) != 1:
+        return None
+    if lhs_args[0].strip() != ":" or lhs_args[1].strip().lower() != loop_var.lower():
+        return None
+
+    b2 = rank2_bounds.get(lhs_name.lower())
+    if b2 is None:
+        return None
+    nrow, ncol = b2
+    if normalize_expr(ub) != normalize_expr(ncol):
+        return None
+
+    sec = rhs_args[0].strip()
+    if ":" not in sec:
+        return None
+    lo, hi = [p.strip() for p in sec.split(":", 1)]
+    if normalize_expr(lo) != normalize_expr(temp_name):
+        return None
+
+    expected_hi = normalize_expr(f"{temp_name} + {nrow} - 1")
+    if normalize_expr(hi) != expected_hi:
+        return None
+
+    expected_temp_1 = normalize_expr(f"1 + ({loop_var} - 1) * {nrow}")
+    expected_temp_2 = normalize_expr(f"({loop_var} - 1) * {nrow} + 1")
+    temp_norm = normalize_expr(temp_rhs)
+    if temp_norm not in (expected_temp_1, expected_temp_2):
+        return None
+
+    return f"{lhs_name} = reshape({rhs_name}, [{nrow}, {ncol}])"
+
+
+def maybe_nested_reshape_from_vector_fill(
+    outer_loop_var: str,
+    outer_lb: str,
+    outer_ub: str,
+    outer_step: Optional[str],
+    stmt_temp: str,
+    inner_do_stmt: str,
+    inner_body_stmt: str,
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """
+    Detect:
+      do j=1,n2
+         k = 1 + (j-1)*n1
+         do i=1,n1
+            a(i,j) = x(k+i-1)
+         end do
+      end do
+    and rewrite to:
+      a = reshape(x, [n1, n2])
+    """
+    if outer_lb.strip() != "1":
+        return None
+    if outer_step is not None and outer_step.strip() not in ("", "1"):
+        return None
+
+    m_tmp = ASSIGN_RE.match(stmt_temp.strip())
+    m_ido = DO_RE.match(inner_do_stmt.strip())
+    m_asn = ASSIGN_RE.match(inner_body_stmt.strip())
+    if not m_tmp or not m_ido or not m_asn:
+        return None
+
+    m_tmp_lhs = SIMPLE_NAME_RE.match(m_tmp.group(1).strip())
+    if not m_tmp_lhs:
+        return None
+    temp_name = m_tmp_lhs.group(1)
+    temp_rhs = m_tmp.group(2).strip()
+
+    inner_var = m_ido.group(1)
+    inner_lb = m_ido.group(2).strip()
+    inner_ub = m_ido.group(3).strip()
+    inner_step = m_ido.group(4)
+    if inner_lb != "1":
+        return None
+    if inner_step is not None and inner_step.strip() not in ("", "1"):
+        return None
+
+    lhs = m_asn.group(1).strip()
+    rhs = m_asn.group(2).strip()
+    lhs_idx = parse_indexed_name(lhs)
+    rhs_idx = parse_indexed_name(rhs)
+    if lhs_idx is None or rhs_idx is None:
+        return None
+    lhs_name, lhs_args = lhs_idx
+    rhs_name, rhs_args = rhs_idx
+    if len(lhs_args) != 2 or len(rhs_args) != 1:
+        return None
+    if lhs_args[0].strip().lower() != inner_var.lower():
+        return None
+    if lhs_args[1].strip().lower() != outer_loop_var.lower():
+        return None
+
+    b2 = rank2_bounds.get(lhs_name.lower())
+    if b2 is None:
+        return None
+    nrow, ncol = b2
+    if normalize_expr(outer_ub) != normalize_expr(ncol):
+        return None
+    if normalize_expr(inner_ub) != normalize_expr(nrow):
+        return None
+
+    rhs_arg = rhs_args[0].strip()
+    expected_rhs_a = normalize_expr(f"{temp_name} + {inner_var} - 1")
+    expected_rhs_b = normalize_expr(f"{inner_var} + {temp_name} - 1")
+    if normalize_expr(rhs_arg) not in (expected_rhs_a, expected_rhs_b):
+        return None
+
+    expected_temp_1 = normalize_expr(f"1 + ({outer_loop_var} - 1) * {nrow}")
+    expected_temp_2 = normalize_expr(f"({outer_loop_var} - 1) * {nrow} + 1")
+    if normalize_expr(temp_rhs) not in (expected_temp_1, expected_temp_2):
+        return None
+
+    return f"{lhs_name} = reshape({rhs_name}, [{nrow}, {ncol}])"
+
+
 def maybe_multi_elementwise(
     loop_var: str,
     rng: str,
@@ -1913,6 +2212,9 @@ def maybe_multi_elementwise(
         return None
     suggestions: List[str] = []
     lhs_names: List[str] = []
+    lhs_targets: Set[str] = set()
+    lhs_targets: Set[str] = set()
+    lhs_targets: Set[str] = set()
     for stmt in body_stmts:
         m = ASSIGN_RE.match(stmt.strip())
         if not m:
@@ -1937,6 +2239,168 @@ def maybe_multi_elementwise(
             if re.search(rf"\b{re.escape(w)}\s*\(", rhs_low):
                 return None
     return "\n".join(suggestions)
+
+
+def maybe_temp_then_multi_elementwise(
+    loop_var: str,
+    rng: str,
+    body_stmts: List[str],
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    decl_scalar_inits: Dict[str, str],
+    alloc_map: Dict[str, str],
+    array_names: Set[str],
+) -> Optional[str]:
+    """Detect temp-scalar assignment followed by multiple elementwise assignments."""
+    if len(body_stmts) < 3:
+        return None
+    m0 = ASSIGN_RE.match(body_stmts[0].strip())
+    if not m0:
+        return None
+    m0_lhs = SIMPLE_NAME_RE.match(m0.group(1).strip())
+    if not m0_lhs:
+        return None
+    temp_name = m0_lhs.group(1)
+    temp_rhs = m0.group(2).strip()
+    # Temp must vary with loop variable so inlining is meaningful.
+    if not has_loop_var(temp_rhs, loop_var):
+        return None
+
+    def _const_int_expr(expr: str) -> Optional[int]:
+        e = expr.strip().lower()
+        if re.fullmatch(r"[a-z][a-z0-9_]*", e):
+            rhs = decl_scalar_inits.get(e)
+            if rhs is None:
+                return None
+            return _const_int_expr(rhs)
+        if not re.fullmatch(r"[0-9+\-*\s()]+", e):
+            return None
+        try:
+            v = eval(e, {"__builtins__": {}}, {})  # noqa: S307 - tightly regex-guarded
+        except Exception:
+            return None
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return int(v)
+        return None
+
+    # Inline temp expression into subsequent statements. Prefer normal
+    # elementwise rewrite; fall back to constructor-based slice fill when the
+    # RHS uses loop_var as a scalar (e.g. sin(real(i))).
+    suggestions: List[str] = []
+    lhs_names: List[str] = []
+    lhs_targets: Set[str] = set()
+    lb, ubtxt = split_range(rng)
+    step_txt: Optional[str] = None
+    m_rng = re.match(r"^\s*(.+?)\s*:\s*(.+?)\s*(?::\s*(.+?)\s*)?$", rng)
+    if m_rng:
+        step_txt = m_rng.group(3).strip() if m_rng.group(3) else None
+    parsed_rows: List[Tuple[Tuple[str, List[str], int], str]] = []
+    for stmt in body_stmts[1:]:
+        m = ASSIGN_RE.match(stmt.strip())
+        if not m:
+            return None
+        lhs = m.group(1).strip()
+        rhs = m.group(2).strip()
+        lhs_parsed = parse_lhs_indexed_by_loop(lhs, loop_var)
+        if lhs_parsed is None:
+            return None
+        lhs_name = lhs_parsed[0].lower()
+        lhs_target = normalize_expr(lhs)
+        if lhs_name == temp_name.lower():
+            return None
+        if lhs_target in lhs_targets:
+            return None
+        lhs_targets.add(lhs_target)
+        lhs_names.append(lhs_name)
+
+        rhs_inlined = re.sub(
+            rf"\b{re.escape(temp_name)}\b",
+            f"({temp_rhs})",
+            rhs,
+            flags=re.IGNORECASE,
+        )
+        # Prevent dependence on values written earlier in this same loop body.
+        rhs_low = strip_quoted_text(rhs_inlined.lower())
+        for w in lhs_names:
+            if re.search(rf"\b{re.escape(w)}\s*\(", rhs_low):
+                return None
+        parsed_rows.append((lhs_parsed, rhs_inlined))
+        stmt_inlined = f"{lhs} = {rhs_inlined}"
+        sugg = maybe_elementwise(loop_var, rng, stmt_inlined, decl_bounds, alloc_map, array_names)
+        if sugg is None:
+            # Fallback: loop var appears as scalar RHS term; use constructor.
+            if not has_loop_var(rhs_inlined, loop_var):
+                return None
+            lhs_args_sliced = list(lhs_parsed[1])
+            lhs_args_sliced[lhs_parsed[2]] = rng
+            if len(lhs_args_sliced) == 1:
+                lhs_expr = f"{lhs_parsed[0]}({rng})"
+                bnd = decl_bounds.get(lhs_parsed[0].lower())
+                if bnd is not None and normalize_expr(rng) == normalize_expr(bnd):
+                    lhs_expr = lhs_parsed[0]
+                elif can_collapse_lhs_alloc(lhs_parsed[0], rng, alloc_map):
+                    lhs_expr = lhs_parsed[0]
+            else:
+                lhs_expr = f"{lhs_parsed[0]}({', '.join(lhs_args_sliced)})"
+            iter_triplet = f"{loop_var}={lb},{ubtxt}"
+            if step_txt not in (None, "", "1"):
+                iter_triplet = f"{loop_var}={lb},{ubtxt},{step_txt}"
+            rhs_ctor = f"[({rhs_inlined}, {iter_triplet})]"
+            rhs_ctor = simplify_section_expr(rhs_ctor, decl_bounds)
+            if has_disallowed_function_calls(rhs_ctor, array_names):
+                return None
+            sugg = f"{lhs_expr} = {rhs_ctor}"
+        suggestions.append(sugg)
+
+    # Prefer compact "loop + row/column constructor" when all writes target
+    # fixed neighboring columns/rows of the same rank-2 array.
+    if parsed_rows:
+        arr0 = parsed_rows[0][0][0]
+        lhs_pos0 = parsed_rows[0][0][2]
+        if all(len(pr[0][1]) == 2 and pr[0][0].lower() == arr0.lower() and pr[0][2] == lhs_pos0 for pr in parsed_rows):
+            other_pos = 1 - lhs_pos0
+            idx_rhs: Dict[int, str] = {}
+            ok = True
+            for lhs_parsed, rhs_inlined in parsed_rows:
+                idx_expr = lhs_parsed[1][other_pos]
+                idx_val = _const_int_expr(idx_expr)
+                if idx_val is None or idx_val in idx_rhs:
+                    ok = False
+                    break
+                idx_rhs[idx_val] = rhs_inlined
+            if ok and idx_rhs:
+                idxs = sorted(idx_rhs.keys())
+                contiguous = all(idxs[k] == idxs[0] + k for k in range(len(idxs)))
+                if contiguous:
+                    rank2 = rank2_bounds.get(arr0.lower())
+                    full_other = False
+                    if rank2 is not None:
+                        b_other = rank2[other_pos]
+                        b_other_v = _const_int_expr(b_other)
+                        if b_other_v is not None and idxs[0] == 1 and idxs[-1] == b_other_v:
+                            full_other = True
+                    idx_join = ", ".join(idx_rhs[i] for i in idxs)
+                    if lhs_pos0 == 0:
+                        sec = ":" if full_other else f"{idxs[0]}:{idxs[-1]}"
+                        lhs_compact = f"{arr0}({loop_var}, {sec})"
+                    else:
+                        sec = ":" if full_other else f"{idxs[0]}:{idxs[-1]}"
+                        lhs_compact = f"{arr0}({sec}, {loop_var})"
+                    do_head = f"do {loop_var}={lb},{ubtxt}"
+                    if step_txt not in (None, "", "1"):
+                        do_head = f"{do_head},{step_txt}"
+                    return "\n".join(
+                        [
+                            do_head,
+                            f"   {body_stmts[0].strip()}",
+                            f"   {lhs_compact} = [{idx_join}]",
+                            "end do",
+                        ]
+                    )
+
+    return "\n".join(suggestions) if suggestions else None
 
 
 def _normalize_affine_subscripts(
@@ -2279,6 +2743,698 @@ def maybe_reduction_sum_vector_2d(
     return f"{acc_name} = sum({expr_mat}, dim=1)"
 
 
+def maybe_block_reduction_sum_dim1_scaled(
+    body: List[Tuple[int, str]],
+    i: int,
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    array_names: Set[str],
+) -> Optional[Tuple[int, str, int]]:
+    """Detect BLOCK with init+nested accumulate+scale and fold to sum(...,dim=1)/scale.
+
+    Pattern (allowing one optional declaration line after BLOCK):
+      block
+        [integer :: ...]
+        do j = 1, C
+          v(j) = 0
+        end do
+        do i = 1, R
+          do j = 1, C
+            v(j) = v(j) + expr(i,j)
+          end do
+        end do
+        do j = 1, C
+          v(j) = v(j) / s
+        end do
+      end block
+    """
+    if i >= len(body) or body[i][1].strip().lower() != "block":
+        return None
+
+    def _canon_extent(e: str) -> str:
+        s = normalize_expr(e)
+        s = re.sub(
+            r"ubound\(\s*([a-z][a-z0-9_]*)\s*,\s*([123])\s*\)",
+            lambda m: f"size({m.group(1)},{m.group(2)})",
+            s,
+            flags=re.IGNORECASE,
+        )
+        return s
+
+    j = i + 1
+    if j < len(body):
+        st = body[j][1].strip().lower()
+        if TYPE_DECL_RE.match(st):
+            j += 1
+    if j + 11 >= len(body):
+        return None
+
+    m_do_init = DO_RE.match(body[j][1].strip())
+    m_asn_init = ASSIGN_RE.match(body[j + 1][1].strip())
+    m_end_init = END_DO_RE.match(body[j + 2][1].strip())
+    m_do_row = DO_RE.match(body[j + 3][1].strip())
+    m_do_col = DO_RE.match(body[j + 4][1].strip())
+    m_asn_acc = ASSIGN_RE.match(body[j + 5][1].strip())
+    m_end_col = END_DO_RE.match(body[j + 6][1].strip())
+    m_end_row = END_DO_RE.match(body[j + 7][1].strip())
+    m_do_scale = DO_RE.match(body[j + 8][1].strip())
+    m_asn_scale = ASSIGN_RE.match(body[j + 9][1].strip())
+    m_end_scale = END_DO_RE.match(body[j + 10][1].strip())
+    end_block = body[j + 11][1].strip().lower() == "end block"
+    if not (
+        m_do_init
+        and m_asn_init
+        and m_end_init
+        and m_do_row
+        and m_do_col
+        and m_asn_acc
+        and m_end_col
+        and m_end_row
+        and m_do_scale
+        and m_asn_scale
+        and m_end_scale
+        and end_block
+    ):
+        return None
+
+    col_var_init = m_do_init.group(1)
+    col_lb = m_do_init.group(2).strip()
+    col_ub = m_do_init.group(3).strip()
+    col_step = m_do_init.group(4)
+    if normalize_expr(col_lb) != normalize_expr("1"):
+        return None
+    if col_step is not None and col_step.strip() != "1":
+        return None
+
+    lhs_init = parse_indexed_name(m_asn_init.group(1).strip())
+    if lhs_init is None or len(lhs_init[1]) != 1:
+        return None
+    acc_name = lhs_init[0]
+    acc_idx = lhs_init[1][0].strip()
+    if acc_idx.lower() != col_var_init.lower():
+        return None
+    if not ZERO_LITERAL_RE.match(m_asn_init.group(2).strip()):
+        return None
+
+    row_var = m_do_row.group(1)
+    row_lb = m_do_row.group(2).strip()
+    row_ub = m_do_row.group(3).strip()
+    row_step = m_do_row.group(4)
+    if normalize_expr(row_lb) != normalize_expr("1"):
+        return None
+    if row_step is not None and row_step.strip() != "1":
+        return None
+
+    col_var_acc = m_do_col.group(1)
+    col_lb_acc = m_do_col.group(2).strip()
+    col_ub_acc = m_do_col.group(3).strip()
+    col_step_acc = m_do_col.group(4)
+    if col_var_acc.lower() != col_var_init.lower():
+        return None
+    if normalize_expr(col_lb_acc) != normalize_expr(col_lb) or normalize_expr(col_ub_acc) != normalize_expr(col_ub):
+        return None
+    if col_step_acc is not None and col_step_acc.strip() != "1":
+        return None
+
+    lhs_acc = parse_indexed_name(m_asn_acc.group(1).strip())
+    if lhs_acc is None or len(lhs_acc[1]) != 1 or lhs_acc[0].lower() != acc_name.lower():
+        return None
+    if lhs_acc[1][0].strip().lower() != col_var_init.lower():
+        return None
+    rhs_acc = m_asn_acc.group(2).strip()
+    m_add = re.match(r"^\s*(.+?)\s*\+\s*(.+)\s*$", rhs_acc)
+    if not m_add:
+        return None
+    if normalize_expr(m_add.group(1).strip()) != normalize_expr(m_asn_acc.group(1).strip()):
+        return None
+    expr = m_add.group(2).strip()
+
+    col_var_scale = m_do_scale.group(1)
+    col_lb_scale = m_do_scale.group(2).strip()
+    col_ub_scale = m_do_scale.group(3).strip()
+    col_step_scale = m_do_scale.group(4)
+    if col_var_scale.lower() != col_var_init.lower():
+        return None
+    if normalize_expr(col_lb_scale) != normalize_expr(col_lb) or normalize_expr(col_ub_scale) != normalize_expr(col_ub):
+        return None
+    if col_step_scale is not None and col_step_scale.strip() != "1":
+        return None
+
+    lhs_scale = parse_indexed_name(m_asn_scale.group(1).strip())
+    if lhs_scale is None or len(lhs_scale[1]) != 1 or lhs_scale[0].lower() != acc_name.lower():
+        return None
+    if lhs_scale[1][0].strip().lower() != col_var_init.lower():
+        return None
+    rhs_scale = m_asn_scale.group(2).strip()
+    m_div = re.match(r"^\s*(.+?)\s*/\s*(.+)\s*$", rhs_scale)
+    if not m_div:
+        return None
+    if normalize_expr(m_div.group(1).strip()) != normalize_expr(m_asn_scale.group(1).strip()):
+        return None
+    scale = m_div.group(2).strip()
+
+    # Build matrix expression for sum(..., dim=1).
+    local_array_names = set(array_names)
+    for mm in CALL_LIKE_RE.finditer(strip_quoted_text(expr.lower())):
+        nm = mm.group(1).lower()
+        if nm in ELEMENTAL_INTRINSICS or nm in USER_ELEMENTAL_CALLS:
+            continue
+        local_array_names.add(nm)
+    expr_m = replace_affine_index_anydim(expr, row_var, "1", row_ub, array_names=local_array_names)
+    expr_m = replace_affine_index_anydim(expr_m, col_var_init, "1", col_ub, array_names=local_array_names)
+    if has_loop_var(expr_m, row_var) or has_loop_var(expr_m, col_var_init):
+        return None
+    expr_m = simplify_section_expr(expr_m, decl_bounds)
+    expr_m = simplify_section_expr_rank2(expr_m, rank2_bounds)
+    # Collapse obvious whole-array sections: a(1:ubound(a,1),1:ubound(a,2)) -> a
+    expr_m = re.sub(
+        r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*ubound\(\s*\1\s*,\s*1\s*\)\s*,\s*1\s*:\s*ubound\(\s*\1\s*,\s*2\s*\)\s*\)",
+        lambda m: m.group(1),
+        expr_m,
+        flags=re.IGNORECASE,
+    )
+    if has_disallowed_function_calls(expr_m, local_array_names):
+        return None
+
+    lhs_expr = f"{acc_name}(1:{col_ub})"
+    bnd = decl_bounds.get(acc_name.lower())
+    if bnd is not None and _canon_extent(f"1:{col_ub}") == _canon_extent(bnd):
+        lhs_expr = acc_name
+    else:
+        m_src = re.match(r"^\s*([a-z][a-z0-9_]*)\s*$", expr_m, re.IGNORECASE)
+        m_ub2 = re.match(r"^\s*ubound\(\s*([a-z][a-z0-9_]*)\s*,\s*2\s*\)\s*$", col_ub, re.IGNORECASE)
+        if m_src and m_ub2 and m_src.group(1).lower() == m_ub2.group(1).lower():
+            lhs_expr = acc_name
+    suggestion = f"{lhs_expr} = sum({expr_m}, dim=1) / {scale}"
+    return (j + 11, suggestion, body[j + 11][0])
+
+
+def maybe_block_reduction_sum_dim2_scaled(
+    body: List[Tuple[int, str]],
+    i: int,
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    array_names: Set[str],
+) -> Optional[Tuple[int, str, int]]:
+    """Detect BLOCK with init+nested accumulate+scale and fold to sum(...,dim=2)/scale.
+
+    Pattern (allowing one optional declaration line after BLOCK):
+      block
+        [integer :: ...]
+        do i = 1, R
+          v(i) = 0
+        end do
+        do i = 1, R
+          do j = 1, C
+            v(i) = v(i) + expr(i,j)
+          end do
+        end do
+        do i = 1, R
+          v(i) = v(i) / s
+        end do
+      end block
+    """
+    if i >= len(body) or body[i][1].strip().lower() != "block":
+        return None
+
+    def _canon_extent(e: str) -> str:
+        s = normalize_expr(e)
+        s = re.sub(
+            r"ubound\(\s*([a-z][a-z0-9_]*)\s*,\s*([123])\s*\)",
+            lambda m: f"size({m.group(1)},{m.group(2)})",
+            s,
+            flags=re.IGNORECASE,
+        )
+        return s
+
+    j = i + 1
+    if j < len(body):
+        st = body[j][1].strip().lower()
+        if TYPE_DECL_RE.match(st):
+            j += 1
+    if j + 11 >= len(body):
+        return None
+
+    m_do_init = DO_RE.match(body[j][1].strip())
+    m_asn_init = ASSIGN_RE.match(body[j + 1][1].strip())
+    m_end_init = END_DO_RE.match(body[j + 2][1].strip())
+    m_do_row = DO_RE.match(body[j + 3][1].strip())
+    m_do_col = DO_RE.match(body[j + 4][1].strip())
+    m_asn_acc = ASSIGN_RE.match(body[j + 5][1].strip())
+    m_end_col = END_DO_RE.match(body[j + 6][1].strip())
+    m_end_row = END_DO_RE.match(body[j + 7][1].strip())
+    m_do_scale = DO_RE.match(body[j + 8][1].strip())
+    m_asn_scale = ASSIGN_RE.match(body[j + 9][1].strip())
+    m_end_scale = END_DO_RE.match(body[j + 10][1].strip())
+    end_block = body[j + 11][1].strip().lower() == "end block"
+    if not (
+        m_do_init
+        and m_asn_init
+        and m_end_init
+        and m_do_row
+        and m_do_col
+        and m_asn_acc
+        and m_end_col
+        and m_end_row
+        and m_do_scale
+        and m_asn_scale
+        and m_end_scale
+        and end_block
+    ):
+        return None
+
+    row_var_init = m_do_init.group(1)
+    row_lb = m_do_init.group(2).strip()
+    row_ub = m_do_init.group(3).strip()
+    row_step = m_do_init.group(4)
+    if normalize_expr(row_lb) != normalize_expr("1"):
+        return None
+    if row_step is not None and row_step.strip() != "1":
+        return None
+
+    lhs_init = parse_indexed_name(m_asn_init.group(1).strip())
+    if lhs_init is None or len(lhs_init[1]) != 1:
+        return None
+    acc_name = lhs_init[0]
+    acc_idx = lhs_init[1][0].strip()
+    if acc_idx.lower() != row_var_init.lower():
+        return None
+    if not ZERO_LITERAL_RE.match(m_asn_init.group(2).strip()):
+        return None
+
+    row_var = m_do_row.group(1)
+    row_lb2 = m_do_row.group(2).strip()
+    row_ub2 = m_do_row.group(3).strip()
+    row_step2 = m_do_row.group(4)
+    if row_var.lower() != row_var_init.lower():
+        return None
+    if normalize_expr(row_lb2) != normalize_expr(row_lb) or normalize_expr(row_ub2) != normalize_expr(row_ub):
+        return None
+    if row_step2 is not None and row_step2.strip() != "1":
+        return None
+
+    col_var = m_do_col.group(1)
+    col_lb = m_do_col.group(2).strip()
+    col_ub = m_do_col.group(3).strip()
+    col_step = m_do_col.group(4)
+    if normalize_expr(col_lb) != normalize_expr("1"):
+        return None
+    if col_step is not None and col_step.strip() != "1":
+        return None
+
+    lhs_acc = parse_indexed_name(m_asn_acc.group(1).strip())
+    if lhs_acc is None or len(lhs_acc[1]) != 1 or lhs_acc[0].lower() != acc_name.lower():
+        return None
+    if lhs_acc[1][0].strip().lower() != row_var_init.lower():
+        return None
+    rhs_acc = m_asn_acc.group(2).strip()
+    m_add = re.match(r"^\s*(.+?)\s*\+\s*(.+)\s*$", rhs_acc)
+    if not m_add:
+        return None
+    if normalize_expr(m_add.group(1).strip()) != normalize_expr(m_asn_acc.group(1).strip()):
+        return None
+    expr = m_add.group(2).strip()
+
+    row_var_scale = m_do_scale.group(1)
+    row_lb_scale = m_do_scale.group(2).strip()
+    row_ub_scale = m_do_scale.group(3).strip()
+    row_step_scale = m_do_scale.group(4)
+    if row_var_scale.lower() != row_var_init.lower():
+        return None
+    if normalize_expr(row_lb_scale) != normalize_expr(row_lb) or normalize_expr(row_ub_scale) != normalize_expr(row_ub):
+        return None
+    if row_step_scale is not None and row_step_scale.strip() != "1":
+        return None
+
+    lhs_scale = parse_indexed_name(m_asn_scale.group(1).strip())
+    if lhs_scale is None or len(lhs_scale[1]) != 1 or lhs_scale[0].lower() != acc_name.lower():
+        return None
+    if lhs_scale[1][0].strip().lower() != row_var_init.lower():
+        return None
+    rhs_scale = m_asn_scale.group(2).strip()
+    m_div = re.match(r"^\s*(.+?)\s*/\s*(.+)\s*$", rhs_scale)
+    if not m_div:
+        return None
+    if normalize_expr(m_div.group(1).strip()) != normalize_expr(m_asn_scale.group(1).strip()):
+        return None
+    scale = m_div.group(2).strip()
+
+    local_array_names = set(array_names)
+    for mm in CALL_LIKE_RE.finditer(strip_quoted_text(expr.lower())):
+        nm = mm.group(1).lower()
+        if nm in ELEMENTAL_INTRINSICS or nm in USER_ELEMENTAL_CALLS:
+            continue
+        local_array_names.add(nm)
+    expr_m = replace_affine_index_anydim(expr, row_var, "1", row_ub, array_names=local_array_names)
+    expr_m = replace_affine_index_anydim(expr_m, col_var, "1", col_ub, array_names=local_array_names)
+    if has_loop_var(expr_m, row_var) or has_loop_var(expr_m, col_var):
+        return None
+    expr_m = simplify_section_expr(expr_m, decl_bounds)
+    expr_m = simplify_section_expr_rank2(expr_m, rank2_bounds)
+    expr_m = re.sub(
+        r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*ubound\(\s*\1\s*,\s*1\s*\)\s*,\s*1\s*:\s*ubound\(\s*\1\s*,\s*2\s*\)\s*\)",
+        lambda m: m.group(1),
+        expr_m,
+        flags=re.IGNORECASE,
+    )
+    expr_m = re.sub(
+        r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*size\(\s*\1\s*,\s*1\s*\)\s*,\s*1\s*:\s*size\(\s*\1\s*,\s*2\s*\)\s*\)",
+        lambda m: m.group(1),
+        expr_m,
+        flags=re.IGNORECASE,
+    )
+    for r2name, (b1, b2) in rank2_bounds.items():
+        b1p = re.escape(re.sub(r"\s+", "", b1))
+        b2p = re.escape(re.sub(r"\s+", "", b2))
+        pat = re.compile(
+            rf"\b{re.escape(r2name)}\s*\(\s*1\s*:\s*({b1p}|{re.escape(b1)})\s*,\s*1\s*:\s*({b2p}|{re.escape(b2)})\s*\)",
+            re.IGNORECASE,
+        )
+        expr_m = pat.sub(r2name, expr_m)
+    if has_disallowed_function_calls(expr_m, local_array_names):
+        return None
+
+    lhs_expr = f"{acc_name}(1:{row_ub})"
+    bnd = decl_bounds.get(acc_name.lower())
+    if bnd is not None and _canon_extent(f"1:{row_ub}") == _canon_extent(bnd):
+        lhs_expr = acc_name
+    else:
+        m_src = re.match(r"^\s*([a-z][a-z0-9_]*)\s*$", expr_m, re.IGNORECASE)
+        m_ub1 = re.match(r"^\s*ubound\(\s*([a-z][a-z0-9_]*)\s*,\s*1\s*\)\s*$", row_ub, re.IGNORECASE)
+        if m_src and m_ub1 and m_src.group(1).lower() == m_ub1.group(1).lower():
+            lhs_expr = acc_name
+    suggestion = f"{lhs_expr} = sum({expr_m}, dim=2) / {scale}"
+    return (j + 11, suggestion, body[j + 11][0])
+
+
+def maybe_block_reduction_sqrt_sum_dim1_scaled(
+    body: List[Tuple[int, str]],
+    i: int,
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    array_names: Set[str],
+) -> Optional[Tuple[int, str, int]]:
+    """Detect BLOCK reduction pattern and fold to sqrt(sum(..., dim=1)/scale)."""
+    base = maybe_block_reduction_sum_dim1_scaled(body, i, decl_bounds, rank2_bounds, array_names)
+    if base is None:
+        return None
+    end_idx, sugg, ln_end = base
+    m = ASSIGN_RE.match(sugg.strip())
+    if not m:
+        return None
+    lhs = m.group(1).strip()
+    rhs = m.group(2).strip()
+    # Expect: sum(expr, dim=1) / scale
+    md = re.match(r"^\s*sum\s*\(\s*(.+)\s*,\s*dim\s*=\s*1\s*\)\s*/\s*(.+)\s*$", rhs, re.IGNORECASE)
+    if not md:
+        return None
+    expr_m = md.group(1).strip()
+    scale = md.group(2).strip()
+
+    # Verify original block's final update is sqrt(acc / scale).
+    # end_idx points at END BLOCK; assignment is at end_idx-2.
+    if end_idx - 2 < i:
+        return None
+    asn_scale = body[end_idx - 2][1]
+    m_asn = ASSIGN_RE.match(asn_scale.strip())
+    if not m_asn:
+        return None
+    if normalize_expr(m_asn.group(1).strip()) != normalize_expr(lhs):
+        return None
+    rhs_scale = m_asn.group(2).strip()
+    m_sqrt = re.match(r"^\s*sqrt\s*\(\s*(.+)\s*\)\s*$", rhs_scale, re.IGNORECASE)
+    if not m_sqrt:
+        return None
+    inner = m_sqrt.group(1).strip()
+    m_div = re.match(r"^\s*(.+?)\s*/\s*(.+)\s*$", inner)
+    if not m_div:
+        return None
+    if normalize_expr(m_div.group(1).strip()) != normalize_expr(lhs):
+        return None
+    if normalize_expr(m_div.group(2).strip()) != normalize_expr(scale):
+        return None
+
+    return (end_idx, f"{lhs} = sqrt(sum({expr_m}, dim=1) / {scale})", ln_end)
+
+
+def maybe_block_reduction_sqrt_inside_outer_dim1(
+    body: List[Tuple[int, str]],
+    i: int,
+    decl_bounds: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+    array_names: Set[str],
+) -> Optional[Tuple[int, str, int]]:
+    """Detect BLOCK with outer-loop init+inner-sum+sqrt-scale and fold to sqrt(sum(...,dim=1)/scale)."""
+    if i >= len(body) or body[i][1].strip().lower() != "block":
+        return None
+
+    j = i + 1
+    if j < len(body):
+        st = body[j][1].strip().lower()
+        if TYPE_DECL_RE.match(st):
+            j += 1
+    if j + 8 >= len(body):
+        return None
+
+    m_do_o = DO_RE.match(body[j][1].strip())
+    m_init = ASSIGN_RE.match(body[j + 1][1].strip())
+    m_do_i = DO_RE.match(body[j + 2][1].strip())
+    m_acc = ASSIGN_RE.match(body[j + 3][1].strip())
+    m_end_i = END_DO_RE.match(body[j + 4][1].strip())
+    m_sqrt = ASSIGN_RE.match(body[j + 5][1].strip())
+    m_end_o = END_DO_RE.match(body[j + 6][1].strip())
+    end_block = body[j + 7][1].strip().lower() == "end block"
+    if not (m_do_o and m_init and m_do_i and m_acc and m_end_i and m_sqrt and m_end_o and end_block):
+        return None
+
+    o_var = m_do_o.group(1)
+    o_lb = m_do_o.group(2).strip()
+    o_ub = m_do_o.group(3).strip()
+    o_step = m_do_o.group(4)
+    if normalize_expr(o_lb) != normalize_expr("1"):
+        return None
+    if o_step is not None and o_step.strip() != "1":
+        return None
+    i_var = m_do_i.group(1)
+    i_lb = m_do_i.group(2).strip()
+    i_ub = m_do_i.group(3).strip()
+    i_step = m_do_i.group(4)
+    if normalize_expr(i_lb) != normalize_expr("1"):
+        return None
+    if i_step is not None and i_step.strip() != "1":
+        return None
+
+    lhs_init = parse_indexed_name(m_init.group(1).strip())
+    if lhs_init is None or len(lhs_init[1]) != 1:
+        return None
+    acc_name = lhs_init[0]
+    if lhs_init[1][0].strip().lower() != o_var.lower():
+        return None
+    if not ZERO_LITERAL_RE.match(m_init.group(2).strip()):
+        return None
+
+    lhs_acc = parse_indexed_name(m_acc.group(1).strip())
+    if lhs_acc is None or len(lhs_acc[1]) != 1:
+        return None
+    if lhs_acc[0].lower() != acc_name.lower() or lhs_acc[1][0].strip().lower() != o_var.lower():
+        return None
+    rhs_acc = m_acc.group(2).strip()
+    m_add = re.match(r"^\s*(.+?)\s*\+\s*(.+)\s*$", rhs_acc)
+    if not m_add:
+        return None
+    if normalize_expr(m_add.group(1).strip()) != normalize_expr(m_acc.group(1).strip()):
+        return None
+    expr = m_add.group(2).strip()
+
+    lhs_sqrt = parse_indexed_name(m_sqrt.group(1).strip())
+    if lhs_sqrt is None or len(lhs_sqrt[1]) != 1:
+        return None
+    if lhs_sqrt[0].lower() != acc_name.lower() or lhs_sqrt[1][0].strip().lower() != o_var.lower():
+        return None
+    rhs_sqrt = m_sqrt.group(2).strip()
+    m_sq = re.match(r"^\s*sqrt\s*\(\s*(.+)\s*\)\s*$", rhs_sqrt, re.IGNORECASE)
+    if not m_sq:
+        return None
+    inner = m_sq.group(1).strip()
+    m_div = re.match(r"^\s*(.+?)\s*/\s*(.+)\s*$", inner)
+    if not m_div:
+        return None
+    if normalize_expr(m_div.group(1).strip()) != normalize_expr(m_sqrt.group(1).strip()):
+        return None
+    scale = m_div.group(2).strip()
+
+    local_array_names = set(array_names)
+    for mm in CALL_LIKE_RE.finditer(strip_quoted_text(expr.lower())):
+        nm = mm.group(1).lower()
+        if nm in ELEMENTAL_INTRINSICS or nm in USER_ELEMENTAL_CALLS:
+            continue
+        local_array_names.add(nm)
+    expr_m = replace_affine_index_anydim(expr, i_var, "1", i_ub, array_names=local_array_names)
+    expr_m = replace_affine_index_anydim(expr_m, o_var, "1", o_ub, array_names=local_array_names)
+    if has_loop_var(expr_m, i_var) or has_loop_var(expr_m, o_var):
+        return None
+    expr_m = simplify_section_expr(expr_m, decl_bounds)
+    expr_m = simplify_section_expr_rank2(expr_m, rank2_bounds)
+    expr_m = re.sub(
+        r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*ubound\(\s*\1\s*,\s*1\s*\)\s*,\s*1\s*:\s*ubound\(\s*\1\s*,\s*2\s*\)\s*\)",
+        lambda m: m.group(1),
+        expr_m,
+        flags=re.IGNORECASE,
+    )
+    expr_m = re.sub(
+        r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*size\(\s*\1\s*,\s*1\s*\)\s*,\s*1\s*:\s*size\(\s*\1\s*,\s*2\s*\)\s*\)",
+        lambda m: m.group(1),
+        expr_m,
+        flags=re.IGNORECASE,
+    )
+    for r2name, (b1, b2) in rank2_bounds.items():
+        pat = re.compile(
+            rf"\b{re.escape(r2name)}\s*\(\s*1\s*:\s*{re.escape(b1)}\s*,\s*1\s*:\s*{re.escape(b2)}\s*\)",
+            re.IGNORECASE,
+        )
+        expr_m = pat.sub(r2name, expr_m)
+    if has_disallowed_function_calls(expr_m, local_array_names):
+        return None
+
+    scale_clean = scale.strip()
+    while True:
+        m_scale_par = re.match(r"^\(\s*(.+?)\s*\)$", scale_clean)
+        if not m_scale_par:
+            break
+        scale_clean = m_scale_par.group(1).strip()
+
+    lhs_expr = acc_name
+    return (j + 7, f"{lhs_expr} = sqrt(sum({expr_m}, dim=1) / ({scale_clean}))", body[j + 7][0])
+
+
+def maybe_block_matmul_transpose_scaled(
+    body: List[Tuple[int, str]],
+    i: int,
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[Tuple[int, str, int]]:
+    """Detect BLOCK triple-loop accumulation and fold to matmul(transpose(A),A)/scale.
+
+    Pattern:
+      block
+        [integer :: ...]
+        do i = 1, p
+          do k = 1, p
+            c(i,k) = 0
+            do j = 1, n
+              c(i,k) = c(i,k) + a(j,i) * a(j,k)
+            end do
+            c(i,k) = c(i,k) / s
+          end do
+        end do
+      end block
+    """
+    if i >= len(body) or body[i][1].strip().lower() != "block":
+        return None
+    j = i + 1
+    if j < len(body):
+        st = body[j][1].strip().lower()
+        if TYPE_DECL_RE.match(st):
+            j += 1
+    if j + 9 >= len(body):
+        return None
+
+    m_do_i = DO_RE.match(body[j][1].strip())
+    m_do_k = DO_RE.match(body[j + 1][1].strip())
+    m_init = ASSIGN_RE.match(body[j + 2][1].strip())
+    m_do_j = DO_RE.match(body[j + 3][1].strip())
+    m_acc = ASSIGN_RE.match(body[j + 4][1].strip())
+    m_end_j = END_DO_RE.match(body[j + 5][1].strip())
+    m_scale = ASSIGN_RE.match(body[j + 6][1].strip())
+    m_end_k = END_DO_RE.match(body[j + 7][1].strip())
+    m_end_i = END_DO_RE.match(body[j + 8][1].strip())
+    end_block = body[j + 9][1].strip().lower() == "end block"
+    if not (m_do_i and m_do_k and m_init and m_do_j and m_acc and m_end_j and m_scale and m_end_k and m_end_i and end_block):
+        return None
+
+    iv = m_do_i.group(1).strip()
+    kv = m_do_k.group(1).strip()
+    jv = m_do_j.group(1).strip()
+    ilb, iub, istep = m_do_i.group(2).strip(), m_do_i.group(3).strip(), m_do_i.group(4)
+    klb, kub, kstep = m_do_k.group(2).strip(), m_do_k.group(3).strip(), m_do_k.group(4)
+    jlb, jub, jstep = m_do_j.group(2).strip(), m_do_j.group(3).strip(), m_do_j.group(4)
+    if normalize_expr(ilb) != normalize_expr("1") or normalize_expr(klb) != normalize_expr("1") or normalize_expr(jlb) != normalize_expr("1"):
+        return None
+    if (istep is not None and istep.strip() != "1") or (kstep is not None and kstep.strip() != "1") or (jstep is not None and jstep.strip() != "1"):
+        return None
+    if normalize_expr(iub) != normalize_expr(kub):
+        return None
+
+    lhs_init = parse_indexed_name(m_init.group(1).strip())
+    if lhs_init is None or len(lhs_init[1]) != 2:
+        return None
+    c_name, c_args = lhs_init
+    if c_args[0].strip().lower() != iv.lower() or c_args[1].strip().lower() != kv.lower():
+        return None
+    if not ZERO_LITERAL_RE.match(m_init.group(2).strip()):
+        return None
+
+    lhs_acc = m_acc.group(1).strip()
+    rhs_acc = m_acc.group(2).strip()
+    if normalize_expr(lhs_acc) != normalize_expr(f"{c_name}({iv},{kv})"):
+        return None
+    m_add = re.match(r"^\s*(.+?)\s*\+\s*(.+)\s*$", rhs_acc)
+    if not m_add:
+        return None
+    if normalize_expr(m_add.group(1).strip()) != normalize_expr(lhs_acc):
+        return None
+    expr = m_add.group(2).strip().replace(" ", "")
+    m_prod = re.match(
+        rf"^([a-z][a-z0-9_]*)\({re.escape(jv)},{re.escape(iv)}\)\*([a-z][a-z0-9_]*)\({re.escape(jv)},{re.escape(kv)}\)$",
+        expr,
+        re.IGNORECASE,
+    )
+    if not m_prod:
+        # also allow commuted factors
+        m_prod = re.match(
+            rf"^([a-z][a-z0-9_]*)\({re.escape(jv)},{re.escape(kv)}\)\*([a-z][a-z0-9_]*)\({re.escape(jv)},{re.escape(iv)}\)$",
+            expr,
+            re.IGNORECASE,
+        )
+    if not m_prod:
+        return None
+    a1 = m_prod.group(1).lower()
+    a2 = m_prod.group(2).lower()
+    if a1 != a2:
+        return None
+    a_name = m_prod.group(1)
+
+    lhs_scale = m_scale.group(1).strip()
+    rhs_scale = m_scale.group(2).strip()
+    if normalize_expr(lhs_scale) != normalize_expr(lhs_init[0] + f"({iv},{kv})"):
+        return None
+    m_div = re.match(r"^\s*(.+?)\s*/\s*(.+)\s*$", rhs_scale)
+    if not m_div:
+        return None
+    if normalize_expr(m_div.group(1).strip()) != normalize_expr(lhs_scale):
+        return None
+    scale = m_div.group(2).strip()
+
+    # Build compact lhs/rhs if bounds match declarations.
+    lhs_expr = f"{c_name}(1:{iub}, 1:{kub})"
+    cb = rank2_bounds.get(c_name.lower())
+    if cb is not None and normalize_expr(cb[0]) == normalize_expr(iub) and normalize_expr(cb[1]) == normalize_expr(kub):
+        lhs_expr = c_name
+
+    rhs_a = f"{a_name}(1:{jub}, 1:{iub})"
+    ab = rank2_bounds.get(a_name.lower())
+    if ab is not None and normalize_expr(ab[0]) == normalize_expr(jub) and normalize_expr(ab[1]) == normalize_expr(iub):
+        rhs_a = a_name
+
+    scale_clean = scale
+    while True:
+        m_par = re.match(r"^\(\s*(.+?)\s*\)$", scale_clean)
+        if not m_par:
+            break
+        scale_clean = m_par.group(1).strip()
+    suggestion = f"{lhs_expr} = matmul(transpose({rhs_a}), {rhs_a}) / ({scale_clean})"
+    return (j + 9, suggestion, body[j + 9][0])
+
+
 def maybe_reduction_product(
     loop_var: str,
     rng: str,
@@ -2371,6 +3527,276 @@ def maybe_nested_inner_sum(
     return f"{lhs} = sum({expr_s})"
 
 
+def maybe_nested_scalar_reduction_sum(
+    outer_var: str,
+    outer_rng: str,
+    inner_do_stmt: str,
+    accum_stmt: str,
+    prev_stmt: Optional[str],
+    decl_bounds: Dict[str, str],
+    array_names: Set[str],
+    rank2_bounds: Optional[Dict[str, Tuple[str, str]]] = None,
+) -> Optional[str]:
+    """Detect:
+      acc = 0
+      do outer=...
+         do inner=...
+            acc = acc + expr(outer,inner,...)
+         end do
+      end do
+    and fold to acc = sum(expr(...)).
+    """
+    if prev_stmt is None:
+        return None
+    mp = ASSIGN_RE.match(prev_stmt.strip())
+    mi = DO_RE.match(inner_do_stmt.strip())
+    ma = ASSIGN_RE.match(accum_stmt.strip())
+    if not mp or not mi or not ma:
+        return None
+    acc_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+    acc_lhs = SIMPLE_NAME_RE.match(ma.group(1).strip())
+    if not acc_prev or not acc_lhs:
+        return None
+    acc = acc_lhs.group(1).lower()
+    if acc_prev.group(1).lower() != acc:
+        return None
+    madd = ADD_ACC_RE.match(ma.group(2).strip())
+    if not madd or madd.group(1).lower() != acc:
+        return None
+    inner_var = mi.group(1).strip()
+    inner_lb = mi.group(2).strip()
+    inner_ub = mi.group(3).strip()
+    expr = madd.group(2).strip()
+
+    lb_o, ub_o = split_range(outer_rng)
+    expr_s = replace_index_with_slice(expr, inner_var, inner_lb, inner_ub)
+    expr_s = replace_index_var_in_multidim_refs(expr_s, inner_var, inner_lb, inner_ub)
+    expr_s = replace_index_with_slice(expr_s, outer_var, lb_o, ub_o)
+    expr_s = replace_index_var_in_multidim_refs(expr_s, outer_var, lb_o, ub_o)
+    if has_loop_var(expr_s, inner_var) or has_loop_var(expr_s, outer_var):
+        return None
+    if expr_s == expr:
+        return None
+    expr_s = simplify_section_expr(expr_s, decl_bounds)
+    if rank2_bounds:
+        expr_s = simplify_section_expr_rank2(expr_s, rank2_bounds)
+    if has_disallowed_function_calls(expr_s, array_names):
+        return None
+    return f"{acc} = sum({expr_s})"
+
+
+def maybe_block_nested_scalar_reduction_sum(
+    body: List[Tuple[int, str]],
+    i: int,
+    decl_bounds: Dict[str, str],
+    array_names: Set[str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[Tuple[int, int, str, int]]:
+    """Detect inside BLOCK:
+      acc = 0
+      do outer=...
+        do inner=...
+          acc = acc + expr
+        end do
+      end do
+    and fold to acc = sum(expr(...)).
+    Returns (start_idx, end_idx, suggestion, end_line).
+    """
+    if i >= len(body) or body[i][1].strip().lower() != "block":
+        return None
+    j = i + 1
+    while j < len(body) and TYPE_DECL_RE.match(body[j][1].strip().lower()):
+        j += 1
+    if j + 5 >= len(body):
+        return None
+    stmt_init = body[j][1]
+    stmt_odo = body[j + 1][1]
+    stmt_ido = body[j + 2][1]
+    stmt_acc = body[j + 3][1]
+    stmt_iend = body[j + 4][1]
+    stmt_oend = body[j + 5][1]
+    mdo = DO_RE.match(stmt_odo.strip())
+    if mdo is None:
+        return None
+    if not END_DO_RE.match(stmt_iend.strip()) or not END_DO_RE.match(stmt_oend.strip()):
+        return None
+    outer_var = mdo.group(1).strip()
+    outer_rng = build_range(mdo.group(2).strip(), mdo.group(3).strip(), mdo.group(4).strip() if mdo.group(4) else None)
+    sugg = maybe_nested_scalar_reduction_sum(
+        outer_var, outer_rng, stmt_ido, stmt_acc, stmt_init, decl_bounds, array_names, rank2_bounds
+    )
+    if sugg is None:
+        return None
+    return (j, j + 5, sugg, body[j + 5][0])
+
+
+def maybe_block_norm2_from_loops(
+    body: List[Tuple[int, str]],
+    i: int,
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[Tuple[int, str, int]]:
+    """Detect block loop patterns equivalent to norm2(x[, dim=...])."""
+    if i >= len(body) or body[i][1].strip().lower() != "block":
+        return None
+
+    j = i + 1
+    while j < len(body) and TYPE_DECL_RE.match(body[j][1].strip().lower()):
+        j += 1
+    if j + 6 >= len(body):
+        return None
+
+    m_do_o = DO_RE.match(body[j][1].strip())
+    if m_do_o is None:
+        return None
+    outer = m_do_o.group(1).strip()
+    lb_o = m_do_o.group(2).strip()
+    ub_o = m_do_o.group(3).strip()
+
+    m_init = ASSIGN_RE.match(body[j + 1][1].strip())
+    m_do_i = DO_RE.match(body[j + 2][1].strip())
+    m_acc = ASSIGN_RE.match(body[j + 3][1].strip())
+    if m_init is None or m_do_i is None or m_acc is None:
+        return None
+    inner = m_do_i.group(1).strip()
+    lb_i = m_do_i.group(2).strip()
+    ub_i = m_do_i.group(3).strip()
+
+    lhs_init = m_init.group(1).strip()
+    lhs_acc = m_acc.group(1).strip()
+    rhs_acc = m_acc.group(2).strip()
+    if normalize_expr(lhs_init) != normalize_expr(lhs_acc):
+        return None
+
+    madd = re.match(r"^\s*(.+?)\s*\+\s*(.+)\s*$", rhs_acc)
+    if not madd:
+        return None
+    if normalize_expr(madd.group(1).strip()) != normalize_expr(lhs_acc):
+        return None
+    term = madd.group(2).strip()
+    m_pow = re.match(
+        r"^\s*([a-z][a-z0-9_]*)\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)\s*\*\*\s*2(?:\.0+)?\s*$",
+        term,
+        re.IGNORECASE,
+    )
+    if not m_pow:
+        return None
+    arr = m_pow.group(1).lower()
+    a1 = m_pow.group(2).strip()
+    a2 = m_pow.group(3).strip()
+
+    if not END_DO_RE.match(body[j + 4][1].strip()):
+        return None
+
+    m_sqrt = ASSIGN_RE.match(body[j + 5][1].strip())
+    if m_sqrt is None:
+        return None
+    lhs_s = m_sqrt.group(1).strip()
+    rhs_s = m_sqrt.group(2).strip()
+    if normalize_expr(lhs_s) != normalize_expr(lhs_acc):
+        return None
+    if normalize_expr(rhs_s) != normalize_expr(f"sqrt({lhs_acc})"):
+        return None
+
+    if not END_DO_RE.match(body[j + 6][1].strip()):
+        return None
+
+    has_print = False
+    print_stmt = ""
+    end_idx = j + 7
+    if j + 8 < len(body) and PRINT_STMT_RE.match(body[j + 7][1].strip()) and body[j + 8][1].strip().lower() == "end block":
+        has_print = True
+        print_stmt = body[j + 7][1].strip()
+        end_idx = j + 8
+    elif j + 7 < len(body) and body[j + 7][1].strip().lower() == "end block":
+        has_print = False
+        end_idx = j + 7
+    else:
+        return None
+
+    lhs_base = fscan.base_identifier(lhs_acc)
+    if lhs_base is None:
+        return None
+    m_lhs_idx = INDEXED_NAME_RE.match(lhs_acc)
+    lhs_idx = m_lhs_idx.group(2).strip() if m_lhs_idx else None
+
+    # Scalar norm2: lhs scalar, nested loops over both dims.
+    if lhs_idx is None:
+        if {normalize_expr(a1), normalize_expr(a2)} != {normalize_expr(outer), normalize_expr(inner)}:
+            return None
+        expr = f"{arr}({lb_i}:{ub_i}, {lb_o}:{ub_o})"
+        expr = simplify_section_expr_rank2(expr, rank2_bounds)
+        norm_expr = f"norm2({expr})"
+    else:
+        # Dim-reduction norm2: lhs indexed by outer loop variable.
+        if normalize_expr(lhs_idx) != normalize_expr(outer):
+            return None
+        if normalize_expr(a1) == normalize_expr(inner) and normalize_expr(a2) == normalize_expr(outer):
+            dim = 1
+            expr = f"{arr}({lb_i}:{ub_i}, {lb_o}:{ub_o})"
+        elif normalize_expr(a1) == normalize_expr(outer) and normalize_expr(a2) == normalize_expr(inner):
+            dim = 2
+            expr = f"{arr}({lb_o}:{ub_o}, {lb_i}:{ub_i})"
+        else:
+            return None
+        expr = simplify_section_expr_rank2(expr, rank2_bounds)
+        norm_expr = f"norm2({expr}, dim={dim})"
+
+    if has_print:
+        # Prefer direct PRINT rewrite to avoid leaking block-local temporaries.
+        sugg = re.sub(rf"\b{re.escape(lhs_base)}\b", norm_expr, print_stmt, flags=re.IGNORECASE)
+    else:
+        sugg = f"{lhs_base} = {norm_expr}"
+    return (end_idx, sugg, body[end_idx][0])
+
+
+def maybe_block_random_number_rank2(
+    body: List[Tuple[int, str]],
+    i: int,
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[Tuple[int, str, int]]:
+    """Detect block:
+      do j = 1,n2
+         call random_number(x(:,j))
+      end do
+    and rewrite to call random_number(x).
+    """
+    if i >= len(body) or body[i][1].strip().lower() != "block":
+        return None
+    j = i + 1
+    while j < len(body) and TYPE_DECL_RE.match(body[j][1].strip().lower()):
+        j += 1
+    if j + 3 >= len(body):
+        return None
+    m_do = DO_RE.match(body[j][1].strip())
+    m_call = RANDOM_CALL_RE.match(body[j + 1][1].strip())
+    if m_do is None or m_call is None:
+        return None
+    if not END_DO_RE.match(body[j + 2][1].strip()):
+        return None
+    if body[j + 3][1].strip().lower() != "end block":
+        return None
+    iv = m_do.group(1).strip()
+    lb = m_do.group(2).strip()
+    ub = m_do.group(3).strip()
+    arg = m_call.group(1).strip()
+    m_idx = INDEXED_SECOND_DIM_RE.match(arg)
+    if m_idx is None:
+        return None
+    arr = m_idx.group(1).strip().lower()
+    sec = m_idx.group(2).strip()
+    idx2 = m_idx.group(3).strip()
+    if normalize_expr(sec) != normalize_expr(":"):
+        return None
+    if normalize_expr(idx2) != normalize_expr(iv):
+        return None
+    rb = rank2_bounds.get(arr)
+    if rb is None:
+        return None
+    if normalize_expr(lb) != normalize_expr("1") or normalize_expr(ub) != normalize_expr(rb[1]):
+        return None
+    return (j + 3, f"call random_number({arr})", body[j + 3][0])
+
+
 def maybe_nested_transpose(
     outer_loop_var: str,
     outer_lb: str,
@@ -2434,6 +3860,78 @@ def maybe_nested_transpose(
     )
 
 
+def maybe_sqrt_sum_sq_to_norm2_expr(expr: str) -> Optional[str]:
+    """Rewrite sqrt(sum(a**2[, dim])) -> norm2(a[, dim]) when structurally safe."""
+    s = expr.strip()
+    if not s.lower().startswith("sqrt("):
+        return None
+    op = s.find("(")
+    if op < 0:
+        return None
+    cp = find_matching_paren(s, op)
+    if cp < 0 or cp != len(s) - 1:
+        return None
+    inside = s[op + 1 : cp].strip()
+    if not inside.lower().startswith("sum("):
+        return None
+    op2 = inside.find("(")
+    if op2 < 0:
+        return None
+    cp2 = find_matching_paren(inside, op2)
+    if cp2 < 0 or cp2 != len(inside) - 1:
+        return None
+    sum_inside = inside[op2 + 1 : cp2].strip()
+    args = split_top_level_commas(sum_inside)
+    if len(args) not in (1, 2):
+        return None
+    term = args[0].strip()
+    mpow = re.match(
+        r"^\s*\(?\s*(.+?)\s*\)?\s*\*\*\s*2(?:\.0+)?(?:_[a-z0-9_]+)?\s*$",
+        term,
+        re.IGNORECASE,
+    )
+    if not mpow:
+        return None
+    base = mpow.group(1).strip()
+    if len(args) == 1:
+        return f"norm2({base})"
+    dim_arg = args[1].strip()
+    if not dim_arg:
+        return None
+    return f"norm2({base}, {dim_arg})"
+
+
+def maybe_norm2_stmt_rewrite(stmt: str) -> Optional[str]:
+    """Rewrite assignment/PRINT* statements that can use NORM2 intrinsic."""
+    mp = PRINT_PREFIX_RE.match(stmt)
+    if mp:
+        tail = mp.group(1).strip()
+        items = [p.strip() for p in split_top_level_commas(tail)] if tail else []
+        if not items:
+            return None
+        changed = False
+        out_items: List[str] = []
+        for it in items:
+            nr = maybe_sqrt_sum_sq_to_norm2_expr(it)
+            if nr is not None:
+                out_items.append(nr)
+                changed = True
+            else:
+                out_items.append(it)
+        if changed:
+            return "print*," + ", ".join(out_items)
+
+    ms = ASSIGN_RE.match(stmt.strip())
+    if ms:
+        lhs = ms.group(1).strip()
+        rhs = ms.group(2).strip()
+        nr = maybe_sqrt_sum_sq_to_norm2_expr(rhs)
+        if nr is not None and nr != rhs:
+            return f"{lhs} = {nr}"
+        return None
+    return None
+
+
 def parse_indexed_name(text: str) -> Optional[Tuple[str, List[str]]]:
     """Parse name(args...) expression into (name, args)."""
     m = re.match(r"^\s*([a-z][a-z0-9_]*)\s*\((.*)\)\s*$", text, re.IGNORECASE)
@@ -2444,6 +3942,31 @@ def parse_indexed_name(text: str) -> Optional[Tuple[str, List[str]]]:
     if not args:
         return None
     return name, args
+
+
+def rhs_has_unsafe_rank1_self_ref(rhs: str, lhs_name: str, assigned: Set[int]) -> bool:
+    """
+    True when RHS has same-array rank-1 references that may be unsafe to pack.
+
+    Safe:
+    - references like lhs(k) where k is a literal integer not in assigned.
+    Unsafe/unknown:
+    - non-literal indices, slices/vector subscripts, or rank>1 refs.
+    - literal index that overlaps assigned.
+    """
+    s = strip_quoted_text(rhs)
+    pat = re.compile(rf"\b{re.escape(lhs_name)}\s*\(([^()]*)\)", re.IGNORECASE)
+    for m in pat.finditer(s):
+        inside = m.group(1).strip()
+        if not inside:
+            return True
+        if "," in inside or ":" in inside:
+            return True
+        if not re.fullmatch(r"[+-]?\d+", inside):
+            return True
+        if int(inside) in assigned:
+            return True
+    return False
 
 
 def parse_rank1_const_lhs_target(lhs: str) -> Optional[Tuple[str, int, int]]:
@@ -2671,8 +4194,8 @@ def maybe_constructor_pack(
     items0 = rhs_constructor_items(rhs0)
     if (hi0 - lo0 + 1) != len(items0):
         return None
-    # Avoid self-reference: constructor assignment evaluates rhs before lhs update.
-    if re.search(rf"\b{re.escape(name)}\b", strip_quoted_text(rhs0), re.IGNORECASE):
+    # Avoid unsafe same-array RHS reads of assigned indices.
+    if rhs_has_unsafe_rank1_self_ref(rhs0, name, set(range(lo0, hi0 + 1))):
         return None
 
     parts: List[str] = list(items0)
@@ -2691,7 +4214,7 @@ def maybe_constructor_pack(
         if lo != last_hi + 1:
             break
         rhs = m.group(2).strip()
-        if re.search(rf"\b{re.escape(name)}\b", strip_quoted_text(rhs), re.IGNORECASE):
+        if rhs_has_unsafe_rank1_self_ref(rhs, name, set(range(lo0, hi + 1))):
             break
         items = rhs_constructor_items(rhs)
         if (hi - lo + 1) != len(items):
@@ -2754,7 +4277,7 @@ def maybe_constructor_pack_sparse(
     if lo0 != hi0:
         return None
     rhs0 = m0.group(2).strip()
-    if re.search(rf"\b{re.escape(name0)}\b", strip_quoted_text(rhs0), re.IGNORECASE):
+    if rhs_has_unsafe_rank1_self_ref(rhs0, name0, {lo0}):
         return None
 
     idxs: List[int] = [lo0]
@@ -2775,7 +4298,7 @@ def maybe_constructor_pack_sparse(
         if lo in seen:
             return None
         rhs = m.group(2).strip()
-        if re.search(rf"\b{re.escape(name0)}\b", strip_quoted_text(rhs), re.IGNORECASE):
+        if rhs_has_unsafe_rank1_self_ref(rhs, name0, set(idxs) | {lo}):
             break
         idxs.append(lo)
         vals.append(rhs)
@@ -3102,6 +4625,214 @@ def maybe_matmul_mv_nested(
     return f"{y_sec} = matmul({a_sec}, {x_sec})"
 
 
+def maybe_matmul_mv_sum_loop(
+    loop_var: str,
+    rng: str,
+    body_stmt: str,
+    decl_bounds1: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """Detect y(i)=sum(A(i,:)*x) loop and suggest y = matmul(A, x)."""
+    def sec_for_compare(a_nm: str, sec_txt: str) -> str:
+        st = sec_txt.strip()
+        if st == ":":
+            rb = rank2_bounds.get(a_nm.lower())
+            if rb is not None:
+                return f"1:{rb[1]}"
+        return st
+
+    m = ASSIGN_RE.match(body_stmt.strip())
+    if not m:
+        return None
+    lhs = parse_indexed_name(m.group(1).strip())
+    if lhs is None or len(lhs[1]) != 1 or lhs[1][0].lower() != loop_var.lower():
+        return None
+    y_name = lhs[0]
+
+    rhs = m.group(2).strip()
+    msum = re.match(r"^\s*sum\s*\(\s*(.+)\s*\)\s*$", rhs, re.IGNORECASE)
+    if not msum:
+        return None
+    sum_arg = msum.group(1).strip()
+    # Keep this conservative: only plain SUM(expr), not SUM(expr, dim=...).
+    if len(split_top_level_commas(sum_arg)) != 1:
+        return None
+
+    mm = re.match(r"^\s*(.+?)\s*\*\s*(.+)\s*$", sum_arg, re.IGNORECASE)
+    if not mm:
+        return None
+    factors = [mm.group(1).strip(), mm.group(2).strip()]
+    parsed = [parse_indexed_name(f) for f in factors]
+    simple = [SIMPLE_NAME_RE.match(f) for f in factors]
+
+    a_name = ""
+    x_name = ""
+    sec = ""
+    for idx in (0, 1):
+        p_a = parsed[idx]
+        if p_a is None:
+            continue
+        n0, a0 = p_a
+        if len(a0) != 2 or a0[0].lower() != loop_var.lower():
+            continue
+        if re.search(rf"\b{re.escape(loop_var)}\b", a0[1], re.IGNORECASE):
+            continue
+        other = 1 - idx
+        p_x = parsed[other]
+        if p_x is not None:
+            n1, a1 = p_x
+            if len(a1) == 1 and normalize_expr(sec_for_compare(n0, a0[1])) == normalize_expr(a1[0]):
+                a_name = n0
+                x_name = n1
+                sec = a0[1].strip()
+                break
+        elif simple[other] is not None:
+            n1 = simple[other].group(1)
+            xb = decl_bounds1.get(n1.lower())
+            if xb is not None and normalize_expr(xb) == normalize_expr(sec_for_compare(n0, a0[1])):
+                a_name = n0
+                x_name = n1
+                sec = a0[1].strip()
+                break
+    if not a_name:
+        return None
+
+    outer_lb, outer_ub = split_range(rng)
+    y_sec = f"{y_name}({rng})"
+    a_sec = f"{a_name}({rng}, {sec})"
+    x_sec = x_name
+
+    yb = decl_bounds1.get(y_name.lower())
+    ab = rank2_bounds.get(a_name.lower())
+    xb = decl_bounds1.get(x_name.lower())
+    if (
+        yb is not None
+        and ab is not None
+        and xb is not None
+        and normalize_expr(yb) == normalize_expr(rng)
+        and normalize_expr(ab[0]) == normalize_expr(outer_ub.strip())
+        and normalize_expr(ab[1]) == normalize_expr(sec_for_compare(a_name, sec))
+        and normalize_expr(xb) == normalize_expr(sec_for_compare(a_name, sec))
+        and normalize_expr(outer_lb.strip()) == normalize_expr("1")
+    ):
+        return f"{y_name} = matmul({a_name}, {x_name})"
+
+    y_sec = simplify_section_expr(y_sec, decl_bounds1)
+    a_sec = simplify_section_expr(a_sec, decl_bounds1)
+    a_sec = simplify_section_expr_rank2(a_sec, rank2_bounds)
+    ab2 = rank2_bounds.get(a_name.lower())
+    if ab2 is not None:
+        if normalize_expr(a_sec) == normalize_expr(f"{a_name}(1:{ab2[0]},:)"):
+            a_sec = a_name
+    return f"{y_sec} = matmul({a_sec}, {x_sec})"
+
+
+def maybe_matmul_mv_preinit_nested(
+    init_stmt: str,
+    outer_do_stmt: str,
+    inner_do_stmt: str,
+    inner_body_stmt: str,
+    decl_bounds1: Dict[str, str],
+    rank2_bounds: Dict[str, Tuple[str, str]],
+) -> Optional[str]:
+    """Detect y(:)=0; do i; do j; y(i)=y(i)+A(i,j)*x(j); enddo; enddo -> matmul(A,x)."""
+    m_init = ASSIGN_RE.match(init_stmt.strip())
+    m_odo = DO_RE.match(outer_do_stmt.strip())
+    m_ido = DO_RE.match(inner_do_stmt.strip())
+    m_acc = ASSIGN_RE.match(inner_body_stmt.strip())
+    if not m_init or not m_odo or not m_ido or not m_acc:
+        return None
+    if not ZERO_LITERAL_RE.match(m_init.group(2).strip()):
+        return None
+
+    outer_var = m_odo.group(1)
+    outer_rng = build_range(m_odo.group(2), m_odo.group(3), m_odo.group(4))
+    inner_var = m_ido.group(1)
+    inner_rng = build_range(m_ido.group(2), m_ido.group(3), m_ido.group(4))
+
+    lhs_acc = parse_indexed_name(m_acc.group(1).strip())
+    if lhs_acc is None or len(lhs_acc[1]) != 1 or lhs_acc[1][0].lower() != outer_var.lower():
+        return None
+    y_name = lhs_acc[0]
+
+    # Init must target same vector as accumulator target (whole or full section).
+    lhs_init_txt = m_init.group(1).strip()
+    init_name = fscan.base_identifier(lhs_init_txt)
+    if init_name is None or init_name.lower() != y_name.lower():
+        return None
+    init_idx = parse_indexed_name(lhs_init_txt)
+    if init_idx is not None:
+        if len(init_idx[1]) != 1:
+            return None
+        init_arg = init_idx[1][0].strip()
+        if not (
+            init_arg.lower() == outer_var.lower()
+            or normalize_expr(init_arg) == normalize_expr(outer_rng)
+        ):
+            return None
+
+    madd = re.match(r"^\s*(.+?)\s*\+\s*(.+)$", m_acc.group(2).strip(), re.IGNORECASE)
+    if not madd:
+        return None
+    acc_ref = parse_indexed_name(madd.group(1).strip())
+    if acc_ref is None or acc_ref != lhs_acc:
+        return None
+
+    prod = madd.group(2).strip()
+    mm = re.match(r"^\s*(.+?)\s*\*\s*(.+)\s*$", prod, re.IGNORECASE)
+    if not mm:
+        return None
+    factors = [mm.group(1).strip(), mm.group(2).strip()]
+    parsed = [parse_indexed_name(f) for f in factors]
+    if parsed[0] is None or parsed[1] is None:
+        return None
+
+    a_name = ""
+    x_name = ""
+    for p0, p1 in (parsed, parsed[::-1]):
+        n0, a0 = p0
+        n1, a1 = p1
+        if (
+            len(a0) == 2
+            and len(a1) == 1
+            and a0[0].lower() == outer_var.lower()
+            and a0[1].lower() == inner_var.lower()
+            and a1[0].lower() == inner_var.lower()
+        ):
+            a_name = n0
+            x_name = n1
+            break
+    if not a_name:
+        return None
+
+    outer_lb, outer_ub = split_range(outer_rng)
+    inner_lb, inner_ub = split_range(inner_rng)
+    y_sec = f"{y_name}({outer_rng})"
+    a_sec = f"{a_name}({outer_rng}, {inner_rng})"
+    x_sec = f"{x_name}({inner_rng})"
+
+    yb = decl_bounds1.get(y_name.lower())
+    ab = rank2_bounds.get(a_name.lower())
+    xb = decl_bounds1.get(x_name.lower())
+    if (
+        yb is not None
+        and ab is not None
+        and xb is not None
+        and normalize_expr(yb) == normalize_expr(outer_rng)
+        and normalize_expr(ab[0]) == normalize_expr(outer_ub.strip())
+        and normalize_expr(ab[1]) == normalize_expr(inner_ub.strip())
+        and normalize_expr(xb) == normalize_expr(inner_rng)
+        and normalize_expr(outer_lb.strip()) == normalize_expr("1")
+        and normalize_expr(inner_lb.strip()) == normalize_expr("1")
+    ):
+        return f"{y_name} = matmul({a_name}, {x_name})"
+
+    a_sec = simplify_section_expr(a_sec, decl_bounds1)
+    x_sec = simplify_section_expr(x_sec, decl_bounds1)
+    y_sec = simplify_section_expr(y_sec, decl_bounds1)
+    return f"{y_sec} = matmul({a_sec}, {x_sec})"
+
+
 def maybe_matmul_mm_nested(
     outer_loop_var: str,
     outer_rng: str,
@@ -3326,8 +5057,9 @@ def maybe_loop_to_concurrent_or_forall(
         return None
 
     if allow_concurrent:
-        # Conservative purity proxy for concurrent mode: reject non-array calls.
-        if not has_nonarray_call(rhs, array_names):
+        # Conservative purity proxy for concurrent mode: allow array refs and
+        # elemental intrinsic calls; reject everything else.
+        if not has_disallowed_function_calls(rhs, array_names):
             return (
                 f"do concurrent ({loop_var} = {rng})\n"
                 f"   {body_stmt.strip()}\n"
@@ -3387,8 +5119,9 @@ def maybe_loopnest_to_concurrent_or_forall(
 
     control = ", ".join(f"{v} = {r}" for v, r in zip(loop_vars, ranges))
     if allow_concurrent:
-        # Conservative purity proxy for concurrent mode: reject non-array calls.
-        if not has_nonarray_call(rhs, array_names):
+        # Conservative purity proxy for concurrent mode: allow array refs and
+        # elemental intrinsic calls; reject everything else.
+        if not has_disallowed_function_calls(rhs, array_names):
             return (
                 f"do concurrent ({control})\n"
                 f"   {body_stmt.strip()}\n"
@@ -4291,6 +6024,87 @@ def maybe_conditional_set(
         ]
     )
     return where_s, "elementwise_conditional_where"
+
+
+def maybe_sum_merge_ifelse(
+    loop_var: str,
+    rng: str,
+    prev_stmt: Optional[str],
+    if_stmt: str,
+    true_stmt: str,
+    false_stmt: str,
+    decl_bounds: Dict[str, str],
+    array_names: Set[str],
+    decl_scalar_inits: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Detect IF/ELSE accumulator fold and suggest SUM(MERGE(...))."""
+    mif = IF_THEN_RE.match(if_stmt.strip())
+    mt = ASSIGN_RE.match(true_stmt.strip())
+    mf = ASSIGN_RE.match(false_stmt.strip())
+    if not mif or not mt or not mf:
+        return None
+
+    lhs_t = SIMPLE_NAME_RE.match(mt.group(1).strip())
+    lhs_f = SIMPLE_NAME_RE.match(mf.group(1).strip())
+    if not lhs_t or not lhs_f:
+        return None
+    acc = lhs_t.group(1).lower()
+    if lhs_f.group(1).lower() != acc:
+        return None
+
+    at = ADD_ACC_RE.match(mt.group(2).strip())
+    af = ADD_ACC_RE.match(mf.group(2).strip())
+    if not at or not af:
+        return None
+    if at.group(1).lower() != acc or af.group(1).lower() != acc:
+        return None
+
+    init_seen = False
+    init_expr: Optional[str] = None
+    if prev_stmt is not None:
+        mp = ASSIGN_RE.match(prev_stmt.strip())
+        if mp:
+            lhs_prev = SIMPLE_NAME_RE.match(mp.group(1).strip())
+            if lhs_prev and lhs_prev.group(1).lower() == acc:
+                init_seen = True
+                init_expr = mp.group(2).strip()
+    if not init_seen and decl_scalar_inits is not None and acc in decl_scalar_inits:
+        init_seen = True
+        init_expr = decl_scalar_inits[acc].strip()
+    if not init_seen:
+        return None
+
+    cond = mif.group(1).strip()
+    expr_t = at.group(2).strip()
+    expr_f = af.group(2).strip()
+    lb, ubtxt = split_range(rng)
+    cond_s = replace_index_with_slice(cond, loop_var, lb, ubtxt)
+    expr_t_s = replace_index_with_slice(expr_t, loop_var, lb, ubtxt)
+    expr_f_s = replace_index_with_slice(expr_f, loop_var, lb, ubtxt)
+    if (
+        has_loop_var(cond_s, loop_var)
+        or has_loop_var(expr_t_s, loop_var)
+        or has_loop_var(expr_f_s, loop_var)
+    ):
+        return None
+    if cond_s == cond or expr_t_s == expr_t or expr_f_s == expr_f:
+        return None
+    cond_s = simplify_section_expr(cond_s, decl_bounds)
+    expr_t_s = simplify_section_expr(expr_t_s, decl_bounds)
+    expr_f_s = simplify_section_expr(expr_f_s, decl_bounds)
+    if (
+        has_disallowed_function_calls(cond_s, array_names)
+        or has_disallowed_function_calls(expr_t_s, array_names)
+        or has_disallowed_function_calls(expr_f_s, array_names)
+    ):
+        return None
+
+    sum_expr = f"sum(merge({expr_t_s}, {expr_f_s}, {cond_s}))"
+    if not init_expr:
+        return f"{acc} = {sum_expr}"
+    if normalize_expr(init_expr) in {"0", "+0", "0.0", "+0.0", "0d0", "+0d0", "0.0d0", "+0.0d0"}:
+        return f"{acc} = {sum_expr}"
+    return f"{acc} = {init_expr} + {sum_expr}"
 
 
 def _rel_true_for_op(op: str, rel: int) -> bool:
@@ -5431,6 +7245,18 @@ def maybe_spread_nested_2d(
             re.IGNORECASE,
         )
         rhs_s = pat2.sub(lambda _m: f"{r2name}(1:{n1}, 1:{n2})", rhs_s)
+    # Also handle rank-2 dummy/assumed-shape arrays not present in rank2_bounds,
+    # e.g. x(:,:) dummies referenced as x(i,j).
+    pat_any2 = re.compile(
+        rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(dim1_var)}\s*,\s*{re.escape(dim2_var)}\s*\)",
+        re.IGNORECASE,
+    )
+    rhs_s = pat_any2.sub(
+        lambda m: m.group(0)
+        if m.group(1).lower() in ELEMENTAL_INTRINSICS or m.group(1).lower() in USER_ELEMENTAL_CALLS
+        else f"{m.group(1)}(1:{n1}, 1:{n2})",
+        rhs_s,
+    )
     # Convert rank-1 refs by loop variable to SPREAD broadcasts.
     pat_dim1 = re.compile(rf"\b([a-z][a-z0-9_]*)\s*\(\s*{re.escape(dim1_var)}\s*\)", re.IGNORECASE)
     rhs_s = pat_dim1.sub(lambda m: f"spread({m.group(1)}, dim=2, ncopies={n2})", rhs_s)
@@ -5449,7 +7275,15 @@ def maybe_spread_nested_2d(
 
     rhs_s = simplify_section_expr(rhs_s, decl_bounds1)
     rhs_s = simplify_section_expr_rank2(rhs_s, rank2_bounds)
-    array_names = set(decl_bounds1.keys()) | set(rank2_bounds.keys())
+    array_names = set(decl_bounds1.keys()) | set(rank2_bounds.keys()) | {lhs_name.lower()}
+    # Treat call-like names in the rewritten RHS as array references unless
+    # they are known intrinsics/elementals. This keeps assumed-shape dummies
+    # like x(:,:) from being misclassified as function calls.
+    for mm in CALL_LIKE_RE.finditer(strip_quoted_text(rhs_s.lower())):
+        nm = mm.group(1).lower()
+        if nm in ELEMENTAL_INTRINSICS or nm in USER_ELEMENTAL_CALLS:
+            continue
+        array_names.add(nm)
     if has_disallowed_function_calls(rhs_s, array_names):
         return None
     if "spread(" not in rhs_s.lower():
@@ -5569,6 +7403,159 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
         ln, stmt = body[i]
         alloc_map.update(parse_alloc_shape_spec(stmt))
         alloc_rank1_bounds.update(parse_alloc_rank1_bounds(stmt))
+        norm2_stmt = maybe_norm2_stmt_rewrite(stmt)
+        if norm2_stmt is not None:
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="norm2_intrinsic",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln,
+                    suggestion=norm2_stmt,
+                )
+            )
+            i += 1
+            continue
+        blk_nested_sum = maybe_block_nested_scalar_reduction_sum(
+            body, i, decl_bounds, array_names, rank2_bounds
+        )
+        if blk_nested_sum is not None:
+            s_idx, e_idx, sugg_nsum, ln_end_nsum = blk_nested_sum
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="nested_reduction_sum_scalar",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=body[s_idx][0],
+                    end_line=ln_end_nsum,
+                    suggestion=sugg_nsum,
+                )
+            )
+            i = e_idx + 1
+            continue
+        blk_rand2 = maybe_block_random_number_rank2(body, i, rank2_bounds)
+        if blk_rand2 is not None:
+            end_idx_r2, sugg_r2, ln_end_r2 = blk_rand2
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="random_number_fill_2d_block",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end_r2,
+                    suggestion=sugg_r2,
+                )
+            )
+            i = end_idx_r2 + 1
+            continue
+        blk_norm2 = maybe_block_norm2_from_loops(body, i, rank2_bounds)
+        if blk_norm2 is not None:
+            end_idx_n2, sugg_n2, ln_end_n2 = blk_norm2
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="nested_reduction_norm2",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end_n2,
+                    suggestion=sugg_n2,
+                )
+            )
+            i = end_idx_n2 + 1
+            continue
+        blk_mm = maybe_block_matmul_transpose_scaled(body, i, rank2_bounds)
+        if blk_mm is not None:
+            end_idx_mm, sugg_mm, ln_end_mm = blk_mm
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="nested_matmul_mm_transpose_scaled",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end_mm,
+                    suggestion=sugg_mm,
+                )
+            )
+            i = end_idx_mm + 1
+            continue
+        blk_sqrt = maybe_block_reduction_sqrt_sum_dim1_scaled(
+            body, i, decl_bounds, rank2_bounds, array_names
+        )
+        if blk_sqrt is not None:
+            end_idx_s, sugg_s, ln_end_s = blk_sqrt
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="nested_reduction_sqrt_sum_dim1_scaled",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end_s,
+                    suggestion=sugg_s,
+                )
+            )
+            i = end_idx_s + 1
+            continue
+        blk_sqrt_in = maybe_block_reduction_sqrt_inside_outer_dim1(
+            body, i, decl_bounds, rank2_bounds, array_names
+        )
+        if blk_sqrt_in is not None:
+            end_idx_si, sugg_si, ln_end_si = blk_sqrt_in
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="nested_reduction_sqrt_sum_dim1_scaled",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end_si,
+                    suggestion=sugg_si,
+                )
+            )
+            i = end_idx_si + 1
+            continue
+        blk = maybe_block_reduction_sum_dim1_scaled(
+            body, i, decl_bounds, rank2_bounds, array_names
+        )
+        if blk is not None:
+            end_idx, sugg_blk, ln_end_blk = blk
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="nested_reduction_sum_dim1_scaled",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end_blk,
+                    suggestion=sugg_blk,
+                )
+            )
+            i = end_idx + 1
+            continue
+        blk2 = maybe_block_reduction_sum_dim2_scaled(
+            body, i, decl_bounds, rank2_bounds, array_names
+        )
+        if blk2 is not None:
+            end_idx2, sugg_blk2, ln_end_blk2 = blk2
+            findings.append(
+                Finding(
+                    path=unit.path,
+                    rule="nested_reduction_sum_dim2_scaled",
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    start_line=ln,
+                    end_line=ln_end_blk2,
+                    suggestion=sugg_blk2,
+                )
+            )
+            i = end_idx2 + 1
+            continue
         if i + 1 < len(body):
             sugg_alloc_src = maybe_allocate_source_pair(stmt, body[i + 1][1])
             if sugg_alloc_src is not None:
@@ -5640,6 +7627,47 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             )
             i = end_idx + 1
             continue
+        # Form A-1b: pre-init + nested matmul matrix-vector:
+        # y(1:m)=0
+        # do i=...
+        #    do j=...
+        #       y(i)=y(i)+A(i,j)*x(j)
+        #    end do
+        # end do
+        if i + 5 < len(body):
+            _ln_odo, stmt_odo = body[i + 1]
+            _ln_ido, stmt_ido = body[i + 2]
+            _ln_ibody, stmt_ibody = body[i + 3]
+            ln_iend, stmt_iend = body[i + 4]
+            ln_oend, stmt_oend = body[i + 5]
+            if (
+                DO_RE.match(stmt_odo.strip())
+                and DO_RE.match(stmt_ido.strip())
+                and END_DO_RE.match(stmt_iend.strip())
+                and END_DO_RE.match(stmt_oend.strip())
+            ):
+                sugg_mv_pre = maybe_matmul_mv_preinit_nested(
+                    stmt,
+                    stmt_odo,
+                    stmt_ido,
+                    stmt_ibody,
+                    decl_bounds,
+                    rank2_bounds,
+                )
+                if sugg_mv_pre is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="nested_matmul_mv",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=sugg_mv_pre,
+                        )
+                    )
+                    i += 6
+                    continue
         sugg_whole = maybe_whole_array_assign(
             stmt, decl_bounds, blocked_whole_names, class_rank1_names, alloc_rank1_bounds
         )
@@ -5964,6 +7992,31 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
         #       a(i,j) = ...
         #    end do
         # end do
+        if i + 5 < len(body):
+            _ln_tmp, stmt_tmp = body[i + 1]
+            _ln_ido, stmt_ido = body[i + 2]
+            _ln_ibody, stmt_ibody = body[i + 3]
+            ln_iend, stmt_iend = body[i + 4]
+            ln_oend, stmt_oend = body[i + 5]
+            if END_DO_RE.match(stmt_iend.strip()) and END_DO_RE.match(stmt_oend.strip()):
+                sugg_nreshape = maybe_nested_reshape_from_vector_fill(
+                    loop_var, lb, ub, step, stmt_tmp, stmt_ido, stmt_ibody, rank2_bounds
+                )
+                if sugg_nreshape is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="nested_reshape_from_vector_fill",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_oend,
+                            suggestion=sugg_nreshape,
+                        )
+                    )
+                    i += 6
+                    continue
+
         if i + 4 < len(body):
             _ln_ido, stmt_ido = body[i + 1]
             _ln_ibody, stmt_ibody = body[i + 2]
@@ -6222,6 +8275,23 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     )
                     i += 3
                     continue
+                sugg_msum = maybe_matmul_mv_sum_loop(
+                    loop_var, rng, stmt_body, decl_bounds, rank2_bounds
+                )
+                if sugg_msum is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="matmul_mv_sum_loop",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_msum,
+                        )
+                    )
+                    i += 3
+                    continue
                 sugg_ctor = maybe_constructor_fill_loop(
                     loop_var, lb, ub, step, stmt_body, decl_bounds, alloc_map, alloc_rank1_bounds
                 )
@@ -6400,6 +8470,29 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
             _ln_s2, stmt_s2 = body[i + 2]
             ln_end, stmt_end = body[i + 3]
             if END_DO_RE.match(stmt_end.strip()):
+                sugg_reshape = maybe_reshape_from_vector_fill(
+                    loop_var,
+                    lb,
+                    ub,
+                    step,
+                    stmt_s1,
+                    stmt_s2,
+                    rank2_bounds,
+                )
+                if sugg_reshape is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reshape_from_vector_fill",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=ln,
+                            end_line=ln_end,
+                            suggestion=sugg_reshape,
+                        )
+                    )
+                    i += 4
+                    continue
                 sugg_rand_elem = maybe_random_fill_then_elementwise(
                     loop_var,
                     rng,
@@ -6473,6 +8566,39 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     i += 6
                     continue
 
+        # Form A3b: scalar nested reduction with init before outer loop:
+        # acc = 0
+        # do j=...
+        #   do i=...
+        #     acc = acc + expr(i,j)
+        #   end do
+        # end do
+        if i + 4 < len(body):
+            _ln_ido, stmt_ido = body[i + 1]
+            _ln_ibody, stmt_ibody = body[i + 2]
+            ln_iend, stmt_iend = body[i + 3]
+            ln_oend, stmt_oend = body[i + 4]
+            if END_DO_RE.match(stmt_iend.strip()) and END_DO_RE.match(stmt_oend.strip()):
+                prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
+                start_line = body[i - 1][0] if i - 1 >= 0 else ln
+                sugg_nested_scalar = maybe_nested_scalar_reduction_sum(
+                    loop_var, rng, stmt_ido, stmt_ibody, prev_stmt, decl_bounds, array_names, rank2_bounds
+                )
+                if sugg_nested_scalar is not None:
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="nested_reduction_sum_scalar",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line,
+                            end_line=ln_oend,
+                            suggestion=sugg_nested_scalar,
+                        )
+                    )
+                    i += 5
+                    continue
+
         # Form D: IF/ELSE block inside loop body:
         # do ...
         #    if (cond) then
@@ -6506,6 +8632,34 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                             start_line=ln,
                             end_line=ln_end,
                             suggestion=suggestion,
+                        )
+                    )
+                    i += 7
+                    continue
+                prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
+                sugg_sum_merge = maybe_sum_merge_ifelse(
+                    loop_var,
+                    rng,
+                    prev_stmt,
+                    stmt_if,
+                    stmt_t,
+                    stmt_f,
+                    decl_bounds,
+                    array_names,
+                    decl_scalar_inits,
+                )
+                if sugg_sum_merge is not None:
+                    acc_name = sugg_sum_merge.split("=", 1)[0].strip().lower()
+                    start_line_acc = body[i - 1][0] if prev_stmt_assigns_name(prev_stmt, acc_name) and i - 1 >= 0 else ln
+                    findings.append(
+                        Finding(
+                            path=unit.path,
+                            rule="reduction_sum_merge",
+                            unit_kind=unit.kind,
+                            unit_name=unit.name,
+                            start_line=start_line_acc,
+                            end_line=ln_end,
+                            suggestion=sugg_sum_merge,
                         )
                     )
                     i += 7
@@ -6811,6 +8965,23 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 )
                 i = end_idx + 1
                 continue
+            sugg_temp_multi = maybe_temp_then_multi_elementwise(
+                loop_var, rng, inner_stmts, decl_bounds, rank2_bounds, decl_scalar_inits, alloc_map, array_names
+            )
+            if sugg_temp_multi is not None:
+                findings.append(
+                    Finding(
+                        path=unit.path,
+                        rule="elementwise_inline_temp_multi",
+                        unit_kind=unit.kind,
+                        unit_name=unit.name,
+                        start_line=ln,
+                        end_line=ln_end,
+                        suggestion=sugg_temp_multi,
+                    )
+                )
+                i = end_idx + 1
+                continue
             sugg_multi = maybe_multi_elementwise(
                 loop_var, rng, inner_stmts, decl_bounds, alloc_map, array_names
             )
@@ -7106,7 +9277,7 @@ def remove_unused_locals_from_lines(lines: List[str], path: Path) -> Tuple[List[
         used: Set[str] = set()
 
         for ln, stmt in unit.body:
-            low = stmt.strip().lower()
+            low = fscan.strip_comment(stmt).strip().lower()
             if not low:
                 continue
             if TYPE_DECL_RE.match(low) and "::" in low:
@@ -7216,7 +9387,9 @@ def annotate_file(path: Path, findings: List[Finding], *, backup: bool = True) -
 
         begin_msg = f"{indent_s}{BEGIN_TAG}{eol_s}"
         end_msg = f"{indent_e}{END_TAG}{eol_e}"
-        sug_lines = f.suggestion.splitlines() if "\n" in f.suggestion else [f.suggestion]
+        sug_lines = _nonblank_suggestion_lines(f.suggestion)
+        if not sug_lines:
+            continue
         sugg_msgs = [f"{indent_e}! {sl} !! suggested replacement by xarray.py{eol_e}" for sl in sug_lines]
 
         # Skip if already annotated around this range.
@@ -7248,6 +9421,7 @@ def apply_fix_file(
     annotate_removed: bool = False,
     out_path: Optional[Path] = None,
     create_backup: bool = True,
+    add_trace: bool = True,
 ) -> Tuple[int, Optional[Path], List[str]]:
     """Replace suggested blocks with array-operation statements and prune unused locals."""
     if not findings:
@@ -7279,13 +9453,15 @@ def apply_fix_file(
         eol = "\r\n" if raw_s.endswith("\r\n") else ("\n" if raw_s.endswith("\n") else "\n")
         indent = re.match(r"^\s*", raw_s).group(0) if raw_s else ""
         removed_lines: List[str] = []
-        if annotate_removed:
+        if annotate_removed and not _is_redundant_removed_block(lines[sidx : eidx + 1], f.suggestion):
             removed_lines.append(f"{indent}{REMOVED_BLOCK_BEGIN}{eol}")
             for old_raw in lines[sidx : eidx + 1]:
                 old_body = old_raw.rstrip("\r\n")
                 removed_lines.append(f"{indent}! {old_body}{eol}")
             removed_lines.append(f"{indent}{REMOVED_BLOCK_END}{eol}")
-        sug_lines = f.suggestion.splitlines() if "\n" in f.suggestion else [f.suggestion]
+        sug_lines = _nonblank_suggestion_lines(f.suggestion)
+        if not sug_lines:
+            continue
         repl_lines: List[str] = []
         if annotate and len(sug_lines) > 1:
             repl_lines.append(f"{indent}{CHANGED_BLOCK_BEGIN}{eol}")
@@ -7304,6 +9480,9 @@ def apply_fix_file(
     removed_locals: List[str] = []
     if replaced > 0:
         lines, removed_locals = remove_unused_locals_from_lines(lines, path)
+        lines = _prune_unused_generated_block_decls(lines)
+        lines = _remove_redundant_extreme_seed_assign(lines)
+        lines = _unwrap_redundant_blocks(lines)
     # Remove stale xarray annotation artifacts from prior annotate runs so
     # repeated fix/annotate cycles stay readable and idempotent.
     cleaned: List[str] = []
@@ -7321,8 +9500,534 @@ def apply_fix_file(
     if out_path is None and create_backup:
         backup = make_backup_path(path)
         shutil.copy2(path, backup)
-    target.write_text("".join(lines), encoding="utf-8")
+    out_text = "".join(lines)
+    if add_trace:
+        out_text = with_trace_header(out_text, tool_name="xarray.py", source_name=path.name)
+    target.write_text(out_text, encoding="utf-8")
     return changed, backup, removed_locals
+
+
+def _normalize_stmt_for_removed_compare(stmt: str) -> str:
+    """Canonicalize a statement for removed-vs-changed redundancy checks."""
+    code = split_code_comment(stmt)[0].strip().lower()
+    # Treat explicit full slices like a(1:n) as equivalent to whole-array a.
+    code = re.sub(
+        r"\b([a-z][a-z0-9_]*)\s*\(\s*1\s*:\s*[a-z][a-z0-9_]*\s*\)",
+        r"\1",
+        code,
+        flags=re.IGNORECASE,
+    )
+    # Ignore formatting whitespace.
+    return re.sub(r"\s+", "", code)
+
+
+def _is_redundant_removed_block(old_lines: List[str], suggestion: str) -> bool:
+    """
+    True when removed block is effectively identical to replacement suggestion.
+
+    This avoids noisy annotate-removed output such as:
+      old: x(1:n) = ...
+      new: x = ...
+    """
+    if len(old_lines) != 1:
+        return False
+    sug_lines = suggestion.splitlines() if "\n" in suggestion else [suggestion]
+    if len(sug_lines) != 1:
+        return False
+    old_norm = _normalize_stmt_for_removed_compare(old_lines[0])
+    new_norm = _normalize_stmt_for_removed_compare(sug_lines[0])
+    return bool(old_norm) and old_norm == new_norm
+
+
+def _nonblank_suggestion_lines(suggestion: str) -> List[str]:
+    """Split suggestion text and drop blank lines."""
+    lines = suggestion.splitlines() if "\n" in suggestion else [suggestion]
+    return [ln for ln in lines if ln.strip()]
+
+
+def _is_generated_loop_var(name: str) -> bool:
+    n = name.strip().lower()
+    return bool(re.fullmatch(r"[ijklm]_*$", n))
+
+
+def _prune_unused_generated_block_decls(lines: List[str]) -> List[str]:
+    """Remove unused generated loop vars from declarations inside BLOCK scopes."""
+    out = list(lines)
+    stack: List[int] = []
+    pairs: List[Tuple[int, int]] = []
+    for i, ln in enumerate(out):
+        code = split_code_comment(ln.rstrip("\r\n"))[0].strip()
+        if re.match(r"^block\b", code, re.IGNORECASE):
+            stack.append(i)
+        elif re.match(r"^end\s+block\b", code, re.IGNORECASE):
+            if stack:
+                pairs.append((stack.pop(), i))
+
+    for s, e in pairs:
+        used: Set[str] = set()
+        decl_lines: List[int] = []
+        for i in range(s + 1, e):
+            code = split_code_comment(out[i].rstrip("\r\n"))[0].strip()
+            if not code:
+                continue
+            if re.match(r"^\s*integer\b.*::", code, re.IGNORECASE):
+                decl_lines.append(i)
+                continue
+            for nm in re.findall(r"\b[a-z][a-z0-9_]*\b", code, re.IGNORECASE):
+                if _is_generated_loop_var(nm):
+                    used.add(nm.lower())
+
+        for i in decl_lines:
+            raw = out[i]
+            eol = "\r\n" if raw.endswith("\r\n") else ("\n" if raw.endswith("\n") else "")
+            code, cmt = split_code_comment(raw.rstrip("\r\n"))
+            m = re.match(r"^(\s*integer\b[^:\n]*::)\s*(.*)$", code, re.IGNORECASE)
+            if not m:
+                continue
+            head = m.group(1)
+            body = m.group(2).strip()
+            items = [t.strip() for t in split_top_level_commas(body) if t.strip()]
+            kept: List[str] = []
+            changed = False
+            for it in items:
+                if _is_generated_loop_var(it) and it.lower() not in used:
+                    changed = True
+                    continue
+                kept.append(it)
+            if not changed:
+                continue
+            if kept:
+                rebuilt = f"{head} {', '.join(kept)}"
+                if cmt:
+                    rebuilt += cmt
+                out[i] = rebuilt + eol
+            else:
+                out[i] = ""
+    return out
+
+
+def _remove_redundant_extreme_seed_assign(lines: List[str]) -> List[str]:
+    """Drop redundant `x = seed` immediately before `x = minval/maxval(...)`."""
+    out = list(lines)
+    i = 0
+    while i + 1 < len(out):
+        c1 = split_code_comment(out[i].rstrip("\r\n"))[0].strip()
+        c2 = split_code_comment(out[i + 1].rstrip("\r\n"))[0].strip()
+        m1 = ASSIGN_RE.match(c1)
+        m2 = ASSIGN_RE.match(c2)
+        if m1 and m2:
+            lhs1 = m1.group(1).strip().lower()
+            lhs2 = m2.group(1).strip().lower()
+            rhs2 = m2.group(2).strip()
+            if lhs1 == lhs2 and re.match(r"^(minval|maxval)\s*\(", rhs2, re.IGNORECASE):
+                out.pop(i)
+                continue
+        i += 1
+    return out
+
+
+def _unwrap_redundant_blocks(lines: List[str]) -> List[str]:
+    """Remove BLOCK/END BLOCK wrappers that contain no declarations."""
+    out = list(lines)
+    changed = True
+    while changed:
+        changed = False
+        stack: List[int] = []
+        pairs: List[Tuple[int, int]] = []
+        for i, ln in enumerate(out):
+            code = split_code_comment(ln.rstrip("\r\n"))[0].strip()
+            if re.match(r"^block\b", code, re.IGNORECASE):
+                stack.append(i)
+            elif re.match(r"^end\s+block\b", code, re.IGNORECASE):
+                if stack:
+                    pairs.append((stack.pop(), i))
+        for s, e in reversed(pairs):
+            has_decl = False
+            for j in range(s + 1, e):
+                code = split_code_comment(out[j].rstrip("\r\n"))[0].strip()
+                if not code:
+                    continue
+                if TYPE_DECL_RE.match(code):
+                    has_decl = True
+                    break
+            if has_decl:
+                continue
+            for j in range(s + 1, e):
+                ln = out[j]
+                if ln.startswith("   "):
+                    out[j] = ln[3:]
+            del out[e]
+            del out[s]
+            changed = True
+    return out
+
+
+def _remove_unused_tool_marker_decls(lines: List[str]) -> List[str]:
+    """Remove unused declaration markers like `! added by xto_loop.py`.
+
+    This pass is scope-aware for BLOCK constructs so inner block-local uses do
+    not keep an outer stale declaration alive.
+    """
+    out = list(lines)
+    marker_idxs: List[int] = []
+    marker_names: Dict[int, List[str]] = {}
+    for i, ln in enumerate(out):
+        body = ln.rstrip("\r\n")
+        code, comment = split_code_comment(body)
+        if "added by xto_loop.py" not in comment.lower():
+            continue
+        low = code.strip().lower()
+        if not (TYPE_DECL_RE.match(low) and "::" in low):
+            continue
+        rhs = code.split("::", 1)[1]
+        ents = parse_decl_entities(rhs)
+        if not ents:
+            continue
+        names: List[str] = []
+        for name, raw_chunk in ents:
+            if "(" in raw_chunk or "=" in raw_chunk or "=>" in raw_chunk:
+                continue
+            names.append(name)
+        if not names:
+            continue
+        marker_idxs.append(i)
+        marker_names[i] = names
+
+    if not marker_idxs:
+        return out
+
+    remove_names_by_idx: Dict[int, Set[str]] = {}
+    for idx in marker_idxs:
+        for name in marker_names[idx]:
+            name_re = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+            outer_used = False
+            block_stack: List[Set[str]] = []
+            for j, ln in enumerate(out):
+                code = split_code_comment(ln.rstrip("\r\n"))[0].strip()
+                low = code.lower()
+                if not low:
+                    continue
+                if re.match(r"^block\b", low, re.IGNORECASE):
+                    block_stack.append(set())
+                    continue
+                if re.match(r"^end\s+block\b", low, re.IGNORECASE):
+                    if block_stack:
+                        block_stack.pop()
+                    continue
+                if TYPE_DECL_RE.match(low) and "::" in low:
+                    rhs = code.split("::", 1)[1]
+                    for n, _raw in parse_decl_entities(rhs):
+                        if block_stack:
+                            block_stack[-1].add(n)
+                    continue
+                if not name_re.search(strip_quoted_text(code)):
+                    continue
+                if j == idx:
+                    continue
+                shadowed = any(name in decls for decls in reversed(block_stack))
+                if not shadowed:
+                    outer_used = True
+                    break
+            if not outer_used:
+                remove_names_by_idx.setdefault(idx, set()).add(name)
+
+    if not remove_names_by_idx:
+        return out
+
+    for i in sorted(remove_names_by_idx.keys(), reverse=True):
+        raw = out[i].rstrip("\r\n")
+        code, comment = split_code_comment(raw)
+        if "::" not in code:
+            continue
+        head, rhs = code.split("::", 1)
+        ents = parse_decl_entities(rhs)
+        keep_chunks: List[str] = []
+        removed = remove_names_by_idx[i]
+        for name, raw_chunk in ents:
+            if name in removed and "(" not in raw_chunk and "=" not in raw_chunk and "=>" not in raw_chunk:
+                continue
+            keep_chunks.append(raw_chunk.strip())
+        if not keep_chunks:
+            del out[i]
+            continue
+        nl = "\r\n" if out[i].endswith("\r\n") else ("\n" if out[i].endswith("\n") else "")
+        rebuilt = f"{head.rstrip()} :: {', '.join(keep_chunks)}"
+        if comment.strip():
+            rebuilt += f" {comment}"
+        out[i] = rebuilt + nl
+    return out
+
+
+def _collapse_assign_then_self_apply(lines: List[str]) -> List[str]:
+    """Collapse consecutive:
+      x = y
+      x = f(x)
+    to:
+      x = f(y)
+    Conservatively skip lines with trailing comments/continuations.
+    """
+    out = list(lines)
+    i = 0
+    while i + 1 < len(out):
+        c1, cm1 = split_code_comment(out[i].rstrip("\r\n"))
+        c2, cm2 = split_code_comment(out[i + 1].rstrip("\r\n"))
+        s1 = c1.strip()
+        s2 = c2.strip()
+        if not s1 or not s2 or cm1.strip() or cm2.strip():
+            i += 1
+            continue
+        if "&" in s1 or "&" in s2:
+            i += 1
+            continue
+        m1 = ASSIGN_RE.match(s1)
+        m2 = ASSIGN_RE.match(s2)
+        if not m1 or not m2:
+            i += 1
+            continue
+        lhs1 = m1.group(1).strip()
+        lhs2 = m2.group(1).strip()
+        m_l1 = SIMPLE_NAME_RE.match(lhs1)
+        m_l2 = SIMPLE_NAME_RE.match(lhs2)
+        if not m_l1 or not m_l2:
+            i += 1
+            continue
+        v1 = m_l1.group(1)
+        v2 = m_l2.group(1)
+        if normalize_expr(v1) != normalize_expr(v2):
+            i += 1
+            continue
+        rhs1 = m1.group(2).strip()
+        rhs2 = m2.group(2).strip()
+        if not re.search(rf"\b{re.escape(v1)}\b", rhs2, re.IGNORECASE):
+            i += 1
+            continue
+        rhs2_new = re.sub(
+            rf"\b{re.escape(v1)}\b",
+            f"({rhs1})",
+            rhs2,
+            flags=re.IGNORECASE,
+        )
+        if rhs2_new == rhs2:
+            i += 1
+            continue
+        indent = re.match(r"^\s*", out[i]).group(0)
+        nl = "\r\n" if out[i].endswith("\r\n") else ("\n" if out[i].endswith("\n") else "")
+        out[i] = f"{indent}{v1} = {rhs2_new}{nl}"
+        del out[i + 1]
+    return out
+
+
+def _trim_redundant_parens_in_assignments(lines: List[str]) -> List[str]:
+    """Clean simple redundant parens in single-line assignments, e.g. sqrt((sum(x))) -> sqrt(sum(x))."""
+    out = list(lines)
+    for i, raw in enumerate(out):
+        code, comment = split_code_comment(raw.rstrip("\r\n"))
+        s = code.strip()
+        if not s:
+            continue
+        m = ASSIGN_RE.match(s)
+        if not m:
+            continue
+        lhs = m.group(1).strip()
+        rhs = m.group(2).strip()
+        rhs2 = re.sub(
+            r"\b([a-z][a-z0-9_]*)\s*\(\s*\((.+)\)\s*\)",
+            lambda mm: f"{mm.group(1)}({mm.group(2)})",
+            rhs,
+            flags=re.IGNORECASE,
+        )
+        if rhs2 == rhs:
+            continue
+        indent = re.match(r"^\s*", raw).group(0)
+        nl = "\r\n" if raw.endswith("\r\n") else ("\n" if raw.endswith("\n") else "")
+        line = f"{indent}{lhs} = {rhs2}"
+        if comment.strip():
+            line += f" {comment}"
+        out[i] = line + nl
+    return out
+
+
+def _inline_single_use_block_temp_into_print(lines: List[str]) -> List[str]:
+    """Collapse:
+      block
+        <type> :: t
+        t = expr
+        print ..., t
+      end block
+    to:
+      print ..., expr
+    when t appears only in that print item list.
+    """
+    out = list(lines)
+    i = 0
+    while i + 4 < len(out):
+        c0, cm0 = split_code_comment(out[i].rstrip("\r\n"))
+        c1, cm1 = split_code_comment(out[i + 1].rstrip("\r\n"))
+        c2, cm2 = split_code_comment(out[i + 2].rstrip("\r\n"))
+        c3, cm3 = split_code_comment(out[i + 3].rstrip("\r\n"))
+        c4, cm4 = split_code_comment(out[i + 4].rstrip("\r\n"))
+        s0, s1, s2, s3, s4 = c0.strip(), c1.strip(), c2.strip(), c3.strip(), c4.strip()
+        if cm0.strip() or cm1.strip() or cm2.strip() or cm3.strip() or cm4.strip():
+            i += 1
+            continue
+        if s0.lower() != "block" or s4.lower() != "end block":
+            i += 1
+            continue
+        if not (TYPE_DECL_RE.match(s1.lower()) and "::" in s1):
+            i += 1
+            continue
+        ents = parse_decl_entities(s1.split("::", 1)[1])
+        if len(ents) != 1:
+            i += 1
+            continue
+        tname = ents[0][0]
+        m_asn = ASSIGN_RE.match(s2)
+        if not m_asn:
+            i += 1
+            continue
+        lhs = m_asn.group(1).strip()
+        rhs = m_asn.group(2).strip()
+        if normalize_expr(lhs) != normalize_expr(tname):
+            i += 1
+            continue
+        m_pr = PRINT_STMT_RE.match(s3)
+        if not m_pr:
+            i += 1
+            continue
+        parts = split_top_level_commas(m_pr.group(1).strip())
+        if len(parts) < 2:
+            i += 1
+            continue
+        items = [p.strip() for p in parts[1:]]
+        item_hits = [k for k, it in enumerate(items) if normalize_expr(it) == normalize_expr(tname)]
+        if len(item_hits) != 1:
+            i += 1
+            continue
+        items[item_hits[0]] = rhs
+        new_print = f"{parts[0].strip()}, " + ", ".join(items)
+        indent = re.match(r"^\s*", out[i]).group(0)
+        nl = "\r\n" if out[i + 3].endswith("\r\n") else ("\n" if out[i + 3].endswith("\n") else "")
+        out[i] = f"{indent}print {new_print}{nl}"
+        del out[i + 1 : i + 5]
+    return out
+
+
+def _collapse_random_number_blocks(lines: List[str]) -> List[str]:
+    """Collapse common block wrappers around random_number fills to whole-array calls."""
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        c0, _ = split_code_comment(out[i].rstrip("\r\n"))
+        if c0.strip().lower() != "block":
+            i += 1
+            continue
+        j = i + 1
+        while j < len(out):
+            cj, cmj = split_code_comment(out[j].rstrip("\r\n"))
+            if cmj.strip():
+                break
+            sj = cj.strip()
+            if TYPE_DECL_RE.match(sj.lower()):
+                j += 1
+                continue
+            break
+        # Form 1:
+        # do j=1,n2
+        #   call random_number(x(:,j))
+        # end do
+        # end block
+        if j + 3 < len(out):
+            s1 = split_code_comment(out[j].rstrip("\r\n"))[0].strip()
+            s2 = split_code_comment(out[j + 1].rstrip("\r\n"))[0].strip()
+            s3 = split_code_comment(out[j + 2].rstrip("\r\n"))[0].strip()
+            s4 = split_code_comment(out[j + 3].rstrip("\r\n"))[0].strip()
+            mdo = DO_RE.match(s1)
+            mcall = RANDOM_CALL_RE.match(s2)
+            if mdo and mcall and END_DO_RE.match(s3) and s4.lower() == "end block":
+                iv = mdo.group(1).strip()
+                arg = mcall.group(1).strip()
+                msec = INDEXED_SECOND_DIM_RE.match(arg)
+                if msec and normalize_expr(msec.group(2).strip()) == normalize_expr(":") and normalize_expr(msec.group(3).strip()) == normalize_expr(iv):
+                    arr = msec.group(1).strip()
+                    indent = re.match(r"^\s*", out[i]).group(0)
+                    nl = "\r\n" if out[j + 3].endswith("\r\n") else ("\n" if out[j + 3].endswith("\n") else "")
+                    out[i] = f"{indent}call random_number({arr}){nl}"
+                    del out[i + 1 : j + 4]
+                    continue
+        # Form 2:
+        # do j=...
+        #   do i=...
+        #     call random_number(x(i,j))
+        #   end do
+        # end do
+        # end block
+        if j + 5 < len(out):
+            s1 = split_code_comment(out[j].rstrip("\r\n"))[0].strip()
+            s2 = split_code_comment(out[j + 1].rstrip("\r\n"))[0].strip()
+            s3 = split_code_comment(out[j + 2].rstrip("\r\n"))[0].strip()
+            s4 = split_code_comment(out[j + 3].rstrip("\r\n"))[0].strip()
+            s5 = split_code_comment(out[j + 4].rstrip("\r\n"))[0].strip()
+            s6 = split_code_comment(out[j + 5].rstrip("\r\n"))[0].strip()
+            mdo_o = DO_RE.match(s1)
+            mdo_i = DO_RE.match(s2)
+            mcall = RANDOM_CALL_RE.match(s3)
+            if mdo_o and mdo_i and mcall and END_DO_RE.match(s4) and END_DO_RE.match(s5) and s6.lower() == "end block":
+                ov = mdo_o.group(1).strip()
+                iv = mdo_i.group(1).strip()
+                arg = mcall.group(1).strip()
+                m2 = INDEXED_SECOND_DIM_RE.match(arg)
+                if m2 and normalize_expr(m2.group(3).strip()) == normalize_expr(ov):
+                    left = m2.group(2).strip()
+                    m1 = re.match(rf"^\s*{re.escape(iv)}\s*$", left, re.IGNORECASE)
+                    if m1:
+                        arr = m2.group(1).strip()
+                        indent = re.match(r"^\s*", out[i]).group(0)
+                        nl = "\r\n" if out[j + 5].endswith("\r\n") else ("\n" if out[j + 5].endswith("\n") else "")
+                        out[i] = f"{indent}call random_number({arr}){nl}"
+                        del out[i + 1 : j + 6]
+                        continue
+        i += 1
+    return out
+
+
+def _rewrite_norm2_lines(lines: List[str]) -> List[str]:
+    """Apply norm2 peephole rewrite on already-transformed assignment/print lines."""
+    out = list(lines)
+    for i, raw in enumerate(out):
+        code, comment = split_code_comment(raw.rstrip("\r\n"))
+        stmt = code.strip()
+        if not stmt:
+            continue
+        rew = maybe_norm2_stmt_rewrite(stmt)
+        if rew is None or rew.strip() == stmt:
+            continue
+        indent = re.match(r"^\s*", raw).group(0)
+        nl = "\r\n" if raw.endswith("\r\n") else ("\n" if raw.endswith("\n") else "")
+        line = f"{indent}{rew}"
+        if comment.strip():
+            line += f" {comment}"
+        out[i] = line + nl
+    return out
+
+
+def cleanup_redundant_generated_wrappers(path: Path) -> bool:
+    """Run post-inline structural cleanup on one transformed file."""
+    before = read_text_flexible(path)
+    lines = before.splitlines(keepends=True)
+    lines = _prune_unused_generated_block_decls(lines)
+    lines = _remove_redundant_extreme_seed_assign(lines)
+    lines = _unwrap_redundant_blocks(lines)
+    lines = _remove_unused_tool_marker_decls(lines)
+    lines = _collapse_assign_then_self_apply(lines)
+    lines = _trim_redundant_parens_in_assignments(lines)
+    lines = _inline_single_use_block_temp_into_print(lines)
+    lines = _collapse_random_number_blocks(lines)
+    lines = _rewrite_norm2_lines(lines)
+    after = "".join(lines)
+    if after != before:
+        path.write_text(after, encoding="utf-8")
+        return True
+    return False
 
 
 def remove_redundant_allocates_via_xalloc_assign(path: Path) -> int:
@@ -7370,9 +10075,22 @@ def inline_temps_via_xno_variable(path: Path) -> Tuple[int, int]:
         findings = xno_variable.analyze_file(path)
         if not findings:
             break
+        # Safety gate: only allow scalar-local temporary inlining in xarray
+        # post-pass. This avoids rank-changing inlines (e.g. rank-2 vars into
+        # rank-1 constructors at call sites).
+        scalar_by_unit: Dict[Tuple[str, str], Set[str]] = {}
+        infos, _missing = fscan.load_source_files([path])
+        if infos:
+            units = xunset.collect_units(infos[0])
+            for u in units:
+                scal = set(xno_variable.parse_declared_scalar_locals(u).keys())
+                scalar_by_unit[(u.kind.lower(), u.name.lower())] = scal
         raw_lines = read_text_flexible(path).splitlines(keepends=True)
         filtered: List[xno_variable.Finding] = []
         for f in findings:
+            unit_key = (f.unit_kind.lower(), f.unit_name.lower())
+            if f.var.lower() not in scalar_by_unit.get(unit_key, set()):
+                continue
             if has_attached_comment(raw_lines, f.assign_line) or has_attached_comment(raw_lines, f.use_line):
                 continue
             filtered.append(f)
@@ -7390,6 +10108,42 @@ def inline_temps_via_xno_variable(path: Path) -> Tuple[int, int]:
         total_inline += n_inline
         total_decl_removed += n_decl_removed
     return total_inline, total_decl_removed
+
+
+def remove_empty_changed_annotation_blocks(path: Path) -> int:
+    """Remove empty ! begin/end block changed markers left after post passes."""
+    lines = read_text_flexible(path).splitlines(keepends=True)
+    if not lines:
+        return 0
+    out: List[str] = []
+    removed = 0
+    i = 0
+    while i < len(lines):
+        if CHANGED_BLOCK_BEGIN.lower() not in lines[i].lower():
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        only_blank = True
+        while j < len(lines):
+            low_j = lines[j].lower()
+            if CHANGED_BLOCK_END.lower() in low_j:
+                if only_blank:
+                    removed += 1
+                    i = j + 1
+                else:
+                    out.extend(lines[i : j + 1])
+                    i = j + 1
+                break
+            if lines[j].strip():
+                only_blank = False
+            j += 1
+        else:
+            out.append(lines[i])
+            i += 1
+    if removed > 0:
+        path.write_text("".join(out), encoding="utf-8")
+    return removed
 
 
 def relocate_section_comments(path: Path) -> int:
@@ -7535,9 +10289,65 @@ def count_file_lines(path: Path) -> int:
     return fscan.count_loc(path, exclude_blank=True, exclude_comment=True)
 
 
+def with_trace_header(text: str, *, tool_name: str, source_name: str) -> str:
+    """Prepend or refresh one-line provenance header in generated output."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    header = f"! created by {tool_name} from {source_name} on {stamp}\n"
+    lines = text.splitlines(keepends=True)
+    if lines and re.match(r"^\s*!\s*created by [a-z0-9_]+\.py\b", lines[0], re.IGNORECASE):
+        lines[0] = header
+        return "".join(lines)
+    return header + text
+
+
 def print_summary_table(rows: List[Tuple[str, int, int, int]]) -> None:
     """Print aligned LOC summary using shared helper."""
     fscan.print_loc_summary_table(rows, source_col="source", blocks_col="blocks_rep")
+
+
+def print_loc_summary_table_extended(
+    rows: List[Tuple[str, int, int, int]],
+    *,
+    source_col: str = "source",
+    blocks_col: str = "blocks_rep",
+    compile_old: Optional[Dict[str, Optional[bool]]] = None,
+    compile_new: Optional[Dict[str, Optional[bool]]] = None,
+    runs_match: Optional[Dict[str, Optional[bool]]] = None,
+) -> None:
+    """Print aligned LOC summary with optional compile/run-diff booleans."""
+    include_compile = (compile_old is not None) or (compile_new is not None)
+    include_diff = runs_match is not None
+    headers = [source_col, "lines_old", "lines_new", "diff", "ratio", blocks_col]
+    if include_compile:
+        headers.extend(["compile_old", "compile_new"])
+    if include_diff:
+        headers.append("runs_match")
+
+    def fmt_bool(v: Optional[bool]) -> str:
+        if v is None:
+            return "NA"
+        return "True" if v else "False"
+
+    formatted: List[List[str]] = []
+    for src, old_loc, new_loc, blocks in rows:
+        diff = old_loc - new_loc
+        ratio = "inf" if new_loc == 0 else f"{(old_loc / new_loc):.2f}"
+        rec = [src, str(old_loc), str(new_loc), str(diff), ratio, str(blocks)]
+        if include_compile:
+            rec.append(fmt_bool((compile_old or {}).get(src)))
+            rec.append(fmt_bool((compile_new or {}).get(src)))
+        if include_diff:
+            rec.append(fmt_bool((runs_match or {}).get(src)))
+        formatted.append(rec)
+
+    widths = [len(h) for h in headers]
+    for r in formatted:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    print("  ".join(headers[i].ljust(widths[i]) if i == 0 else headers[i].rjust(widths[i]) for i in range(len(headers))))
+    for r in formatted:
+        print("  ".join(r[i].ljust(widths[i]) if i == 0 else r[i].rjust(widths[i]) for i in range(len(r))))
 
 
 def compile_one_for_summary(source: Path, command: str, *, phase: str) -> bool:
@@ -7609,8 +10419,58 @@ def compile_and_run_capture(
     label: str,
     quiet_run: bool = False,
     keep_exe: bool = False,
+    deterministic_seed: bool = False,
 ) -> Tuple[bool, str, str]:
-    compile_cmd = ["gfortran", str(source), "-o", str(exe_path)]
+    compile_source = source
+    seeded_temp_path: Optional[Path] = None
+    if deterministic_seed:
+        try:
+            txt = read_text_flexible(source)
+            has_random_number = re.search(r"^\s*call\s+random_number\s*\(", txt, re.IGNORECASE | re.MULTILINE) is not None
+            has_seed_control = re.search(
+                r"^\s*call\s+random_(?:seed|init)\s*\(",
+                txt,
+                re.IGNORECASE | re.MULTILINE,
+            ) is not None
+            if has_random_number and not has_seed_control:
+                lines = txt.splitlines(keepends=True)
+                injected = False
+                prog_idx = -1
+                for i, ln in enumerate(lines):
+                    if re.match(r"^\s*program\b", ln, re.IGNORECASE) and not re.match(r"^\s*end\s+program\b", ln, re.IGNORECASE):
+                        prog_idx = i
+                        break
+                if prog_idx >= 0:
+                    decl_like_re = re.compile(
+                        r"^\s*(use|implicit|parameter|dimension|save|data|common|external|intrinsic|equivalence|type\b|class\b|procedure\b|namelist)\b",
+                        re.IGNORECASE,
+                    )
+                    for i in range(prog_idx + 1, len(lines)):
+                        code = fscan.strip_comment(lines[i]).strip()
+                        if not code:
+                            continue
+                        if re.match(r"^\s*(contains|end\s+program)\b", code, re.IGNORECASE):
+                            break
+                        if TYPE_DECL_RE.match(code) or decl_like_re.match(code):
+                            continue
+                        indent = re.match(r"^(\s*)", lines[i]).group(1)
+                        lines.insert(i, f"{indent}call random_init(.true., .false.) ! added by xarray.py run-diff\n")
+                        injected = True
+                        break
+                if injected:
+                    fd, tmpname = tempfile.mkstemp(
+                        prefix=f"{source.stem}_xarray_seed_",
+                        suffix=source.suffix if source.suffix else ".f90",
+                        dir=str(source.parent),
+                    )
+                    with open(fd, "w", encoding="utf-8", closefd=True) as tf:
+                        tf.write("".join(lines))
+                    seeded_temp_path = Path(tmpname)
+                    compile_source = seeded_temp_path
+        except Exception:
+            compile_source = source
+
+    compile_cmd = ["gfortran", str(compile_source), "-o", str(exe_path)]
     print(f"Build ({label}): {' '.join(fbuild.quote_cmd_arg(x) for x in compile_cmd)}")
     cp = subprocess.run(compile_cmd, capture_output=True, text=True)
     if cp.returncode != 0:
@@ -7619,6 +10479,11 @@ def compile_and_run_capture(
             print(cp.stdout.rstrip())
         if cp.stderr:
             print(fbuild.format_linker_stderr(cp.stderr).rstrip())
+        if seeded_temp_path is not None:
+            try:
+                seeded_temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         return False, "", ""
     print(f"Build ({label}): PASS")
     print(f"Run ({label}): {fbuild.quote_cmd_arg(str(exe_path))}")
@@ -7639,6 +10504,11 @@ def compile_and_run_capture(
                 print(rp.stderr.rstrip())
         return True, rp.stdout or "", rp.stderr or ""
     finally:
+        if seeded_temp_path is not None:
+            try:
+                seeded_temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         if not keep_exe:
             try:
                 exe_path.unlink(missing_ok=True)
@@ -7702,6 +10572,13 @@ def main() -> int:
     parser.add_argument("--keep-exe", action="store_true", help="Keep generated executables after running")
     parser.add_argument("--annotate", action="store_true", help="Insert annotated suggestion blocks")
     parser.add_argument(
+        "--no-annotate",
+        "-no-annotate",
+        dest="no_annotate",
+        action="store_true",
+        help="Do not emit inline xarray annotation comments in transformed output",
+    )
+    parser.add_argument(
         "--annotate-removed",
         action="store_true",
         help="When fixing, keep removed source lines as comments above replacements",
@@ -7742,6 +10619,14 @@ def main() -> int:
         action="store_true",
         help="Enable more aggressive rewrites (e.g., collapse unrolled chunk loops to full-section assignments)",
     )
+    parser.add_argument(
+        "--no-trace",
+        "--notrace",
+        dest="trace",
+        action="store_false",
+        default=True,
+        help="Do not prepend created-by trace header to transformed output",
+    )
     args = parser.parse_args()
     global AGGRESSIVE_MODE
     AGGRESSIVE_MODE = bool(args.aggressive)
@@ -7751,6 +10636,9 @@ def main() -> int:
     if args.maxfail is not None and args.maxfail < 1:
         print("--maxfail must be >= 1.")
         return 2
+    if args.no_annotate:
+        args.annotate = False
+        args.annotate_removed = False
     if args.run_diff:
         args.run_both = True
     if args.run_both:
@@ -7793,9 +10681,6 @@ def main() -> int:
             print("--out-dir exists but is not a directory.")
             return 2
         args.out_dir.mkdir(parents=True, exist_ok=True)
-    if args.run and len(files) != 1:
-        print("--run/--run-both require exactly one input source file.")
-        return 2
     baseline_compile_paths = files
     if args.fix and args.out is not None:
         after_compile_paths = [args.out]
@@ -7839,18 +10724,30 @@ def main() -> int:
     for f in findings:
         by_file_candidates.setdefault(f.path, []).append(f)
     pre_lines: Dict[Path, int] = {p: count_file_lines(p) for p in files}
+    run_compile_old_map: Dict[str, Optional[bool]] = {}
+    run_compile_new_map: Dict[str, Optional[bool]] = {}
+    run_diff_match_map: Dict[str, Optional[bool]] = {}
+    summary_rows: Optional[List[Tuple[str, int, int, int]]] = None
+    summary_compile_old_map: Optional[Dict[str, Optional[bool]]] = None
+    summary_compile_new_map: Optional[Dict[str, Optional[bool]]] = None
 
     if not findings:
         orig_out = ""
         orig_err = ""
         if args.run_both:
-            src = files[0]
-            orig_exe = Path(f"{src.stem}_orig.exe")
-            ok_orig, orig_out, orig_err = compile_and_run_capture(
-                src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
-            )
-            if not ok_orig:
-                return 5
+            for src in files:
+                orig_exe = Path(f"{src.stem}_orig.exe")
+                ok_orig, orig_out, orig_err = compile_and_run_capture(
+                    src,
+                    exe_path=orig_exe,
+                    label="original",
+                    quiet_run=args.quiet_run,
+                    keep_exe=args.keep_exe,
+                    deterministic_seed=args.run_diff,
+                )
+                run_compile_old_map[fscan.display_path(src)] = ok_orig
+                if not ok_orig:
+                    return 5
         if args.run_diff:
             print("Run diff: SKIP (no transformations suggested)")
         if args.summary:
@@ -7866,6 +10763,9 @@ def main() -> int:
                 did_fix=False,
                 maxfail=args.maxfail,
             )
+            summary_rows = rows
+            summary_compile_old_map = compile_old_map
+            summary_compile_new_map = compile_new_map
             fscan.print_loc_summary_table(
                 rows,
                 source_col="source",
@@ -7893,6 +10793,10 @@ def main() -> int:
     orig_err = ""
     xform_out = ""
     xform_err = ""
+    run_diff_pairs = 0
+    run_diff_diffs = 0
+    transformed_by_file: Dict[Path, Path] = {p: p for p in files}
+    replaced_by_file: Dict[Path, int] = {}
     if args.fix:
         by_file = by_file_candidates
         touched = 0
@@ -7901,8 +10805,6 @@ def main() -> int:
         total_post_inlined = 0
         total_post_decl_removed = 0
         total_comments_relocated = 0
-        replaced_by_file: Dict[Path, int] = {}
-        transformed_by_file: Dict[Path, Path] = {}
         post_lines: Dict[Path, int] = {}
         compile_old_map_run: Optional[Dict[str, Optional[bool]]] = {} if args.compile_both else None
         compile_new_map_run: Optional[Dict[str, Optional[bool]]] = {} if args.compile_both else None
@@ -7949,6 +10851,7 @@ def main() -> int:
                 annotate_removed=args.annotate_removed,
                 out_path=out_path,
                 create_backup=args.backup,
+                add_trace=args.trace,
             )
             total += n
             replaced_by_file[p] = n
@@ -7964,11 +10867,14 @@ def main() -> int:
                     n_post_inl, n_post_decl = inline_temps_via_xno_variable(target)
                     total_post_inlined += n_post_inl
                     total_post_decl_removed += n_post_decl
+                    if args.annotate:
+                        remove_empty_changed_annotation_blocks(target)
                     n_comments = 0
                     # Keep audit annotations stable and local.
                     if not (args.annotate or args.annotate_removed):
                         n_comments = relocate_section_comments(target)
                         total_comments_relocated += n_comments
+                    cleanup_redundant_generated_wrappers(target)
                 if out_path is not None:
                     print(f"\nFixed {p.name}: replaced {n} block(s), wrote {out_path}")
                     if args.tee:
@@ -8050,6 +10956,9 @@ def main() -> int:
                     did_fix=True,
                     maxfail=args.maxfail,
                 )
+            summary_rows = rows
+            summary_compile_old_map = compile_old_map
+            summary_compile_new_map = compile_new_map
             fscan.print_loc_summary_table(
                 rows,
                 source_col="source",
@@ -8086,6 +10995,9 @@ def main() -> int:
                 did_fix=False,
                 maxfail=args.maxfail,
             )
+            summary_rows = rows
+            summary_compile_old_map = compile_old_map
+            summary_compile_new_map = compile_new_map
             fscan.print_loc_summary_table(
                 rows,
                 source_col="source",
@@ -8107,6 +11019,9 @@ def main() -> int:
             did_fix=False,
             maxfail=args.maxfail,
         )
+        summary_rows = rows
+        summary_compile_old_map = compile_old_map
+        summary_compile_new_map = compile_new_map
         fscan.print_loc_summary_table(
             rows,
             source_col="source",
@@ -8117,41 +11032,85 @@ def main() -> int:
     if args.fix and args.compiler and not args.compile_both:
         if not fbuild.run_compiler_command(args.compiler, after_compile_paths, "after-fix", fscan.display_path):
             return 5
-    if args.run_both:
-        src = files[0]
-        orig_exe = Path(f"{src.stem}_orig.exe")
-        ok_orig, orig_out, orig_err = compile_and_run_capture(
-            src, exe_path=orig_exe, label="original", quiet_run=args.quiet_run, keep_exe=args.keep_exe
-        )
-        if not ok_orig:
-            return 5
-    if args.run and transformed_changed and transformed_target is not None:
-        out_src = transformed_target
-        out_exe = Path(f"{out_src.stem}.exe")
-        ok_xf, xform_out, xform_err = compile_and_run_capture(
-            out_src, exe_path=out_exe, label="transformed", quiet_run=args.quiet_run, keep_exe=args.keep_exe
-        )
-        if not ok_xf:
-            return 5
+    if args.run:
+        for p in files:
+            key = fscan.display_path(p)
+            if args.run_both:
+                orig_exe = Path(f"{p.stem}_orig.exe")
+                ok_orig, orig_out, orig_err = compile_and_run_capture(
+                    p,
+                    exe_path=orig_exe,
+                    label="original",
+                    quiet_run=args.quiet_run,
+                    keep_exe=args.keep_exe,
+                    deterministic_seed=args.run_diff,
+                )
+                run_compile_old_map[key] = ok_orig
+                if not ok_orig:
+                    return 5
+            out_src = transformed_by_file.get(p, p)
+            if args.run_diff and args.fix and replaced_by_file.get(p, 0) <= 0:
+                print(f"Run diff ({p.name}): SKIP (no transformations applied)")
+                run_diff_match_map[key] = None
+                continue
+            # For --run (without --run-both), skip files with no applied transformation.
+            if (not args.run_both) and (replaced_by_file.get(p, 0) <= 0):
+                continue
+            out_exe = Path(f"{out_src.stem}.exe")
+            ok_xf, xform_out, xform_err = compile_and_run_capture(
+                out_src,
+                exe_path=out_exe,
+                label="transformed",
+                quiet_run=args.quiet_run,
+                keep_exe=args.keep_exe,
+                deterministic_seed=args.run_diff,
+            )
+            run_compile_new_map[key] = ok_xf
+            if not ok_xf:
+                return 5
+            if args.run_diff:
+                run_diff_pairs += 1
+                same = outputs_match_tolerant(orig_out, xform_out) and outputs_match_tolerant(orig_err, xform_err)
+                run_diff_match_map[key] = same
+                if same:
+                    print(f"Run diff ({p.name}): MATCH")
+                else:
+                    run_diff_diffs += 1
+                    print(f"Run diff ({p.name}): DIFF")
+                    orig_blob = f"STDOUT:\n{orig_out}\nSTDERR:\n{orig_err}\n"
+                    xform_blob = f"STDOUT:\n{xform_out}\nSTDERR:\n{xform_err}\n"
+                    for line in difflib.unified_diff(
+                        orig_blob.splitlines(),
+                        xform_blob.splitlines(),
+                        fromfile=f"{p.name}:original",
+                        tofile=f"{p.name}:transformed",
+                        lineterm="",
+                    ):
+                        print(line)
     if args.run_diff:
-        if not transformed_changed:
-            print("Run diff: SKIP (no transformations applied)")
+        if run_diff_pairs == 0:
+            print("Run diff: SKIP (no transformed pairs executed)")
         else:
-            same = (orig_out == xform_out) and (orig_err == xform_err)
-            if same:
-                print("Run diff: MATCH")
-            else:
-                print("Run diff: DIFF")
-                orig_blob = f"STDOUT:\n{orig_out}\nSTDERR:\n{orig_err}\n"
-                xform_blob = f"STDOUT:\n{xform_out}\nSTDERR:\n{xform_err}\n"
-                for line in difflib.unified_diff(
-                    orig_blob.splitlines(),
-                    xform_blob.splitlines(),
-                    fromfile="original",
-                    tofile="transformed",
-                    lineterm="",
-                ):
-                    print(line)
+            print(
+                f"Run diff summary: pairs {run_diff_pairs}, "
+                f"matches {run_diff_pairs - run_diff_diffs}, diffs {run_diff_diffs}"
+            )
+    if args.summary and summary_rows is not None and (
+        args.run or args.run_both or args.run_diff
+    ):
+        merged_old = dict(summary_compile_old_map or {})
+        merged_new = dict(summary_compile_new_map or {})
+        merged_old.update(run_compile_old_map)
+        merged_new.update(run_compile_new_map)
+        print("\n--summary (with run/compile):")
+        print_loc_summary_table_extended(
+            summary_rows,
+            source_col="source",
+            blocks_col="blocks_rep",
+            compile_old=(merged_old if merged_old else None),
+            compile_new=(merged_new if merged_new else None),
+            runs_match=(run_diff_match_map if args.run_diff else None),
+        )
     return 0
 
 
