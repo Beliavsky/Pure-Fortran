@@ -603,7 +603,7 @@ Notes:
 - Avoids recurrence-style false positives (for example `y(i)=y(i-1)+...`).
 - Edit modes create backups before edits.
 
-### 22a) `xto_loop.py`
+### `xto_loop.py`
 
 Advisory checker/fixer that rewrites selected array expressions/intrinsics back to explicit loops.
 
@@ -628,7 +628,7 @@ Notes:
 - Intended as a conservative inverse companion to `xarray.py`.
 - Includes residual checks for prohibited array-operation forms in loopified output.
 
-### 22b) `xroundtrip.py`
+### `xroundtrip.py`
 
 Round-trip harness for semantic regression checks between array-style and loop-style rewrites.
 
@@ -651,7 +651,7 @@ Notes:
 - Reports per-file pass/fail with mismatch details and final transformed path.
 - Useful for validating transform reversibility and catching behavioral regressions.
 
-### 22c) `xinit.py`
+### `xinit.py`
 
 Advisory checker/fixer that inserts explicit initializations (for example NaN/sentinels) to expose uninitialized-variable behavior.
 
@@ -675,7 +675,7 @@ Notes:
 - Defaults are configurable for integer/real/logical/character initialization values.
 - Designed for debugging undefined behavior from unset variables.
 
-### 22d) `xproc_index.py`
+### `xproc_index.py`
 
 Procedure indexing/report tool that scans file sets and reports discovered procedure names, locations, and duplicates.
 
@@ -697,7 +697,7 @@ Notes:
 - Useful for identifying duplicate helper procedures across large source collections.
 - Designed as a lightweight inventory tool for refactoring/modularization workflows.
 
-### 22e) `xsubroutine.py`
+### `xsubroutine.py`
 
 Extractor that lifts marked code regions (or selected loops) into generated module procedures/functions.
 
