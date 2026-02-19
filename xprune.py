@@ -325,10 +325,16 @@ def main() -> int:
     parser.add_argument(
         "--compiler",
         type=str,
-        required=True,
-        help='Compilation command, e.g. "gfortran -o app.exe"',
+        default="gfortran -c -Wfatal-errors {files}",
+        help='Compilation command (default: "gfortran -c -Wfatal-errors {files}")',
     )
     parser.add_argument("--out-dir", type=Path, default=Path("pruned"), help="Output directory (default: pruned)")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output file for a single input source (implies non-in-place output)",
+    )
     parser.add_argument("--in-place", action="store_true", help="Modify sources in place (default: off)")
     parser.add_argument("--fix", action="store_true", help="Alias for --in-place")
     parser.add_argument("--max-iter", type=int, default=10, help="Maximum prune passes (default: 10)")
@@ -346,7 +352,22 @@ def main() -> int:
         print("No source files remain after applying --exclude filters.")
         return 2
 
-    if args.in_place:
+    if args.out is not None:
+        if args.in_place:
+            print("--out cannot be combined with --in-place/--fix.")
+            return 2
+        if len(src_files) != 1:
+            print("--out requires exactly one input source file.")
+            return 2
+        if args.out.exists() and args.out.is_dir():
+            print("--out exists but is a directory.")
+            return 2
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_files[0], args.out)
+        work_files = [args.out]
+        work_dir = args.out.parent.resolve()
+        print(f"Wrote working source to: {args.out}")
+    elif args.in_place:
         work_files = src_files
         work_dir = Path(".").resolve()
     else:
