@@ -46,6 +46,8 @@ Main programs:
 - `xalloc_assign.py` - advisory checker/fixer for redundant `allocate(...)` immediately before whole-array assignment.
 - `xset_array.py` - advisory checker for replacing consecutive scalar array-element assignments with one array assignment.
 - `xarray.py` - advisory checker for simple loops replaceable by array operations (`sum/product/count` and elementwise forms).
+- `xto_loop.py` - advisory checker/fixer that reverses selected array operations to explicit loops (for benchmarking/audit round-trips).
+- `xroundtrip.py` - harness that applies `xarray.py`/`xto_loop.py` in sequence and compares semantic equivalence of round-tripped code.
 - `xbounds.py` - advisory checker for likely out-of-bounds indexing/slicing patterns.
 - `xone_line_if.py` - advisory checker/fixer for collapsible three-line IF blocks (and reverse expansion mode).
 - `xlong_lines.py` - advisory checker/fixer for overlong Fortran lines via continuation wrapping.
@@ -600,6 +602,124 @@ Notes:
 - Supports simple strided loops (`do i=lb,ub,step`) in supported reduction patterns.
 - Avoids recurrence-style false positives (for example `y(i)=y(i-1)+...`).
 - Edit modes create backups before edits.
+
+### 22a) `xto_loop.py`
+
+Advisory checker/fixer that rewrites selected array expressions/intrinsics back to explicit loops.
+
+Optional modes:
+
+- `--fix`: apply loopifying rewrites.
+- `--out` / `--out-dir`: write transformed sources to a file/directory.
+- `--run`, `--run-both`, `--run-diff`: compile/run transformed and optionally compare outputs.
+- `--time-both`, `--time-reps`: benchmark original vs transformed executables.
+- `--no-annotate`: suppress replacement comments in emitted code.
+
+Typical commands:
+
+```bash
+python xto_loop.py
+python xto_loop.py foo.f90 --out foo_loop.f90 --run-diff
+python xto_loop.py src\\*.f90 --out-dir loop_out --compile-both
+```
+
+Notes:
+
+- Intended as a conservative inverse companion to `xarray.py`.
+- Includes residual checks for prohibited array-operation forms in loopified output.
+
+### 22b) `xroundtrip.py`
+
+Round-trip harness for semantic regression checks between array-style and loop-style rewrites.
+
+Optional modes:
+
+- `--direction array-loop|loop-array|both`: choose transform order.
+- `--tee`, `--tee-all`: print intermediate generated sources.
+- `--keep`: preserve generated intermediate files/directories.
+
+Typical commands:
+
+```bash
+python xroundtrip.py foo.f90
+python xroundtrip.py foo.f90 --direction both --tee-all
+python xroundtrip.py src\\*.f90 --limit 20
+```
+
+Notes:
+
+- Reports per-file pass/fail with mismatch details and final transformed path.
+- Useful for validating transform reversibility and catching behavioral regressions.
+
+### 22c) `xinit.py`
+
+Advisory checker/fixer that inserts explicit initializations (for example NaN/sentinels) to expose uninitialized-variable behavior.
+
+Optional modes:
+
+- `--fix`: apply inserted initialization statements.
+- `--uncertain`: initialize only variables flagged as uncertain by static analysis.
+- `--out` / `--out-dir`: write transformed file(s) to target path(s).
+- `--compiler`: compile baseline and transformed code for validation.
+
+Typical commands:
+
+```bash
+python xinit.py foo.f90 --fix
+python xinit.py foo.f90 --out temp.f90 --uncertain --compiler "gfortran -c -Wfatal-errors {file}"
+python xinit.py src\\*.f90 --out-dir init_out --uncertain
+```
+
+Notes:
+
+- Defaults are configurable for integer/real/logical/character initialization values.
+- Designed for debugging undefined behavior from unset variables.
+
+### 22d) `xproc_index.py`
+
+Procedure indexing/report tool that scans file sets and reports discovered procedure names, locations, and duplicates.
+
+Optional modes:
+
+- file globs/directories as inputs (including recursive selections where supported),
+- duplicate-focused reporting and sorted summaries.
+
+Typical commands:
+
+```bash
+python xproc_index.py
+python xproc_index.py burkardt\\*.f90
+python xproc_index.py src --verbose
+```
+
+Notes:
+
+- Useful for identifying duplicate helper procedures across large source collections.
+- Designed as a lightweight inventory tool for refactoring/modularization workflows.
+
+### 22e) `xsubroutine.py`
+
+Extractor that lifts marked code regions (or selected loops) into generated module procedures/functions.
+
+Optional modes:
+
+- marker-driven extraction (`!! begin ...` / `!! end ...`) with module/procedure naming,
+- function/subroutine generation with argument/local inference,
+- `--compiler-cmd`, `--run`, `--run-both` validation workflows,
+- `--inline`, `--loop-lines` automation helpers.
+
+Typical commands:
+
+```bash
+python xsubroutine.py foo.f90 --out temp.f90
+python xsubroutine.py foo.f90 --compiler-cmd "gfortran {file}" --run-both
+python xsubroutine.py foo.f90 --loop-lines 5 --fix
+```
+
+Notes:
+
+- Applies structural checks on marker placement and scope boundaries.
+- Can infer/insert `pure` where safe and updates caller/use sites.
 
 ### 23) `xpower.py`
 
