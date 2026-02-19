@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -46,6 +48,7 @@ class Finding:
     var: str
     assign_stmt: str
     replace_assign_rhs: Optional[str]
+    replace_assign_stmt: Optional[str] = None
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -228,12 +231,75 @@ def allocated_target_with_dim(stmt: str) -> Optional[Tuple[str, str]]:
     return mobj.group(1).lower(), mobj.group(2).strip()
 
 
+def allocate_objects(stmt: str) -> Optional[List[Tuple[str, str]]]:
+    """Return [(name, dim-spec)] for ALLOCATE object specs; None if unsupported."""
+    m = ALLOCATE_STMT_RE.match(stmt.strip())
+    if not m:
+        return None
+    args = split_top_level_commas(m.group(1))
+    if not args:
+        return None
+    out: List[Tuple[str, str]] = []
+    for a in args:
+        s = a.strip()
+        if not s:
+            continue
+        if re.match(r"^[a-z][a-z0-9_]*\s*=", s, re.IGNORECASE):
+            return None
+        mobj = re.match(r"^([a-z][a-z0-9_]*)\s*\((.*)\)\s*$", s, re.IGNORECASE)
+        if not mobj:
+            return None
+        out.append((mobj.group(1).lower(), mobj.group(2).strip()))
+    return out if out else None
+
+
 def assignment_rhs_of(stmt: str, name: str) -> Optional[str]:
     """Return RHS when statement is whole-variable intrinsic assignment to name."""
     m = re.match(ASSIGN_RE_TEMPLATE.format(name=re.escape(name)), stmt.strip(), re.IGNORECASE)
     if not m:
         return None
     return m.group(1).strip()
+
+
+def constructor_items(rhs: str) -> Optional[List[str]]:
+    """Return top-level items from bracket constructor RHS, else None."""
+    s = rhs.strip()
+    if not (s.startswith("[") and s.endswith("]")):
+        return None
+    inner = s[1:-1].strip()
+    if not inner:
+        return []
+    return split_top_level_commas(inner)
+
+
+def assignment_info_of(stmt: str, name: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Return (rhs, replacement_stmt_or_None) for supported assignment forms.
+
+    Supported:
+    - `name = rhs`
+    - `name(1:N) = [ ... ]` with constructor length N (rewritable to `name = [...]`)
+    """
+    rhs = assignment_rhs_of(stmt, name)
+    if rhs is not None:
+        return rhs, None
+    m = re.match(
+        rf"^\s*{re.escape(name)}\s*\(\s*1\s*:\s*([+-]?\d+)\s*\)\s*=\s*(.+?)\s*$",
+        stmt.strip(),
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    try:
+        ub = int(m.group(1))
+    except ValueError:
+        return None
+    rhs2 = m.group(2).strip()
+    items = constructor_items(rhs2)
+    if items is None:
+        return None
+    if ub != len(items):
+        return None
+    return rhs2, f"{name} = {rhs2}"
 
 
 def contains_ident(expr: str, name: str) -> bool:
@@ -314,6 +380,53 @@ def rewrite_assignment_rhs_line(raw: str, var: str, new_rhs: str) -> str:
     return f"{new_code}{comment}{eol}"
 
 
+def rewrite_assignment_stmt_line(raw: str, var: str, new_stmt: str) -> str:
+    """Replace full assignment statement for `var` in one physical line."""
+    eol = ""
+    line = raw
+    if line.endswith("\r\n"):
+        line, eol = line[:-2], "\r\n"
+    elif line.endswith("\n"):
+        line, eol = line[:-1], "\n"
+    code, comment = split_code_comment(line)
+    if not re.match(rf"^\s*{re.escape(var)}\b", code.strip(), re.IGNORECASE):
+        return raw
+    indent = re.match(r"^\s*", code).group(0) if code else ""
+    return f"{indent}{new_stmt}{comment}{eol}"
+
+
+def rewrite_allocate_remove_vars(raw: str, remove_vars: Set[str]) -> Optional[str]:
+    """Remove variables from ALLOCATE object list; return rewritten line or None."""
+    eol = ""
+    line = raw
+    if line.endswith("\r\n"):
+        line, eol = line[:-2], "\r\n"
+    elif line.endswith("\n"):
+        line, eol = line[:-1], "\n"
+    code, comment = split_code_comment(line)
+    m = ALLOCATE_STMT_RE.match(code.strip())
+    if not m:
+        return raw
+    args = split_top_level_commas(m.group(1))
+    kept: List[str] = []
+    indent = re.match(r"^\s*", code).group(0) if code else ""
+    for a in args:
+        s = a.strip()
+        if not s:
+            continue
+        mobj = re.match(r"^([a-z][a-z0-9_]*)\s*\((.*)\)\s*$", s, re.IGNORECASE)
+        if not mobj:
+            kept.append(s)
+            continue
+        name = mobj.group(1).lower()
+        if name in remove_vars:
+            continue
+        kept.append(s)
+    if not kept:
+        return None
+    return f"{indent}allocate({', '.join(kept)}){comment}{eol}"
+
+
 def end_line_for_stmt_start(lines: List[str], start_line: int) -> int:
     """Approximate statement end line from continuation markers."""
     i = start_line - 1
@@ -347,46 +460,57 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     out: List[Finding] = []
 
     for i, (ln, stmt) in enumerate(body):
-        alloc = allocated_target_with_dim(stmt)
-        if alloc is None:
+        objs = allocate_objects(stmt)
+        if objs is None:
             continue
-        var, dim_spec = alloc
-        di = decls.get(var)
-        if di is None or not di.allocatable:
-            continue
-        if di.rank is not None and di.rank != 1:
-            continue
-
-        if i + 1 >= len(body):
-            continue
-        ln2, stmt2 = body[i + 1]
-        rhs = assignment_rhs_of(stmt2, var)
-        if rhs is None:
-            continue
-        # Self-referential assignment needs existing allocation; do not suggest.
-        if contains_ident(rhs, var):
-            continue
-        rhs_array = rhs_is_clearly_array(rhs, array_names)
-        replace_rhs: Optional[str] = None
-        if not rhs_array:
-            # Scalar RHS only safe for allocate(...(1)) via explicit singleton constructor.
-            if allocate_is_singleton(dim_spec):
-                replace_rhs = f"[{rhs}]"
-            else:
+        for var, dim_spec in objs:
+            di = decls.get(var)
+            if di is None or not di.allocatable:
+                continue
+            if di.rank is not None and di.rank != 1:
                 continue
 
-        out.append(
-            Finding(
-                path=unit.path,
-                unit_kind=unit.kind,
-                unit_name=unit.name,
-                alloc_line=ln,
-                assign_line=ln2,
-                var=var,
-                assign_stmt=stmt2.strip(),
-                replace_assign_rhs=replace_rhs,
+            # Search a short window for the first assignment to this var.
+            found: Optional[Tuple[int, str, Optional[str]]] = None
+            for j in range(i + 1, min(i + 8, len(body))):
+                ln2, stmt2 = body[j]
+                info = assignment_info_of(stmt2, var)
+                if info is not None:
+                    rhs2, repl_stmt = info
+                    found = (ln2, stmt2, repl_stmt if repl_stmt is not None else None)
+                    rhs = rhs2
+                    break
+                # Stop on other meaningful use of var before assignment.
+                if contains_ident(stmt2, var):
+                    break
+            if found is None:
+                continue
+            ln2, stmt2, repl_stmt = found
+            # Self-referential assignment needs existing allocation; do not suggest.
+            if contains_ident(rhs, var):
+                continue
+            rhs_array = rhs_is_clearly_array(rhs, array_names)
+            replace_rhs: Optional[str] = None
+            if not rhs_array:
+                # Scalar RHS only safe for allocate(...(1)) via explicit singleton constructor.
+                if allocate_is_singleton(dim_spec):
+                    replace_rhs = f"[{rhs}]"
+                else:
+                    continue
+
+            out.append(
+                Finding(
+                    path=unit.path,
+                    unit_kind=unit.kind,
+                    unit_name=unit.name,
+                    alloc_line=ln,
+                    assign_line=ln2,
+                    var=var,
+                    assign_stmt=stmt2.strip(),
+                    replace_assign_rhs=replace_rhs,
+                    replace_assign_stmt=repl_stmt,
+                )
             )
-        )
     return out
 
 
@@ -419,40 +543,53 @@ def apply_file_edits(
     changed = 0
     inserted = 0
 
-    by_alloc_line: Dict[int, Finding] = {}
+    by_alloc_line: Dict[int, List[Finding]] = {}
     for f in findings:
-        by_alloc_line.setdefault(f.alloc_line, f)
+        by_alloc_line.setdefault(f.alloc_line, []).append(f)
 
     for alloc_line in sorted(by_alloc_line.keys(), reverse=True):
-        f = by_alloc_line[alloc_line]
+        fs = by_alloc_line[alloc_line]
         if alloc_line < 1 or alloc_line > len(lines):
             continue
 
         if fix:
             # Apply assignment RHS rewrite first when needed (line numbers are stable).
-            if f.replace_assign_rhs is not None and 1 <= f.assign_line <= len(lines):
-                lines[f.assign_line - 1] = rewrite_assignment_rhs_line(
-                    lines[f.assign_line - 1],
-                    f.var,
-                    f.replace_assign_rhs,
-                )
-            end_line = end_line_for_stmt_start(lines, alloc_line)
-            for ln in range(end_line, alloc_line - 1, -1):
-                idx = ln - 1
-                raw = lines[idx]
-                body = raw
-                eol = ""
-                if body.endswith("\r\n"):
-                    body, eol = body[:-2], "\r\n"
-                elif body.endswith("\n"):
-                    body, eol = body[:-1], "\n"
-                if body.lstrip().startswith("!"):
-                    continue
-                indent = re.match(r"^\s*", body).group(0) if body else ""
-                code = body[len(indent):]
-                suffix = f"  {ANNOTATE_TAG}" if annotate else ""
-                lines[idx] = f"{indent}! {code}{suffix}{eol}"
-                changed += 1
+            for f in fs:
+                if 1 <= f.assign_line <= len(lines):
+                    if f.replace_assign_stmt is not None:
+                        lines[f.assign_line - 1] = rewrite_assignment_stmt_line(
+                            lines[f.assign_line - 1], f.var, f.replace_assign_stmt
+                        )
+                    elif f.replace_assign_rhs is not None:
+                        lines[f.assign_line - 1] = rewrite_assignment_rhs_line(
+                            lines[f.assign_line - 1], f.var, f.replace_assign_rhs
+                        )
+            idx = alloc_line - 1
+            remove_vars = {f.var.lower() for f in fs}
+            rewritten = rewrite_allocate_remove_vars(lines[idx], remove_vars)
+            if rewritten is None:
+                # Nothing left: comment out full allocate statement.
+                end_line = end_line_for_stmt_start(lines, alloc_line)
+                for ln in range(end_line, alloc_line - 1, -1):
+                    j = ln - 1
+                    raw = lines[j]
+                    body = raw
+                    eol = ""
+                    if body.endswith("\r\n"):
+                        body, eol = body[:-2], "\r\n"
+                    elif body.endswith("\n"):
+                        body, eol = body[:-1], "\n"
+                    if body.lstrip().startswith("!"):
+                        continue
+                    indent = re.match(r"^\s*", body).group(0) if body else ""
+                    code = body[len(indent):]
+                    suffix = f"  {ANNOTATE_TAG}" if annotate else ""
+                    lines[j] = f"{indent}! {code}{suffix}{eol}"
+                    changed += 1
+            else:
+                if lines[idx] != rewritten:
+                    lines[idx] = rewritten
+                    changed += 1
         elif annotate:
             idx = alloc_line - 1
             raw = lines[idx]
@@ -461,7 +598,9 @@ def apply_file_edits(
             if raw.endswith("\r\n"):
                 eol = "\r\n"
             indent = re.match(r"^\s*", body).group(0) if body else ""
-            msg = f"{indent}! remove redundant allocate for {f.var}; assignment on line {f.assign_line}  !! suggested by xalloc_assign.py{eol}"
+            vars_txt = ", ".join(sorted({f.var for f in fs}))
+            first_assign = min(f.assign_line for f in fs)
+            msg = f"{indent}! remove redundant allocate for {vars_txt}; assignment near line {first_assign}  !! suggested by xalloc_assign.py{eol}"
             if idx + 1 < len(lines) and lines[idx + 1].strip().lower() == msg.strip().lower():
                 continue
             lines.insert(idx + 1, msg)
@@ -477,6 +616,35 @@ def apply_file_edits(
         shutil.copy2(path, backup)
     target.write_text("".join(lines), encoding="utf-8")
     return changed, inserted, backup
+
+
+def rewrite_text_allocation_on_assignment(text: str) -> Tuple[str, int]:
+    """Rewrite source text using this tool's allocation-on-assignment logic.
+
+    Returns (new_text, num_findings_applied).
+    """
+    fd, tmp_name = tempfile.mkstemp(suffix=".f90", prefix="xalloc_assign_")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        findings = analyze_file(tmp_path)
+        if not findings:
+            return text, 0
+        apply_file_edits(
+            tmp_path,
+            findings,
+            fix=True,
+            annotate=False,
+            out_path=tmp_path,
+            create_backup=False,
+        )
+        return tmp_path.read_text(encoding="utf-8"), len(findings)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def main() -> int:
