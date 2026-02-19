@@ -44,6 +44,7 @@ Main programs:
 - `xnames.py` - advisory checker for variable/procedure names that collide with Fortran keywords/intrinsics.
 - `xkind.py` - advisory checker/fixer for hard-coded kind numbers (`_8`, `kind=8`, etc.).
 - `xalloc_assign.py` - advisory checker/fixer for redundant `allocate(...)` immediately before whole-array assignment.
+- `xc2f.py` - practical C-to-Fortran transpiler for a supported C subset, with Fortran-oriented cleanup/post-processing passes.
 - `xset_array.py` - advisory checker for replacing consecutive scalar array-element assignments with one array assignment.
 - `xarray.py` - advisory checker for simple loops replaceable by array operations (`sum/product/count` and elementwise forms).
 - `xto_loop.py` - advisory checker/fixer that reverses selected array operations to explicit loops (for benchmarking/audit round-trips).
@@ -828,7 +829,7 @@ Notes:
 
 ### 28) `xalloc_assign.py`
 
-Advisory checker/fixer for redundant `allocate(...)` immediately before whole-array assignment.
+Advisory checker/fixer for redundant `allocate(...)` before assignment-driven allocation opportunities.
 
 Optional modes:
 
@@ -847,7 +848,27 @@ python xalloc_assign.py foo.f90 --fix --annotate --diff
 Notes:
 
 - Conservative by design (skips unsafe patterns).
+- Handles single-object and multi-object `allocate(...)` statements, removing only the redundant objects when possible.
+- Can rewrite eligible contiguous slice-constructor assignments (for example `a(1:n) = [...]`) to whole-array assignment when needed for safe allocate-on-assignment conversion.
 - When shape would be lost after removing `allocate(var(1))`, fix mode can rewrite scalar assignment to singleton constructor form (for example `var = [0.0_dp]`).
+
+### `xc2f.py`
+
+Practical transpiler from a supported C subset to compilable free-form Fortran, with conservative cleanup passes.
+
+Typical commands:
+
+```bash
+python xc2f.py foo.c
+python xc2f.py xfactors.c --out xfactors.f90
+python xc2f.py xmatmul.c --out xmatmul.f90
+```
+
+Notes:
+
+- Uses `pycparser` AST lowering and emits module/program Fortran structure.
+- Applies post-processing passes to improve generated Fortran readability and safety (for example declaration/allocate coalescing, redundant-syntax cleanup, constant promotion, and allocation-on-assignment rewrites where safe).
+- Supports generation patterns validated on representative examples such as factors/matmul-style C sources.
 
 ### 29) `xbounds.py`
 
