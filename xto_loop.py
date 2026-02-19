@@ -1204,9 +1204,16 @@ def maybe_reverse_minmax(lhs: str, rhs: str, indent: str, vars_info: Dict[str, V
     first_idx = ",".join(resolve_dim_bounds(arr, d, b)[0] for d, b in enumerate(vi.bounds))
     cmp = "<" if fn == "minval" else ">"
     lines: List[str] = [f"{indent}block", f"{indent}   {generated_loop_var_decl(vars_info, rank=vi.rank)}", f"{indent}   {lhs_name} = {arr}({first_idx})"]
+    def _next_start(lb: str) -> str:
+        t = lb.strip()
+        if re.fullmatch(r"[+-]?\d+", t):
+            return str(int(t) + 1)
+        return f"({t}) + 1"
     for level, d in enumerate(reversed(range(vi.rank))):
         b = vi.bounds[d]
         lb, ub = resolve_dim_bounds(arr, d, b)
+        if vi.rank == 1 and d == 0:
+            lb = _next_start(lb)
         lines.append(f"{indent}{' ' * (3 * (level + 1))}do {idx[d]} = {lb}, {ub}")
     idx_txt = ",".join(idx[: vi.rank])
     lines.append(f"{indent}{' ' * (3 * (vi.rank + 1))}if ({arr}({idx_txt}) {cmp} {lhs_name}) {lhs_name} = {arr}({idx_txt})")
@@ -3232,9 +3239,16 @@ def maybe_reverse_print_reductions(code: str, indent: str, vars_info: Dict[str, 
             execs.append(f"{indent}   {t} = {arr}({first})")
             idx = loop_vars_for_rank(vi.rank, vars_info)
             cmp = "<" if fn == "minval" else ">"
+            def _next_start(lb: str) -> str:
+                tt = lb.strip()
+                if re.fullmatch(r"[+-]?\d+", tt):
+                    return str(int(tt) + 1)
+                return f"({tt}) + 1"
             for level, d in enumerate(reversed(range(vi.rank))):
                 b = vi.bounds[d]
                 lb, ub = resolve_dim_bounds(arr, d, b)
+                if vi.rank == 1 and d == 0:
+                    lb = _next_start(lb)
                 execs.append(f"{indent}{' ' * (3 * (level+1))}do {idx[d]} = {lb}, {ub}")
             execs.append(f"{indent}{' ' * (3 * (vi.rank+1))}if ({arr}({', '.join(idx[:vi.rank])}) {cmp} {t}) {t} = {arr}({', '.join(idx[:vi.rank])})")
             for level in reversed(range(vi.rank)):
@@ -3357,42 +3371,228 @@ def maybe_reverse_print_reductions(code: str, indent: str, vars_info: Dict[str, 
                 execs.append(f"{indent}{' ' * (3 * (level+1))}end do")
             rewritten.append(t)
             continue
+        mscaled = re.match(
+            r"^\s*(sum|product)\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*([+\-*/])\s*(.+)\s*$",
+            item,
+            re.IGNORECASE,
+        )
+        if mscaled:
+            op = mscaled.group(1).lower()
+            arr = mscaled.group(2).lower()
+            tail_op = mscaled.group(3).strip()
+            tail_expr = mscaled.group(4).strip()
+            vi = vars_info.get(arr)
+            if vi is not None and 1 <= vi.rank <= 3:
+                t = unique_temp_name(f"{op}_{arr}", taken_names)
+                typ = type_map.get(arr, "real")
+                init = init_literal_for_type(typ, one=(op == "product"))
+                sym = "*" if op == "product" else "+"
+                decls.append(f"{indent}   {typ} :: {t}")
+                execs.append(f"{indent}   {t} = {init}")
+                idx = loop_vars_for_rank(vi.rank, vars_info)
+                for level, d in enumerate(reversed(range(vi.rank))):
+                    b = vi.bounds[d]
+                    lb, ub = resolve_dim_bounds(arr, d, b)
+                    execs.append(f"{indent}{' ' * (3 * (level+1))}do {idx[d]} = {lb}, {ub}")
+                execs.append(f"{indent}{' ' * (3 * (vi.rank+1))}{t} = {t} {sym} {arr}({', '.join(idx[:vi.rank])})")
+                for level in reversed(range(vi.rank)):
+                    execs.append(f"{indent}{' ' * (3 * (level+1))}end do")
+                rewritten.append(f"({t} {tail_op} {tail_expr})")
+                continue
+
+        mdt = re.match(
+            r"^\s*(sum|product)\s*\(\s*([a-z][a-z0-9_]*)\s*,\s*(?:dim\s*=\s*)?([123])\s*\)\s*([+\-*/])\s*(.+)\s*$",
+            item,
+            re.IGNORECASE,
+        )
+        if mdt:
+            reduce_op = mdt.group(1).lower()
+            arr = mdt.group(2).lower()
+            dim = int(mdt.group(3))
+            tail_op = mdt.group(4).strip()
+            tail_expr = mdt.group(5).strip()
+            vi = vars_info.get(arr)
+            if vi is not None and vi.rank in (2, 3) and 1 <= dim <= vi.rank:
+                t = unique_temp_name(f"{reduce_op}_{arr}_dim_{dim}", taken_names)
+                typ = type_map.get(arr, "real")
+                reduce_init = init_literal_for_type(typ, one=(reduce_op == "product"))
+                reduce_acc = "*" if reduce_op == "product" else "+"
+                idx = loop_vars_for_rank(max(vi.rank, 3), vars_info)
+                i, j, k = idx[:3]
+                if vi.rank == 2:
+                    l1, u1 = resolve_dim_bounds(arr, 0, vi.bounds[0])
+                    l2, u2 = resolve_dim_bounds(arr, 1, vi.bounds[1])
+                    if dim == 1:
+                        decls.append(f"{indent}   {typ} :: {t}({l2}:{u2})")
+                        execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}      {t}({j}) = {reduce_init}")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}      do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}         {t}({j}) = {t}({j}) {reduce_acc} {arr}({i},{j})")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}      {t}({j}) = {t}({j}) {tail_op} {tail_expr}")
+                        execs.append(f"{indent}   end do")
+                    else:
+                        decls.append(f"{indent}   {typ} :: {t}({l1}:{u1})")
+                        execs.append(f"{indent}   do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}      {t}({i}) = {reduce_init}")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}         {t}({i}) = {t}({i}) {reduce_acc} {arr}({i},{j})")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}      {t}({i}) = {t}({i}) {tail_op} {tail_expr}")
+                        execs.append(f"{indent}   end do")
+                else:
+                    l1, u1 = resolve_dim_bounds(arr, 0, vi.bounds[0])
+                    l2, u2 = resolve_dim_bounds(arr, 1, vi.bounds[1])
+                    l3, u3 = resolve_dim_bounds(arr, 2, vi.bounds[2])
+                    if dim == 1:
+                        decls.append(f"{indent}   {typ} :: {t}({l2}:{u2},{l3}:{u3})")
+                        execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                        execs.append(f"{indent}      do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}         {t}({j},{k}) = {reduce_init}")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                        execs.append(f"{indent}      do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}         do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}            {t}({j},{k}) = {t}({j},{k}) {reduce_acc} {arr}({i},{j},{k})")
+                        execs.append(f"{indent}         end do")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                        execs.append(f"{indent}      do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}         {t}({j},{k}) = {t}({j},{k}) {tail_op} {tail_expr}")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                    elif dim == 2:
+                        decls.append(f"{indent}   {typ} :: {t}({l1}:{u1},{l3}:{u3})")
+                        execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                        execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}         {t}({i},{k}) = {reduce_init}")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                        execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}         do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}            {t}({i},{k}) = {t}({i},{k}) {reduce_acc} {arr}({i},{j},{k})")
+                        execs.append(f"{indent}         end do")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                        execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}         {t}({i},{k}) = {t}({i},{k}) {tail_op} {tail_expr}")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                    else:
+                        decls.append(f"{indent}   {typ} :: {t}({l1}:{u1},{l2}:{u2})")
+                        execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}         {t}({i},{j}) = {reduce_init}")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}         do {k} = {l3}, {u3}")
+                        execs.append(f"{indent}            {t}({i},{j}) = {t}({i},{j}) {reduce_acc} {arr}({i},{j},{k})")
+                        execs.append(f"{indent}         end do")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                        execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                        execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                        execs.append(f"{indent}         {t}({i},{j}) = {t}({i},{j}) {tail_op} {tail_expr}")
+                        execs.append(f"{indent}      end do")
+                        execs.append(f"{indent}   end do")
+                rewritten.append(t)
+                continue
+
         md = SUM_DIM_RE.match(item) or SUM_DIM_POS_RE.match(item) or PRODUCT_DIM_RE.match(item) or PRODUCT_DIM_POS_RE.match(item)
         if md:
             arr = md.group(1).lower()
             dim = int(md.group(2))
             vi = vars_info.get(arr)
-            if vi is None or vi.rank != 2 or dim not in (1, 2):
+            if vi is None or vi.rank not in (2, 3) or dim < 1 or dim > vi.rank:
                 rewritten.append(item)
                 continue
             reduce_op = "product" if (PRODUCT_DIM_RE.match(item) or PRODUCT_DIM_POS_RE.match(item)) else "sum"
             t = unique_temp_name(f"{reduce_op}_{arr}_dim_{dim}", taken_names)
             typ = type_map.get(arr, "real")
-            i, j = loop_vars_for_rank(2, vars_info)[:2]
-            l1, u1 = resolve_dim_bounds(arr, 0, vi.bounds[0])
-            l2, u2 = resolve_dim_bounds(arr, 1, vi.bounds[1])
             reduce_init = "1.0" if reduce_op == "product" else "0.0"
             reduce_acc = "*" if reduce_op == "product" else "+"
-            if dim == 1:
-                decls.append(f"{indent}   {typ} :: {t}({l2}:{u2})")
-                execs.append(f"{indent}   do {j} = {l2}, {u2}")
-                execs.append(f"{indent}      {t}({j}) = {reduce_init}")
-                execs.append(f"{indent}   end do")
-                execs.append(f"{indent}   do {i} = {l1}, {u1}")
-                execs.append(f"{indent}      do {j} = {l2}, {u2}")
-                execs.append(f"{indent}         {t}({j}) = {t}({j}) {reduce_acc} {arr}({i},{j})")
-                execs.append(f"{indent}      end do")
-                execs.append(f"{indent}   end do")
+            i, j, k = loop_vars_for_rank(max(vi.rank, 3), vars_info)[:3]
+            l1, u1 = resolve_dim_bounds(arr, 0, vi.bounds[0])
+            l2, u2 = resolve_dim_bounds(arr, 1, vi.bounds[1])
+            if vi.rank == 2:
+                if dim == 1:
+                    decls.append(f"{indent}   {typ} :: {t}({l2}:{u2})")
+                    execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}      {t}({j}) = {reduce_init}")
+                    execs.append(f"{indent}   end do")
+                    execs.append(f"{indent}   do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}      do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}         {t}({j}) = {t}({j}) {reduce_acc} {arr}({i},{j})")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
+                else:
+                    decls.append(f"{indent}   {typ} :: {t}({l1}:{u1})")
+                    execs.append(f"{indent}   do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}      {t}({i}) = {reduce_init}")
+                    execs.append(f"{indent}   end do")
+                    execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}         {t}({i}) = {t}({i}) {reduce_acc} {arr}({i},{j})")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
             else:
-                decls.append(f"{indent}   {typ} :: {t}({l1}:{u1})")
-                execs.append(f"{indent}   do {i} = {l1}, {u1}")
-                execs.append(f"{indent}      {t}({i}) = {reduce_init}")
-                execs.append(f"{indent}   end do")
-                execs.append(f"{indent}   do {j} = {l2}, {u2}")
-                execs.append(f"{indent}      do {i} = {l1}, {u1}")
-                execs.append(f"{indent}         {t}({i}) = {t}({i}) {reduce_acc} {arr}({i},{j})")
-                execs.append(f"{indent}      end do")
-                execs.append(f"{indent}   end do")
+                l3, u3 = resolve_dim_bounds(arr, 2, vi.bounds[2])
+                if dim == 1:
+                    decls.append(f"{indent}   {typ} :: {t}({l2}:{u2},{l3}:{u3})")
+                    execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                    execs.append(f"{indent}      do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}         {t}({j},{k}) = {reduce_init}")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
+                    execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                    execs.append(f"{indent}      do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}         do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}            {t}({j},{k}) = {t}({j},{k}) {reduce_acc} {arr}({i},{j},{k})")
+                    execs.append(f"{indent}         end do")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
+                elif dim == 2:
+                    decls.append(f"{indent}   {typ} :: {t}({l1}:{u1},{l3}:{u3})")
+                    execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                    execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}         {t}({i},{k}) = {reduce_init}")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
+                    execs.append(f"{indent}   do {k} = {l3}, {u3}")
+                    execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}         do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}            {t}({i},{k}) = {t}({i},{k}) {reduce_acc} {arr}({i},{j},{k})")
+                    execs.append(f"{indent}         end do")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
+                else:
+                    decls.append(f"{indent}   {typ} :: {t}({l1}:{u1},{l2}:{u2})")
+                    execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}         {t}({i},{j}) = {reduce_init}")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
+                    execs.append(f"{indent}   do {j} = {l2}, {u2}")
+                    execs.append(f"{indent}      do {i} = {l1}, {u1}")
+                    execs.append(f"{indent}         do {k} = {l3}, {u3}")
+                    execs.append(f"{indent}            {t}({i},{j}) = {t}({i},{j}) {reduce_acc} {arr}({i},{j},{k})")
+                    execs.append(f"{indent}         end do")
+                    execs.append(f"{indent}      end do")
+                    execs.append(f"{indent}   end do")
             rewritten.append(t)
             continue
         mdm = (
