@@ -45,6 +45,10 @@ Main programs:
 - `xkind.py` - advisory checker/fixer for hard-coded kind numbers (`_8`, `kind=8`, etc.).
 - `xalloc_assign.py` - advisory checker/fixer for redundant `allocate(...)` immediately before whole-array assignment.
 - `xc2f.py` - practical C-to-Fortran transpiler for a supported C subset, with Fortran-oriented cleanup/post-processing passes.
+- `xc2f_batch_test.py` - batch harness to smoke-test `xc2f.py` across many C files with compile/run reporting.
+- `xf2c.py` - practical Fortran-to-C transpiler for a supported free-form Fortran subset, with build/run and per-file modes.
+- `xlegal.py` - lightweight Fortran legality validator (statement/form checks, implicit-none/declaration sanity, duplicate checks).
+- `xfix.py` - conservative auto-fixer for common structural issues (for example end-name mismatches, duplicate defs/decls, simple paren fixes).
 - `xset_array.py` - advisory checker for replacing consecutive scalar array-element assignments with one array assignment.
 - `xarray.py` - advisory checker for simple loops replaceable by array operations (`sum/product/count` and elementwise forms).
 - `xto_loop.py` - advisory checker/fixer that reverses selected array operations to explicit loops (for benchmarking/audit round-trips).
@@ -868,6 +872,75 @@ Notes:
 - Uses `pycparser` AST lowering and emits module/program Fortran structure.
 - Applies post-processing passes to improve generated Fortran readability and safety (for example declaration/allocate coalescing, redundant-syntax cleanup, constant promotion, and allocation-on-assignment rewrites where safe).
 - Supports generation patterns validated on representative examples such as factors/matmul-style C sources.
+
+### `xc2f_batch_test.py`
+
+Batch harness for evaluating how many C sources can be transpiled by `xc2f.py` and built successfully.
+
+Typical commands:
+
+```bash
+python xc2f_batch_test.py --root c:\\c\\public_domain\\github\\jburkardt-c --limit 50
+python xc2f_batch_test.py --limit 10 --sort-size --out-dir _xc2f_batch_smoke --verbose
+```
+
+Notes:
+
+- Can sort by source size to try smaller/easier files first.
+- Can skip cases where baseline C build fails.
+- Produces per-file status summary and failure diagnostics.
+
+### `xf2c.py`
+
+Practical transpiler from a supported free-form Fortran subset to C, with optional build/run checks.
+
+Typical commands:
+
+```bash
+python xf2c.py foo.f90 --out foo.c
+python xf2c.py foo.f90 --run-both
+python xf2c.py src\\*.f90 --mode-each --compile-both --summary
+```
+
+Notes:
+
+- Supports single-file and multi-file processing (`--mode each|combined`).
+- Includes options for compile-only and run comparisons (`--compile`, `--compile-c`, `--compile-both`, `--run-both`).
+- Emits C helpers for selected Fortran intrinsics/patterns where needed.
+
+### `xlegal.py`
+
+Validator for free-form Fortran source legality using lightweight static checks.
+
+Typical commands:
+
+```bash
+python xlegal.py foo.f90
+python xlegal.py src\\*.f90
+```
+
+Notes:
+
+- Reports unrecognized statements and basic structural mismatches.
+- Includes implicit-none/declaration sanity checks and duplicate definition/declaration detection.
+- Intended as a fast preflight gate for transformation/transpilation workflows.
+
+### `xfix.py`
+
+Conservative auto-fixer for common structural/typo issues detected in Fortran code.
+
+Typical commands:
+
+```bash
+python xfix.py foo.f90 --out fixed.f90
+python xfix.py src\\*.f90 --fix
+```
+
+Notes:
+
+- Repairs selected end-statement name mismatches and simple unambiguous parenthesis issues.
+- Can remove duplicate procedure definitions (keeping the last) and duplicate declarations (keeping the first), with reporting.
+- Complements `xlegal.py` by applying safe automated corrections where possible.
 
 ### 29) `xbounds.py`
 
