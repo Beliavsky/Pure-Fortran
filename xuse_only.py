@@ -24,6 +24,11 @@ USE_RE = re.compile(
     r"^\s*use\b(?:\s*,\s*(?:non_intrinsic|intrinsic)\s*)?(?:\s*::\s*|\s+)([a-z][a-z0-9_]*)(.*)$",
     re.IGNORECASE,
 )
+USE_ONLY_LINE_RE = re.compile(
+    r"^(?P<prefix>\s*use\b(?:\s*,\s*(?:non_intrinsic|intrinsic)\s*)?(?:\s*::\s*|\s+))"
+    r"(?P<module>[a-z][a-z0-9_]*)\s*,\s*only\s*:\s*(?P<tail>.+)$",
+    re.IGNORECASE,
+)
 MODULE_START_RE = re.compile(r"^\s*module\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 MODULE_END_RE = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
 CONTAINS_RE = re.compile(r"^\s*contains\b", re.IGNORECASE)
@@ -31,6 +36,11 @@ PROC_START_RE = re.compile(
     r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(function|subroutine)\s+([a-z][a-z0-9_]*)\b",
     re.IGNORECASE,
 )
+UNIT_START_RE = re.compile(
+    r"^\s*(?!end\b)(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:program|module|subroutine|function)\b",
+    re.IGNORECASE,
+)
+UNIT_END_RE = re.compile(r"^\s*end\s+(?:program|module|subroutine|function)\b", re.IGNORECASE)
 INTERFACE_RE = re.compile(r"^\s*interface\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 ACCESS_RE = re.compile(r"^\s*(public|private)\b(.*)$", re.IGNORECASE)
 IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
@@ -143,6 +153,52 @@ def parse_access_names(rest: str) -> Optional[List[str]]:
     return out
 
 
+def split_top_level_commas(text: str) -> List[str]:
+    """Split text by top-level commas only."""
+    out: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < len(text) and text[i + 1] == "'":
+                cur.append("''")
+                i += 2
+                continue
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < len(text) and text[i + 1] == '"':
+                cur.append('""')
+                i += 2
+                continue
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                out.append("".join(cur).strip())
+                cur = []
+                i += 1
+                continue
+        cur.append(ch)
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
     """Resolve input file paths from CLI args or current directory defaults."""
     if args_files:
@@ -237,6 +293,98 @@ def used_names_in_file(finfo: fscan.SourceFileInfo, candidates: Set[str]) -> Lis
     return ordered
 
 
+def used_names_in_file_excluding_use(finfo: fscan.SourceFileInfo, candidates: Set[str]) -> List[str]:
+    """Return candidate names referenced outside USE statements, first-seen order."""
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for _lineno, stmt in fscan.iter_fortran_statements(finfo.parsed_lines):
+        low = stmt.lower().strip()
+        if low.startswith("use "):
+            continue
+        for m in IDENT_RE.finditer(low):
+            n = m.group(1).lower()
+            if n in FORTRAN_KEYWORDS or n not in candidates or n in seen:
+                continue
+            seen.add(n)
+            ordered.append(n)
+    return ordered
+
+
+def used_names_in_unit_excluding_use(
+    finfo: fscan.SourceFileInfo, candidates: Set[str], target_line: int
+) -> List[str]:
+    """Return candidate names referenced in the same program unit as target_line."""
+    # Find enclosing unit bounds for the target statement line.
+    stack: List[Tuple[int, int]] = []  # (start_line, depth id)
+    unit_bounds: List[Tuple[int, int]] = []
+    depth = 0
+    stmts = list(fscan.iter_fortran_statements(finfo.parsed_lines))
+    for lineno, stmt in stmts:
+        s = stmt.strip().lower()
+        if UNIT_START_RE.match(s):
+            depth += 1
+            stack.append((lineno, depth))
+            continue
+        if UNIT_END_RE.match(s) and stack:
+            start, _d = stack.pop()
+            unit_bounds.append((start, lineno))
+            continue
+    lo, hi = 1, 10**9
+    for a, b in unit_bounds:
+        if a <= target_line <= b:
+            lo, hi = a, b
+            break
+
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for lineno, stmt in stmts:
+        if lineno < lo or lineno > hi:
+            continue
+        low = stmt.lower().strip()
+        if low.startswith("use "):
+            continue
+        for m in IDENT_RE.finditer(low):
+            n = m.group(1).lower()
+            if n in FORTRAN_KEYWORDS or n not in candidates or n in seen:
+                continue
+            seen.add(n)
+            ordered.append(n)
+    return ordered
+
+
+def parse_use_only_imports(code: str) -> Optional[Tuple[str, List[Tuple[str, str]]]]:
+    """Parse one single-line USE, ONLY statement into module and imported locals.
+
+    Returns (module, [(raw_token, local_name), ...]).
+    """
+    if "&" in code:
+        return None
+    m = USE_ONLY_LINE_RE.match(code)
+    if not m:
+        return None
+    mod = m.group("module").lower()
+    tail = m.group("tail").strip()
+    if not tail:
+        return None
+    parts = split_top_level_commas(tail)
+    imports: List[Tuple[str, str]] = []
+    for p in parts:
+        t = p.strip()
+        if not t:
+            continue
+        if "=>" in t:
+            local = t.split("=>", 1)[0].strip()
+        else:
+            local = t
+        ml = re.match(r"^([a-z][a-z0-9_]*)$", local, re.IGNORECASE)
+        if not ml:
+            return None
+        imports.append((t, ml.group(1).lower()))
+    if not imports:
+        return None
+    return mod, imports
+
+
 def rewrite_use_line(line: str, only_names: List[str]) -> Optional[str]:
     """Rewrite one broad USE line to USE, ONLY form."""
     code, comment = split_code_comment(line.rstrip("\r\n"))
@@ -247,6 +395,23 @@ def rewrite_use_line(line: str, only_names: List[str]) -> Optional[str]:
         return None
     eol = get_eol(line)
     return f"{m.group('prefix')}{m.group('module')}, only: {', '.join(only_names)}{comment}{eol}"
+
+
+def rewrite_use_only_line(line: str, kept_raw: List[str]) -> Optional[str]:
+    """Rewrite one USE, ONLY line keeping only selected raw import tokens.
+
+    Returns None when no names remain (line can be deleted).
+    """
+    code, comment = split_code_comment(line.rstrip("\r\n"))
+    if "&" in code:
+        return None
+    m = USE_ONLY_LINE_RE.match(code)
+    if not m:
+        return None
+    if not kept_raw:
+        return None
+    eol = get_eol(line)
+    return f"{m.group('prefix')}{m.group('module')}, only: {', '.join(kept_raw)}{comment}{eol}"
 
 
 def split_code_comment(line: str) -> Tuple[str, str]:
@@ -283,6 +448,7 @@ def apply_fix_for_file(
     lines = finfo.lines[:]
     changed = 0
     changes: Dict[str, List[str]] = {}
+    pruned: Dict[str, List[str]] = {}
 
     for idx, line in enumerate(lines):
         code, _comment = split_code_comment(line.rstrip("\r\n"))
@@ -309,6 +475,27 @@ def apply_fix_for_file(
         changed += 1
         changes[mod] = used
 
+    # Prune unused imports in existing USE, ONLY lines.
+    for idx, line in enumerate(lines):
+        code, _comment = split_code_comment(line.rstrip("\r\n"))
+        parsed = parse_use_only_imports(code)
+        if parsed is None:
+            continue
+        mod, imports = parsed
+        locals_set = {loc for _raw, loc in imports}
+        used_locals = set(used_names_in_unit_excluding_use(finfo, locals_set, idx + 1))
+        if len(used_locals) == len(locals_set):
+            continue
+        kept_raw = [raw for raw, loc in imports if loc in used_locals]
+        removed = [raw for raw, loc in imports if loc not in used_locals]
+        new_line = rewrite_use_only_line(line, kept_raw)
+        if new_line is None:
+            lines[idx] = ""
+        else:
+            lines[idx] = new_line
+        changed += 1
+        pruned.setdefault(mod, []).extend(removed)
+
     if changed == 0:
         return 0, None, {}
 
@@ -333,6 +520,10 @@ def apply_fix_for_file(
 
     target = out_path if out_path is not None else finfo.path
     target.write_text("".join(lines), encoding="utf-8", newline="")
+    for mod, removed in pruned.items():
+        if removed:
+            changes.setdefault(mod, [])
+            changes[mod].extend([f"-{r}" for r in removed])
     return changed, backup_path, changes
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prune likely unused Fortran procedures with compile validation."""
+"""Prune likely unused Fortran procedures with optional compile validation."""
 
 from __future__ import annotations
 
@@ -308,12 +308,27 @@ def remove_procedure_block(path: Path, proc: ProcRef) -> str:
     end_idx = min(len(lines), proc.end)
     del lines[start_idx:end_idx]
     lines = remove_name_from_public_lines(lines, proc.name)
-    path.write_text("".join(lines), encoding="utf-8", newline="")
+    path.write_text(normalize_blank_lines(lines), encoding="utf-8", newline="")
     return old_text
 
 
+def normalize_blank_lines(lines: List[str]) -> List[str]:
+    """Collapse blank-line runs to at most one blank line."""
+    out: List[str] = []
+    blank_run = 0
+    for ln in lines:
+        if ln.strip() == "":
+            blank_run += 1
+            if blank_run > 1:
+                continue
+        else:
+            blank_run = 0
+        out.append(ln)
+    return out
+
+
 def main() -> int:
-    """Run compile-validated pruning to remove likely unused procedures."""
+    """Run pruning to remove likely unused procedures."""
     parser = argparse.ArgumentParser(description="Prune likely unused Fortran procedures")
     parser.add_argument("fortran_files", type=Path, nargs="*", help="Source files (default: *.f90/*.F90)")
     parser.add_argument(
@@ -337,6 +352,11 @@ def main() -> int:
     )
     parser.add_argument("--in-place", action="store_true", help="Modify sources in place (default: off)")
     parser.add_argument("--fix", action="store_true", help="Alias for --in-place")
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Use static call-graph pruning only (skip compiler validation).",
+    )
     parser.add_argument("--max-iter", type=int, default=10, help="Maximum prune passes (default: 10)")
     parser.add_argument("--verbose", action="store_true", help="Print accepted/rejected removals")
     args = parser.parse_args()
@@ -384,8 +404,9 @@ def main() -> int:
     if not compile_files:
         compile_files = [f.path for f in ordered_infos]
 
-    if not run_compile(args.compiler, compile_files, phase="baseline", cwd=work_dir):
-        return 1
+    if not args.no_compile:
+        if not run_compile(args.compiler, compile_files, phase="baseline", cwd=work_dir):
+            return 1
 
     removed: List[ProcRef] = []
     for it in range(1, args.max_iter + 1):
@@ -402,8 +423,16 @@ def main() -> int:
             break
 
         changed_this_iter = 0
-        for proc in sorted(candidates, key=lambda x: (x.path.name.lower(), x.start)):
+        # Remove bottom-to-top within each file so stored line ranges remain valid
+        # across multiple removals in the same pass.
+        for proc in sorted(candidates, key=lambda x: (x.path.name.lower(), -x.start)):
             old_text = remove_procedure_block(proc.path, proc)
+            if args.no_compile:
+                removed.append(proc)
+                changed_this_iter += 1
+                if args.verbose:
+                    print(f"Removed: {proc.path.name} {proc.kind} {proc.name} [{proc.start}-{proc.end}]")
+                continue
             if run_compile(args.compiler, compile_files, phase="trial", cwd=work_dir):
                 removed.append(proc)
                 changed_this_iter += 1
@@ -417,9 +446,18 @@ def main() -> int:
         if changed_this_iter == 0:
             break
 
-    if not run_compile(args.compiler, compile_files, phase="final", cwd=work_dir):
-        print("Final compile failed; no further changes applied.")
-        return 1
+    if not args.no_compile:
+        if not run_compile(args.compiler, compile_files, phase="final", cwd=work_dir):
+            print("Final compile failed; no further changes applied.")
+            return 1
+
+    # Final formatting normalization (also useful when no procedures were removed).
+    for p in work_files:
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        lines = txt.splitlines(keepends=True)
+        norm = normalize_blank_lines(lines)
+        if norm != lines:
+            p.write_text("".join(norm), encoding="utf-8", newline="")
 
     print(f"\nRemoved {len(removed)} procedure(s).")
     if removed:

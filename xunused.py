@@ -673,7 +673,11 @@ def can_remove_assignment(stmt: str, var_name: str) -> bool:
     return True
 
 
-def build_fix_actions_for_unit(unit: Unit) -> Tuple[Dict[int, Set[str]], Set[int]]:
+def build_fix_actions_for_unit(
+    unit: Unit,
+    *,
+    fix_decl_unused: bool = True,
+) -> Tuple[Dict[int, Set[str]], Set[int]]:
     """Build declaration-removal and assignment-removal actions for one unit."""
     tracked: Set[str] = set()
     writes: Set[str] = set()
@@ -729,12 +733,17 @@ def build_fix_actions_for_unit(unit: Unit) -> Tuple[Dict[int, Set[str]], Set[int
     skip = set(unit.dummy_names)
     if unit.result_name:
         skip.add(unit.result_name.lower())
-    unused = {n for n in tracked if n not in skip and n in writes and n not in reads}
-    if not unused:
+    set_unused = {n for n in tracked if n not in skip and n in writes and n not in reads}
+    decl_only_unused = {
+        n
+        for n in tracked
+        if n not in skip and n not in writes and n not in reads and n in decl_line_by_name
+    }
+    if not set_unused and not (fix_decl_unused and decl_only_unused):
         return {}, set()
 
     fixable_unused: Set[str] = set()
-    for n in unused:
+    for n in set_unused:
         write_lines = write_lines_by_name.get(n, set())
         if not write_lines:
             continue
@@ -742,6 +751,8 @@ def build_fix_actions_for_unit(unit: Unit) -> Tuple[Dict[int, Set[str]], Set[int
         # Only remove declarations for variables whose every write can be removed safely.
         if write_lines.issubset(removable):
             fixable_unused.add(n)
+    if fix_decl_unused:
+        fixable_unused.update(decl_only_unused)
     if not fixable_unused:
         return {}, set()
 
@@ -754,7 +765,7 @@ def build_fix_actions_for_unit(unit: Unit) -> Tuple[Dict[int, Set[str]], Set[int
             names_here = set(decls.keys()) & fixable_unused
             if names_here:
                 decl_actions.setdefault(ln, set()).update(names_here)
-        for n in fixable_unused:
+        for n in (fixable_unused & set_unused):
             if can_remove_assignment(low, n):
                 remove_assign_lines.add(ln)
     return decl_actions, remove_assign_lines
@@ -913,6 +924,14 @@ def module_internal_ref_counts(finfo: fscan.SourceFileInfo) -> Dict[Tuple[str, s
     return counts
 
 
+def unit_context_for_line(units: List[Unit], line: int) -> str:
+    """Best-effort unit context for a source line."""
+    for u in units:
+        if u.start <= line <= u.end:
+            return f"{u.kind} {u.name}"
+    return "unit"
+
+
 def main() -> int:
     """Run advisory checks for likely unused set variables/constants."""
     parser = argparse.ArgumentParser(
@@ -923,9 +942,27 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="Print all findings")
     parser.add_argument("--fix", action="store_true", help="Apply conservative removals for some findings")
     parser.add_argument(
+        "--fix-decl-unused",
+        dest="fix_decl_unused",
+        action="store_true",
+        help="With --fix, also remove declaration-only unused locals (default on).",
+    )
+    parser.add_argument(
+        "--no-fix-decl-unused",
+        dest="fix_decl_unused",
+        action="store_false",
+        help="With --fix, do not remove declaration-only unused locals.",
+    )
+    parser.set_defaults(fix_decl_unused=True)
+    parser.add_argument(
         "--warn-dead-store",
         action="store_true",
         help="Also warn about likely dead-store assignments (advisory)",
+    )
+    parser.add_argument(
+        "--dead-store-conservative",
+        action="store_true",
+        help="Use shared conservative dead-store analysis (set-but-never-read) and include it in --fix",
     )
     parser.add_argument("--out", type=Path, help="With --fix, write transformed output to this file (single input)")
     parser.add_argument("--out-dir", type=Path, help="With --fix, write outputs to this directory")
@@ -974,12 +1011,41 @@ def main() -> int:
 
     issues: List[Issue] = []
     by_path_unit: Dict[Tuple[Path, str, str], Unit] = {}
+    units_by_path: Dict[Path, List[Unit]] = {}
     for finfo in ordered_infos:
-        for unit in collect_units(finfo):
+        units = collect_units(finfo)
+        units_by_path[finfo.path] = units
+        for unit in units:
             by_path_unit[(unit.path, unit.kind, unit.name)] = unit
             issues.extend(analyze_unit(unit))
             if args.warn_dead_store:
                 issues.extend(analyze_unit_dead_stores(unit))
+
+    conservative_edits_by_path: Dict[Path, fscan.DeadStoreEdits] = {}
+    if args.dead_store_conservative:
+        existing_set_never_read: Set[Tuple[Path, int, str]] = set()
+        for it in issues:
+            if "set but never read in this unit" in it.detail.lower():
+                existing_set_never_read.add((it.path, it.line, it.name.lower()))
+        for finfo in ordered_infos:
+            edits = fscan.find_set_but_never_read_local_edits(finfo.parsed_lines)
+            if edits.decl_remove_by_line or edits.remove_stmt_lines:
+                conservative_edits_by_path[finfo.path] = edits
+            for ln, names in sorted(edits.decl_remove_by_line.items()):
+                ctx = unit_context_for_line(units_by_path.get(finfo.path, []), ln)
+                for n in sorted(names):
+                    if (finfo.path, ln, n.lower()) in existing_set_never_read:
+                        continue
+                    issues.append(
+                        Issue(
+                            path=finfo.path,
+                            line=ln,
+                            category="dead-store",
+                            context=ctx,
+                            name=n,
+                            detail="set but never read in this unit (conservative)",
+                        )
+                    )
 
     for finfo in ordered_infos:
         refs = module_internal_ref_counts(finfo)
@@ -997,6 +1063,16 @@ def main() -> int:
                     )
                 )
 
+    deduped: List[Issue] = []
+    seen_issue_keys: Set[Tuple[str, int, str, str]] = set()
+    for it in issues:
+        key = (it.path.name.lower(), it.line, it.name.lower(), it.detail.lower())
+        if key in seen_issue_keys:
+            continue
+        seen_issue_keys.add(key)
+        deduped.append(it)
+    issues = deduped
+
     if not issues:
         if args.out is not None and len(files) == 1:
             src = files[0]
@@ -1012,13 +1088,24 @@ def main() -> int:
         per_file_decl_actions: Dict[Path, Dict[int, Set[str]]] = {}
         per_file_remove_assign: Dict[Path, Set[int]] = {}
         for unit in by_path_unit.values():
-            d_actions, rem_assign = build_fix_actions_for_unit(unit)
+            d_actions, rem_assign = build_fix_actions_for_unit(
+                unit,
+                fix_decl_unused=args.fix_decl_unused,
+            )
             if d_actions:
                 bucket = per_file_decl_actions.setdefault(unit.path, {})
                 for ln, names in d_actions.items():
                     bucket.setdefault(ln, set()).update(names)
             if rem_assign:
                 per_file_remove_assign.setdefault(unit.path, set()).update(rem_assign)
+        if args.dead_store_conservative:
+            for p, edits in conservative_edits_by_path.items():
+                if edits.decl_remove_by_line:
+                    bucket = per_file_decl_actions.setdefault(p, {})
+                    for ln, names in edits.decl_remove_by_line.items():
+                        bucket.setdefault(ln, set()).update(names)
+                if edits.remove_stmt_lines:
+                    per_file_remove_assign.setdefault(p, set()).update(edits.remove_stmt_lines)
 
         total_changes = 0
         for p in sorted({*per_file_decl_actions.keys(), *per_file_remove_assign.keys()}, key=lambda x: x.name.lower()):

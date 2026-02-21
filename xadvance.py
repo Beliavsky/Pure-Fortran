@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -203,8 +205,8 @@ def collapse_fmt_expr(fmt_expr: str) -> str:
     return fmt_expr
 
 
-def parse_write_nonadv(stmt: str) -> Optional[Tuple[str, str, str]]:
-    """Parse `write` with advance='no'; return (unit, fmt, item) when safe."""
+def parse_write_nonadv(stmt: str) -> Optional[Tuple[str, str, List[str]]]:
+    """Parse `write` with advance='no'; return (unit, fmt, items) when safe."""
     s = stmt.strip()
     if not WRITE_RE.match(s):
         return None
@@ -220,11 +222,8 @@ def parse_write_nonadv(stmt: str) -> Optional[Tuple[str, str, str]]:
     items = s[pos_rpar + 1 :].strip()
     if not items:
         return None
-    out_items = split_top_level_commas(items)
-    if len(out_items) != 1:
-        return None
-    out_item = out_items[0].strip()
-    if not out_item:
+    out_items = [it.strip() for it in split_top_level_commas(items)]
+    if not out_items or any(not it for it in out_items):
         return None
 
     ctl_parts = split_top_level_commas(ctl)
@@ -263,7 +262,7 @@ def parse_write_nonadv(stmt: str) -> Optional[Tuple[str, str, str]]:
         return None
     if other_keys:
         return None
-    return unit_expr, fmt_expr, out_item
+    return unit_expr, fmt_expr, out_items
 
 
 def build_replacement(loop_var: str, lb: str, ub: str, write_item: str) -> str:
@@ -275,6 +274,74 @@ def build_replacement(loop_var: str, lb: str, ub: str, write_item: str) -> str:
     return f"({write_item}, {loop_var} = {lb}, {ub})"
 
 
+def _format_implied_do_bound(expr: str) -> str:
+    """Format implied-do bounds for readability (avoid ambiguous `m*n-1` style)."""
+    s = re.sub(r"\s+", " ", expr.strip())
+    # Clarify trailing +/- literal offsets, e.g. `m * n-1` -> `m * n - 1`.
+    m = re.match(r"^(.*\S)\s*([+\-])\s*([0-9]+)\s*$", s)
+    if m:
+        lhs, op, rhs = m.group(1).strip(), m.group(2), m.group(3)
+        s = f"{lhs} {op} {rhs}"
+    return s
+
+
+def _is_zero_literal(expr: str) -> bool:
+    return expr.strip() == "0"
+
+
+def _strip_outer_parens(expr: str) -> str:
+    s = expr.strip()
+    while len(s) >= 2 and s[0] == "(" and s[-1] == ")":
+        depth = 0
+        ok = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    ok = False
+                    break
+        if not ok:
+            break
+        s = s[1:-1].strip()
+    return s
+
+
+def _plus_one_expr(expr: str) -> str:
+    """Return expression equivalent to (expr + 1), simplified when obvious."""
+    s = _strip_outer_parens(expr)
+    m = re.match(r"^(.*\S)\s*-\s*1\s*$", s)
+    if m:
+        return m.group(1).strip()
+    m2 = re.match(r"^(.*\S)\s*\+\s*1\s*$", s)
+    if m2:
+        return f"{m2.group(1).strip()} + 2"
+    return f"{s} + 1"
+
+
+def _normalize_offset_implied_do(write_item: str, loop_var: str, lb: str, ub: str) -> Tuple[str, str, str]:
+    """Normalize `(i+1)` style indexing with 0-based loop bounds to 1-based form."""
+    if not _is_zero_literal(lb):
+        return write_item, lb, ub
+    pat = re.compile(rf"\b{re.escape(loop_var)}\s*\+\s*1\b", re.IGNORECASE)
+    if not pat.search(write_item):
+        return write_item, lb, ub
+    new_item = pat.sub(loop_var, write_item)
+    new_lb = "1"
+    new_ub = _plus_one_expr(ub)
+    return new_item, new_lb, new_ub
+
+
+def _is_string_literal(expr: str) -> bool:
+    s = expr.strip()
+    return len(s) >= 2 and ((s[0] == "'" and s[-1] == "'") or (s[0] == '"' and s[-1] == '"'))
+
+
+def _mentions_loop_var(expr: str, loop_var: str) -> bool:
+    return re.search(rf"\b{re.escape(loop_var)}\b", expr, re.IGNORECASE) is not None
+
+
 def maybe_finding(path: Path, loop: LoopCtx, end_line: int) -> Optional[Finding]:
     """Return finding when loop matches the supported non-advancing WRITE pattern."""
     if len(loop.body) != 1:
@@ -283,8 +350,25 @@ def maybe_finding(path: Path, loop: LoopCtx, end_line: int) -> Optional[Finding]
     parsed = parse_write_nonadv(wstmt)
     if parsed is None:
         return None
-    unit_expr, fmt_expr, out_item = parsed
-    replacement_item = build_replacement(loop.var, loop.lb, loop.ub, out_item)
+    unit_expr, fmt_expr, out_items = parsed
+    replacement_item: Optional[str] = None
+    lb_raw = loop.lb
+    ub_raw = loop.ub
+    if len(out_items) == 1:
+        item_raw = out_items[0]
+        item_raw, lb_raw, ub_raw = _normalize_offset_implied_do(item_raw, loop.var, lb_raw, ub_raw)
+        lb_fmt = _format_implied_do_bound(lb_raw)
+        ub_fmt = _format_implied_do_bound(ub_raw)
+        replacement_item = build_replacement(loop.var, lb_fmt, ub_fmt, item_raw)
+    elif len(out_items) == 2 and _is_string_literal(out_items[0]) and _mentions_loop_var(out_items[1], loop.var):
+        # Common pattern: write(..., advance='no') " ", item(i)
+        item_raw = out_items[1]
+        item_raw, lb_raw, ub_raw = _normalize_offset_implied_do(item_raw, loop.var, lb_raw, ub_raw)
+        lb_fmt = _format_implied_do_bound(lb_raw)
+        ub_fmt = _format_implied_do_bound(ub_raw)
+        replacement_item = f"({out_items[0]}, {item_raw}, {loop.var} = {lb_fmt}, {ub_fmt})"
+    if replacement_item is None:
+        return None
     suggestion = f"write ({unit_expr}, {collapse_fmt_expr(fmt_expr)}) {replacement_item}"
     return Finding(
         path=path,
@@ -367,6 +451,39 @@ def annotate_file(path: Path, findings: List[Finding]) -> Tuple[int, Optional[Pa
         lines.insert(at, msg)
     path.write_text("".join(lines), encoding="utf-8")
     return len(inserts), backup
+
+
+def rewrite_text_collapse_nonadv_write_loops(text: str) -> Tuple[str, int]:
+    """Rewrite collapsible non-advancing WRITE loops in source text.
+
+    Returns (new_text, rewritten_count).
+    """
+    fd, tmp_name = tempfile.mkstemp(suffix=".f90", prefix="xadvance_")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        findings = analyze_file(tmp_path)
+        if not findings:
+            return text, 0
+        lines = tmp_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        applied = 0
+        for f in sorted(findings, key=lambda x: (x.line_start, x.line_end), reverse=True):
+            s = f.line_start - 1
+            e = f.line_end - 1
+            if s < 0 or e >= len(lines) or s > e:
+                continue
+            raw = lines[s]
+            indent = re.match(r"^\s*", raw).group(0) if raw else ""
+            eol = "\r\n" if raw.endswith("\r\n") else ("\n" if raw.endswith("\n") else "\n")
+            lines[s : e + 1] = [f"{indent}{f.suggestion}{eol}"]
+            applied += 1
+        return "".join(lines), applied
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def main() -> int:

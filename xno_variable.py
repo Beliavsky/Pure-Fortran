@@ -106,6 +106,41 @@ def split_top_level_commas(text: str) -> List[str]:
     return out
 
 
+def split_write_control_and_args(stmt: str) -> Optional[Tuple[str, str]]:
+    """Split a WRITE statement into control-part prefix and argument text.
+
+    Returns (prefix_with_trailing_space, args_text) where prefix ends right after
+    the closing ')' of WRITE(...), including original spacing.
+    """
+    m = re.match(r"^\s*write\s*\(", stmt, re.IGNORECASE)
+    if not m:
+        return None
+    i = m.end() - 1  # at '('
+    depth = 0
+    in_single = False
+    in_double = False
+    j = i
+    while j < len(stmt):
+        ch = stmt[j]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    prefix = stmt[: j + 1]
+                    rest = stmt[j + 1 :].strip()
+                    if not rest:
+                        return None
+                    return prefix + " ", rest
+        j += 1
+    return None
+
+
 def parse_declared_scalar_locals(unit: xunset.Unit) -> Dict[str, int]:
     """Return scalar local variable names to declaration line numbers."""
     out: Dict[str, int] = {}
@@ -290,6 +325,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
     assign_lines: Dict[str, Tuple[int, str]] = {}
     read_count: Dict[str, int] = {n: 0 for n in local_scalars}
     use_line_stmt: Dict[str, Tuple[int, str]] = {}
+    use_stmt_lines: Dict[str, Set[int]] = {n: set() for n in local_scalars}
     stmt_by_line: Dict[int, str] = {}
 
     for ln, stmt in unit.body:
@@ -317,6 +353,7 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                     read_count[n] += c
                     if n not in use_line_stmt:
                         use_line_stmt[n] = (ln, s)
+                    use_stmt_lines[n].add(ln)
 
             if lhs_name and lhs_name in local_scalars:
                 if lhs_name in assign_lines:
@@ -333,8 +370,10 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 read_count[n] += c
                 if n not in use_line_stmt:
                     use_line_stmt[n] = (ln, s)
+                use_stmt_lines[n].add(ln)
 
     findings: List[Finding] = []
+    seen_keys: Set[Tuple[str, int, int]] = set()
     for n, decl_ln in sorted(local_scalars.items(), key=lambda kv: kv[1]):
         if n not in assign_lines:
             continue
@@ -392,6 +431,77 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 delete_lines=(),
             )
         )
+        seen_keys.add((n, al, ul))
+
+    # Additional valid case:
+    # temp assigned once, then only used in one WRITE statement as component list
+    # (e.g., mm%mn, mm%mx) => replace full arg list by the expression once.
+    for n, decl_ln in sorted(local_scalars.items(), key=lambda kv: kv[1]):
+        if n not in assign_lines:
+            continue
+        al, expr = assign_lines[n]
+        if al < 0:
+            continue
+        if len(use_stmt_lines.get(n, set())) != 1:
+            continue
+        use = use_line_stmt.get(n)
+        if use is None:
+            continue
+        ul, use_stmt = use
+        if ul <= al:
+            continue
+        parts = split_write_control_and_args(use_stmt)
+        if parts is None:
+            continue
+        prefix, args_text = parts
+        args = split_top_level_commas(args_text)
+        if not args:
+            continue
+        comp_re = re.compile(
+            rf"^\s*{re.escape(n)}\s*%\s*[a-z][a-z0-9_]*(?:\s*%\s*[a-z][a-z0-9_]*)*\s*$",
+            re.IGNORECASE,
+        )
+        if not all(comp_re.match(a) for a in args):
+            continue
+        # Safety: dependencies of expr cannot be written between assignment/use.
+        deps = referenced_names(expr)
+        deps.discard(n)
+        unsafe = False
+        if deps:
+            for ln2, s2 in unit.body:
+                if ln2 <= al or ln2 >= ul:
+                    continue
+                m2 = ASSIGN_RE.match(s2.strip())
+                if not m2:
+                    continue
+                b2 = lhs_base_name(m2.group(1))
+                if b2 is not None and b2 in deps:
+                    unsafe = True
+                    break
+        if unsafe:
+            continue
+        key = (n, al, ul)
+        if key in seen_keys:
+            continue
+        suggested_stmt = f"{prefix}{expr}"
+        findings.append(
+            Finding(
+                path=unit.path,
+                unit_kind=unit.kind,
+                unit_name=unit.name,
+                var=n,
+                decl_line=decl_ln,
+                assign_line=al,
+                use_line=ul,
+                expr=expr,
+                use_stmt=use_stmt,
+                suggested_stmt=suggested_stmt,
+                unit_start=unit.start,
+                unit_end=unit.end,
+                delete_lines=(),
+            )
+        )
+        seen_keys.add(key)
 
     # Conservative array temporary pattern:
     #   allocate(a(...), source=expr)

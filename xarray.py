@@ -2676,6 +2676,51 @@ def maybe_reduction_sum(
     return f"{acc_name_lhs} = sum({expr_sliced})"
 
 
+def reduction_sum_acc_name(body_stmt: str) -> Optional[str]:
+    """Extract accumulator name from `acc = acc + expr` body form."""
+    ml = ASSIGN_RE.match(body_stmt.strip())
+    if not ml:
+        return None
+    acc_lhs = SIMPLE_NAME_RE.match(ml.group(1).strip())
+    if not acc_lhs:
+        return None
+    madd = ADD_ACC_RE.match(ml.group(2).strip())
+    if not madd:
+        return None
+    if madd.group(1).lower() != acc_lhs.group(1).lower():
+        return None
+    return acc_lhs.group(1).lower()
+
+
+def simplify_sum_section_with_size_alias(sugg: str, body: List[Tuple[int, str]], do_idx: int) -> str:
+    """Simplify `sum((a(1:nx)-...))` -> `sum((a-...))` when `nx = size(a)` nearby."""
+    m = re.match(r"^\s*([a-z][a-z0-9_]*)\s*=\s*sum\((.+)\)\s*$", sugg, re.IGNORECASE)
+    if m is None:
+        return sugg
+    expr = m.group(2)
+    aliases: Dict[str, str] = {}
+    for back in range(1, min(12, do_idx + 1)):
+        stmt = body[do_idx - back][1].strip()
+        ma = re.match(
+            r"^\s*([a-z][a-z0-9_]*)\s*=\s*size\s*\(\s*([a-z][a-z0-9_]*)\s*\)\s*$",
+            stmt,
+            re.IGNORECASE,
+        )
+        if ma is not None:
+            aliases[ma.group(1).lower()] = ma.group(2)
+    if not aliases:
+        return sugg
+    for nvar, arr in aliases.items():
+        expr_new = re.sub(
+            rf"\b{re.escape(arr)}\s*\(\s*1\s*:\s*{re.escape(nvar)}\s*\)",
+            arr,
+            expr,
+            flags=re.IGNORECASE,
+        )
+        expr = expr_new
+    return f"{m.group(1)} = sum({expr})"
+
+
 def maybe_reduction_sum_vector_2d(
     loop_var: str,
     rng: str,
@@ -7085,6 +7130,16 @@ def maybe_io_loop_implied_do(
     pw = _parse_write_stmt(s)
     if pw is not None:
         ctrl, tail = pw
+        # Preserve record-by-record semantics for external file writes.
+        # `do ...; write(fp,...) ...; end do` is generally not equivalent to one
+        # implied-DO WRITE record, so only rewrite stdout-style unit `*`.
+        ctrl_parts = split_top_level_commas(ctrl)
+        if not ctrl_parts:
+            return None
+        unit_part = ctrl_parts[0].strip().lower()
+        unit_expr = unit_part.split("=", 1)[1].strip() if unit_part.startswith("unit=") else unit_part
+        if unit_expr != "*":
+            return None
         items = [p.strip() for p in split_top_level_commas(tail) if p.strip()]
         if not items:
             return None
@@ -8477,7 +8532,41 @@ def analyze_unit(unit: xunset.Unit) -> List[Finding]:
                 prev_stmt = body[i - 1][1] if i - 1 >= 0 else None
                 start_line = body[i - 1][0] if i - 1 >= 0 else ln
                 sugg_sum = maybe_reduction_sum(loop_var, rng, stmt_body, prev_stmt, decl_bounds, array_names)
+                # Also handle nearby init when unrelated statements sit between
+                # accumulator initialization and the reduction loop, as long as
+                # the accumulator is not referenced in between.
+                if sugg_sum is None and i - 2 >= 0:
+                    acc_nm = reduction_sum_acc_name(stmt_body)
+                    if acc_nm is not None:
+                        for back in range(2, min(8, i + 1)):
+                            cand_idx = i - back
+                            cand_stmt = body[cand_idx][1]
+                            mp2 = ASSIGN_RE.match(cand_stmt.strip())
+                            ok_prev2 = False
+                            if mp2 is not None:
+                                lhs2 = SIMPLE_NAME_RE.match(mp2.group(1).strip())
+                                rhs2 = mp2.group(2).strip()
+                                ok_prev2 = (
+                                    lhs2 is not None
+                                    and lhs2.group(1).lower() == acc_nm
+                                    and ZERO_LITERAL_RE.match(rhs2) is not None
+                                )
+                            if not ok_prev2:
+                                continue
+                            safe_between = True
+                            for mid in range(cand_idx + 1, i):
+                                if re.search(rf"\b{re.escape(acc_nm)}\b", body[mid][1], re.IGNORECASE):
+                                    safe_between = False
+                                    break
+                            if not safe_between:
+                                continue
+                            sugg_sum2 = maybe_reduction_sum(loop_var, rng, stmt_body, cand_stmt, decl_bounds, array_names)
+                            if sugg_sum2 is not None:
+                                sugg_sum = sugg_sum2
+                                start_line = ln
+                                break
                 if sugg_sum is not None:
+                    sugg_sum = simplify_sum_section_with_size_alias(sugg_sum, body, i)
                     findings.append(
                         Finding(
                             path=unit.path,
@@ -10038,7 +10127,11 @@ def _trim_redundant_parens_in_assignments(lines: List[str]) -> List[str]:
         rhs = m.group(2).strip()
         rhs2 = re.sub(
             r"\b([a-z][a-z0-9_]*)\s*\(\s*\((.+)\)\s*\)",
-            lambda mm: f"{mm.group(1)}({mm.group(2)})",
+            lambda mm: (
+                mm.group(0)
+                if "," in mm.group(2)
+                else f"{mm.group(1)}({mm.group(2)})"
+            ),
             rhs,
             flags=re.IGNORECASE,
         )
