@@ -105,6 +105,10 @@ class Name(Expr):
     id: str
 
 @dataclass
+class BoolLit(Expr):
+    val: bool
+
+@dataclass
 class Call(Expr):
     fn: str
     args: List[Expr]
@@ -186,6 +190,11 @@ class Parser:
         if t.kind == "string":
             return Str(t.val)
         if t.kind == "name":
+            low = t.val.lower()
+            if low == "true":
+                return BoolLit(True)
+            if low == "false":
+                return BoolLit(False)
             if self.cur().kind == "op" and self.cur().val == "(":
                 self.eat("op", "(")
                 args = self.parse_arglist(")")
@@ -309,6 +318,14 @@ class ForStmt(Stmt):
     rng: Range
     body: List[Stmt]
 
+@dataclass
+class BreakStmt(Stmt):
+    pass
+
+@dataclass
+class ContinueStmt(Stmt):
+    pass
+
 # -------------------------
 # preprocessing
 # -------------------------
@@ -418,6 +435,16 @@ def parse_stmt_list(stmts: List[str], k0: int = 0, stop: Optional[set] = None) -
 
         if low == "end":
             return out, k + 1
+
+        if low == "break":
+            out.append(BreakStmt())
+            k += 1
+            continue
+
+        if low == "continue":
+            out.append(ContinueStmt())
+            k += 1
+            continue
 
         if low.startswith("for "):
             m = re.match(r"for\s+([A-Za-z_]\w*)\s*=\s*(.*)$", s, flags=re.IGNORECASE)
@@ -584,6 +611,8 @@ class Infer:
             return Sym("real", 0, alloc=False)
         if isinstance(e, Str):
             return Sym("char", 0, alloc=False)
+        if isinstance(e, BoolLit):
+            return Sym("logical", 0, alloc=False)
         if isinstance(e, Name):
             return self.syms.get(e.id, Sym("real", 0, alloc=False))
         if isinstance(e, Unary):
@@ -712,6 +741,34 @@ class Emitter:
                 return f"real({ex.id}, kind=dp)"
         return sx
 
+    def emit_real_dp_expr(self, e: Expr) -> str:
+        sx, _ = self.emit_expr(e)
+        return self._coerce_real_dp(e, sx)
+
+    def emit_int_expr(self, e: Expr) -> str:
+        # Ensure an INTEGER expression for Fortran DO bounds/steps.
+        if isinstance(e, Num):
+            txt = e.text.strip()
+            if self._is_int_literal(txt):
+                return txt
+            sx, _ = self.emit_expr(e)
+            return f"int({sx})"
+        if isinstance(e, Unary) and e.op in ("+", "-") and isinstance(e.x, Num) and self._is_int_literal(e.x.text):
+            sign = "-" if e.op == "-" else ""
+            return f"{sign}{e.x.text}"
+        if isinstance(e, Call):
+            fn = e.fn.lower()
+            if fn == "floor" and len(e.args) == 1:
+                inner = self.emit_real_dp_expr(e.args[0])
+                return f"int(floor({inner}))"
+            if fn == "sqrt" and len(e.args) == 1:
+                inner = self.emit_real_dp_expr(e.args[0])
+                return f"int(sqrt({inner}))"
+        sx, t = self.emit_expr(e)
+        if t.ftype == "integer":
+            return sx
+        return f"int({sx})"
+
     def emit_expr(self, e: Expr) -> Tuple[str, Sym]:
         inf = self.infer
         t = inf.expr_type(e)
@@ -720,6 +777,8 @@ class Emitter:
             return self.num_to_fortran(e.text), t
         if isinstance(e, Str):
             return e.text, t
+        if isinstance(e, BoolLit):
+            return (".true." if e.val else ".false."), Sym("logical", 0, alloc=False)
         if isinstance(e, Name):
             return e.id, t
         if isinstance(e, Unary):
@@ -795,6 +854,15 @@ class Emitter:
                     r = f"(1 + mod(({kexpr}) - 1, {nrow}))"
                     c = f"(1 + (({kexpr}) - 1) / {nrow})"
                     return f"{fn}({r}, {c})", Sym(sym.ftype, 0, alloc=False)
+
+                lfn = fn.lower()
+                if lfn in ("sqrt", "floor") and len(e.args) == 1:
+                    sx0, _ = self.emit_expr(e.args[0])
+                    sx0 = self._coerce_real_dp(e.args[0], sx0)
+                    if lfn == "sqrt":
+                        return f"sqrt({sx0})", Sym("real", 0, alloc=False)
+                    else:
+                        return f"floor({sx0})", Sym("real", 0, alloc=False)
 
                 subs = []
                 for ex in e.args:
@@ -890,11 +958,25 @@ class Emitter:
                 self.emit(f"call disp({x})")
                 return
             if fn == "printf":
+                # Minimal support:
+                # - printf("literal")
+                # - printf("%d\n", x)  (integer)
+                # - printf("%f\n", x)  (real)
                 if len(c.args) == 1 and isinstance(c.args[0], Str):
                     s2 = c.args[0].text.replace("\\n", "")
                     self.emit(f'write(*,"(a)") {s2}')
                     return
-                raise SyntaxError('printf supported only as printf("literal")')
+                if len(c.args) == 2 and isinstance(c.args[0], Str):
+                    fmt = c.args[0].text
+                    x1, t1 = self.emit_expr(c.args[1])
+                    if "%d" in fmt:
+                        self.emit(f'write(*,"(i0)") {x1}')
+                        return
+                    if "%f" in fmt or "%g" in fmt:
+                        xr = self.emit_real_dp_expr(c.args[1])
+                        self.emit(f'write(*,"(g0)") {xr}')
+                        return
+                raise SyntaxError('printf supported only as printf("literal") or printf("%d", x)')
             raise SyntaxError(f"unsupported call statement: {c.fn}(...)")
 
         if isinstance(st, ForStmt):
@@ -904,12 +986,12 @@ class Emitter:
             if st.rng.step is not None:
                 inf.mark_integer_expr(st.rng.step)
 
-            a, _ = self.emit_expr(st.rng.a)
-            b, _ = self.emit_expr(st.rng.b)
+            a = self.emit_int_expr(st.rng.a)
+            b = self.emit_int_expr(st.rng.b)
             if st.rng.step is None:
                 self.emit(f"do {st.var} = {a}, {b}")
             else:
-                stp, _ = self.emit_expr(st.rng.step)
+                stp = self.emit_int_expr(st.rng.step)
                 self.emit(f"do {st.var} = {a}, {b}, {stp}")
             self.ind += 1
             for s in st.body:
@@ -939,6 +1021,14 @@ class Emitter:
                     self.emit_stmt(s)
                 self.ind -= 1
             self.emit("end if")
+            return
+
+        if isinstance(st, BreakStmt):
+            self.emit("exit")
+            return
+
+        if isinstance(st, ContinueStmt):
+            self.emit("cycle")
             return
 
         raise SyntaxError("unknown statement type")
