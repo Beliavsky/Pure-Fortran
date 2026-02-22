@@ -252,6 +252,9 @@ class py2f(ast.NodeVisitor):
         self.alloc_logs = set()
         self.alloc_ints = set()
 
+        self.param_ints = {}
+        self._tree = None
+
     # ---------- expr ----------
     def expr(self, node):
         if isinstance(node, ast.Name):
@@ -357,6 +360,44 @@ class py2f(ast.NodeVisitor):
         return start, stop, step
 
     def prescan(self, tree):
+        # keep a handle for heuristic parameter comments
+        self._tree = tree
+
+        # top-level constant integer assignments: name = <int>
+        top_const = {}
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                t = stmt.targets[0]
+                if isinstance(t, ast.Name) and is_const_int(stmt.value):
+                    top_const[t.id] = stmt.value.value
+
+        # count how many times each name is assigned anywhere (conservative)
+        store_counts = {}
+
+        def bump(name):
+            store_counts[name] = store_counts.get(name, 0) + 1
+
+        for sub in ast.walk(tree):
+            if isinstance(sub, ast.Assign):
+                for tgt in sub.targets:
+                    if isinstance(tgt, ast.Name):
+                        bump(tgt.id)
+            elif isinstance(sub, ast.AugAssign):
+                if isinstance(sub.target, ast.Name):
+                    bump(sub.target.id)
+            elif isinstance(sub, ast.AnnAssign):
+                if isinstance(sub.target, ast.Name):
+                    bump(sub.target.id)
+            elif isinstance(sub, ast.For):
+                if isinstance(sub.target, ast.Name):
+                    bump(sub.target.id)
+
+        # promote to parameters if:
+        #   - assigned at top-level to an integer constant
+        #   - assigned exactly once in the whole program
+        self.param_ints = {name: val for name, val in top_const.items() if store_counts.get(name, 0) == 1}
+
+        # existing lightweight type/alloc inference (tailored to primes example)
         for node in tree.body:
             if isinstance(node, ast.Assign):
                 if len(node.targets) != 1:
@@ -387,6 +428,20 @@ class py2f(ast.NodeVisitor):
                             if isinstance(c.func.value, ast.Name):
                                 self.alloc_ints.add(c.func.value.id)
 
+    def param_comment(self, name):
+        # heuristic, ASCII-only comments for generated parameters
+        nm = name.lower()
+        if nm == "n":
+            # if program appears to be about primes, make the comment specific
+            if "prime" in self.program_name.lower():
+                return "upper bound for primes"
+            if self._tree is not None:
+                for sub in ast.walk(self._tree):
+                    if isinstance(sub, ast.Name) and sub.id in ("primes", "is_prime"):
+                        return "upper bound for primes"
+            return "upper bound"
+        return "constant from python source"
+
     # ---------- statements ----------
     def visit_Module(self, node):
         self.prescan(node)
@@ -400,8 +455,15 @@ class py2f(ast.NodeVisitor):
 
         self.o.w("implicit none")
 
-        ints = sorted(self.ints | {"npr"})
-        self.o.w("integer :: " + ", ".join(ints))
+        if self.param_ints:
+            for pname in sorted(self.param_ints):
+                pval = self.param_ints[pname]
+                cmt = self.param_comment(pname)
+                self.o.w(f"integer, parameter :: {pname} = {pval} ! {cmt}")
+
+        ints = sorted((self.ints | {"npr"}) - set(self.param_ints))
+        if ints:
+            self.o.w("integer :: " + ", ".join(ints))
 
         if self.alloc_logs:
             for name in sorted(self.alloc_logs):
@@ -425,6 +487,8 @@ class py2f(ast.NodeVisitor):
         v = node.value
 
         if isinstance(t, ast.Name) and is_const_int(v):
+            if t.id in self.param_ints:
+                return
             self.o.w(f"{t.id} = {v.value}")
             return
 
