@@ -1,8 +1,226 @@
-# minimal python -> fortran transpiler for a small subset (enough for primes_up_to_n.py)
+# p2f.py
+# partial python -> fortran transpiler for a small subset (enough for primes_up_to_n.py)
+#
+# behavior:
+# - reads runtime module file python.f90 (default ./python.f90)
+# - discovers which helper procedures are exported (public :: name)
+# - if the translated python needs a helper that is missing, extends python.f90 by:
+#     (a) adding a parseable public line:  public :: name  !@pyapi ...
+#     (b) adding the procedure implementation before end module
+# - writes the translated main program to <input_stem>.f90
+#
+# usage:
+#   python p2f.py input.py
+#   python p2f.py input.py path\to\python.f90
+#
+# then compile:
+#   gfortran -std=f2018 python.f90 input.f90
 
 import ast
 import sys
 from pathlib import Path
+import re
+
+
+# -------------------------
+# fortran runtime management
+# -------------------------
+
+def discover_runtime_exports(runtime_text):
+    # returns:
+    #   module_name: str (best guess)
+    #   exports: set[str] from "public :: name"
+    #   has_proc: set[str] from actual procedure definitions
+    module_name = None
+    exports = set()
+    has_proc = set()
+
+    for line in runtime_text.splitlines():
+        m = re.match(r"^\s*module\s+([a-zA-Z_]\w*)\b", line, flags=re.IGNORECASE)
+        if m and module_name is None:
+            module_name = m.group(1)
+
+        m = re.match(r"^\s*public\s*::\s*([a-zA-Z_]\w*)\b", line, flags=re.IGNORECASE)
+        if m:
+            exports.add(m.group(1).lower())
+
+        # function/subroutine definitions (lightweight)
+        m = re.match(
+            r"^\s*(?:[a-zA-Z_]\w*\s+)*?(function|subroutine)\s+([a-zA-Z_]\w*)\s*\(",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            has_proc.add(m.group(2).lower())
+
+    if module_name is None:
+        module_name = "python_mod"
+
+    return module_name, exports, has_proc
+
+
+def _find_insertion_points(lines):
+    idx_contains = None
+    idx_end_module = None
+    for i, line in enumerate(lines):
+        if idx_contains is None and re.match(r"^\s*contains\b", line, flags=re.IGNORECASE):
+            idx_contains = i
+        if re.match(r"^\s*end\s+module\b", line, flags=re.IGNORECASE):
+            idx_end_module = i
+    if idx_contains is None:
+        raise RuntimeError("could not find CONTAINS in runtime module")
+    if idx_end_module is None:
+        raise RuntimeError("could not find END MODULE in runtime module")
+    return idx_contains, idx_end_module
+
+
+def _insert_public(lines, idx_contains, public_lines):
+    # insert just before CONTAINS, after any existing public lines in that region
+    insert_at = idx_contains
+    for i in range(idx_contains - 1, -1, -1):
+        if re.match(r"^\s*public\s*::", lines[i], flags=re.IGNORECASE):
+            insert_at = i + 1
+            break
+
+    to_add = list(public_lines)
+    if to_add:
+        if insert_at > 0 and lines[insert_at - 1].strip() != "":
+            to_add.insert(0, "")
+        if insert_at < len(lines) and lines[insert_at].strip() != "":
+            to_add.append("")
+    return lines[:insert_at] + to_add + lines[insert_at:]
+
+
+def _insert_procs(lines, idx_end_module, proc_blocks):
+    # insert before END MODULE
+    to_add = []
+    for blk in proc_blocks:
+        if to_add and to_add[-1].strip() != "":
+            to_add.append("")
+        to_add.extend(blk.splitlines())
+        if to_add and to_add[-1].strip() != "":
+            to_add.append("")
+
+    if to_add:
+        if idx_end_module > 0 and lines[idx_end_module - 1].strip() != "":
+            to_add.insert(0, "")
+    return lines[:idx_end_module] + to_add + lines[idx_end_module:]
+
+
+def runtime_helper_templates():
+    # dict keyed by lowercase helper name -> (public_line, proc_block)
+
+    isqrt_pub = (
+        "public :: isqrt_int       !@pyapi kind=function ret=integer "
+        "args=x:integer:intent(in) desc=\"integer square root: return floor(sqrt(x)) for x >= 0\""
+    )
+
+    isqrt_blk = '''      integer function isqrt_int(x)
+         ! integer square root: return floor(sqrt(x)) for x >= 0
+         implicit none
+         integer, intent(in) :: x  ! input integer (x >= 0 expected)
+         integer :: r
+         if (x <= 0) then
+            isqrt_int = 0
+            return
+         end if
+         r = int(sqrt(real(x)))
+         do while ((r+1)*(r+1) <= x)
+            r = r + 1
+         end do
+         do while (r*r > x)
+            r = r - 1
+         end do
+         isqrt_int = r
+      end function isqrt_int'''
+
+    pil_pub = (
+        "public :: print_int_list  !@pyapi kind=subroutine "
+        "args=a:integer(:):intent(in),n:integer:intent(in) "
+        "desc=\"print integer list a(1:n) in python-style [..] format\""
+    )
+
+    pil_blk = '''      subroutine print_int_list(a, n)
+         ! print integer list a(1:n) in python-style [..] format
+         implicit none
+         integer, intent(in) :: a(:)  ! array containing values to print
+         integer, intent(in) :: n     ! number of elements from a to print
+         integer :: j
+         if (n <= 0) then
+            write(*,'(a)') '[]'
+            return
+         end if
+         write(*,'(a)', advance='no') '['
+         do j = 1, n
+            if (j > 1) write(*,'(a)', advance='no') ', '
+            write(*,'(i0)', advance='no') a(j)
+         end do
+         write(*,'(a)') ']'
+      end subroutine print_int_list'''
+
+    return {
+        "isqrt_int": (isqrt_pub, isqrt_blk),
+        "print_int_list": (pil_pub, pil_blk),
+    }
+
+
+def ensure_runtime_helpers(runtime_path, needed_helpers):
+    helper_templates = runtime_helper_templates()
+
+    runtime_text = runtime_path.read_text(encoding="utf-8")
+    module_name, exports, has_proc = discover_runtime_exports(runtime_text)
+
+    missing = []
+    for h in needed_helpers:
+        hl = h.lower()
+        if hl not in helper_templates:
+            raise RuntimeError(f"no template for helper '{h}'")
+        # require export and definition
+        if hl not in exports or hl not in has_proc:
+            missing.append(hl)
+
+    if not missing:
+        return module_name, False
+
+    lines = runtime_text.splitlines()
+    idx_contains, idx_end_module = _find_insertion_points(lines)
+
+    public_lines = []
+    proc_blocks = []
+
+    for hl in missing:
+        pub, blk = helper_templates[hl]
+        if hl not in exports:
+            public_lines.append(pub)
+        if hl not in has_proc:
+            proc_blocks.append(blk)
+
+    lines2 = _insert_public(lines, idx_contains, public_lines)
+    _, idx_end_module2 = _find_insertion_points(lines2)
+    lines3 = _insert_procs(lines2, idx_end_module2, proc_blocks)
+
+    bak = runtime_path.with_suffix(runtime_path.suffix + ".bak")
+    if not bak.exists():
+        bak.write_text(runtime_text, encoding="utf-8")
+
+    runtime_path.write_text("\n".join(lines3) + "\n", encoding="utf-8")
+    return module_name, True
+
+
+# -------------------------
+# transpiler
+# -------------------------
+
+def is_const_int(node):
+    return isinstance(node, ast.Constant) and isinstance(node.value, int)
+
+
+def is_const_str(node):
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def is_bool_const(node):
+    return isinstance(node, ast.Constant) and isinstance(node.value, bool)
 
 
 class emit:
@@ -23,26 +241,16 @@ class emit:
         return "\n".join(self.lines) + "\n"
 
 
-def is_const_int(node):
-    return isinstance(node, ast.Constant) and isinstance(node.value, int)
-
-
-def is_const_str(node):
-    return isinstance(node, ast.Constant) and isinstance(node.value, str)
-
-
-def is_bool_const(node):
-    return isinstance(node, ast.Constant) and isinstance(node.value, bool)
-
-
 class py2f(ast.NodeVisitor):
-    def __init__(self, program_name="xprog"):
+    def __init__(self, program_name, module_name, needed_helpers):
         self.o = emit()
         self.program_name = program_name
+        self.module_name = module_name
+        self.needed_helpers = set(needed_helpers)
+
         self.ints = set()
         self.alloc_logs = set()
         self.alloc_ints = set()
-        self.needs_primes_helpers = False
 
     # ---------- expr ----------
     def expr(self, node):
@@ -116,25 +324,14 @@ class py2f(ast.NodeVisitor):
             return f"{name}({idx})"
 
         if isinstance(node, ast.Call):
-            # isqrt(n) -> isqrt_int(n)
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
-                if len(node.args) != 1:
-                    raise NotImplementedError("isqrt with 1 arg only")
                 return f"isqrt_int({self.expr(node.args[0])})"
+            raise NotImplementedError("unsupported call")
 
-            if isinstance(node.func, ast.Name) and node.func.id == "range":
-                raise NotImplementedError("range only supported in for loops")
-
-            raise NotImplementedError(f"unsupported call: {ast.dump(node.func)}")
-
-        if isinstance(node, ast.JoinedStr):
-            raise NotImplementedError("f-string only supported inside print(...)")
-
-        raise NotImplementedError(f"unsupported expr: {type(node).__name__}")
+        raise NotImplementedError("unsupported expr")
 
     # ---------- helpers ----------
     def simplify_stop_minus_1(self, stop_node):
-        # (x + 1) - 1 -> x
         if isinstance(stop_node, ast.BinOp) and isinstance(stop_node.op, ast.Add):
             if is_const_int(stop_node.right) and stop_node.right.value == 1:
                 return self.expr(stop_node.left)
@@ -160,7 +357,6 @@ class py2f(ast.NodeVisitor):
         return start, stop, step
 
     def prescan(self, tree):
-        # minimal inference tailored to primes example
         for node in tree.body:
             if isinstance(node, ast.Assign):
                 if len(node.targets) != 1:
@@ -171,12 +367,9 @@ class py2f(ast.NodeVisitor):
                 if isinstance(t, ast.Name) and is_const_int(v):
                     self.ints.add(t.id)
 
-                # primes = []
                 if isinstance(t, ast.Name) and isinstance(v, ast.List) and len(v.elts) == 0:
                     self.alloc_ints.add(t.id)
-                    self.needs_primes_helpers = True
 
-                # is_prime = [True] * (n + 1)
                 if isinstance(t, ast.Name) and isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult):
                     if isinstance(v.left, ast.List) and len(v.left.elts) == 1 and is_bool_const(v.left.elts[0]):
                         self.alloc_logs.add(t.id)
@@ -185,17 +378,14 @@ class py2f(ast.NodeVisitor):
                 for sub in ast.walk(node):
                     if isinstance(sub, ast.For) and isinstance(sub.target, ast.Name):
                         self.ints.add(sub.target.id)
-
                     if isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name):
                         if sub.value.id == "is_prime":
                             self.alloc_logs.add("is_prime")
-
                     if isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Call):
                         c = sub.value
                         if isinstance(c.func, ast.Attribute) and c.func.attr == "append":
                             if isinstance(c.func.value, ast.Name):
                                 self.alloc_ints.add(c.func.value.id)
-                                self.needs_primes_helpers = True
 
     # ---------- statements ----------
     def visit_Module(self, node):
@@ -203,6 +393,11 @@ class py2f(ast.NodeVisitor):
 
         self.o.w(f"program {self.program_name}")
         self.o.push()
+
+        if self.needed_helpers:
+            only = ", ".join(sorted(self.needed_helpers))
+            self.o.w(f"use {self.module_name}, only: {only}")
+
         self.o.w("implicit none")
 
         ints = sorted(self.ints | {"npr"})
@@ -216,31 +411,16 @@ class py2f(ast.NodeVisitor):
                 self.o.w(f"integer, allocatable :: {name}(:)")
 
         self.o.w("")
-
         for stmt in node.body:
             self.visit(stmt)
 
-        self.o.w("")
-        self.o.w("contains")
-        self.o.push()
-
-        self.emit_isqrt_int()
-
-        if self.needs_primes_helpers:
-            self.emit_print_int_list()
-
-        self.o.pop()
         self.o.pop()
         self.o.w(f"end program {self.program_name}")
 
     def visit_ImportFrom(self, node):
-        # ignore "from math import isqrt"
         return
 
     def visit_Assign(self, node):
-        if len(node.targets) != 1:
-            raise NotImplementedError("multiple assignment not supported")
-
         t = node.targets[0]
         v = node.value
 
@@ -248,14 +428,12 @@ class py2f(ast.NodeVisitor):
             self.o.w(f"{t.id} = {v.value}")
             return
 
-        # primes = []
         if isinstance(t, ast.Name) and isinstance(v, ast.List) and len(v.elts) == 0:
             name = t.id
             self.o.w(f"if (.not. allocated({name})) allocate({name}(1:n))")
             self.o.w("npr = 0")
             return
 
-        # is_prime = [True] * (n + 1)
         if isinstance(t, ast.Name) and isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult):
             if isinstance(v.left, ast.List) and len(v.left.elts) == 1 and is_bool_const(v.left.elts[0]):
                 name = t.id
@@ -264,17 +442,13 @@ class py2f(ast.NodeVisitor):
                 self.o.w(f"{name} = .true.")
                 return
 
-        # subscript assignment
         if isinstance(t, ast.Subscript):
-            lhs = self.expr(t)
-            rhs = self.expr(v)
-            self.o.w(f"{lhs} = {rhs}")
+            self.o.w(f"{self.expr(t)} = {self.expr(v)}")
             return
 
-        raise NotImplementedError(f"unsupported assign: {ast.dump(node)}")
+        raise NotImplementedError("unsupported assign")
 
     def visit_If(self, node):
-        # fortran requires parentheses after if
         self.o.w(f"if ({self.expr(node.test)}) then")
         self.o.push()
         for s in node.body:
@@ -289,12 +463,6 @@ class py2f(ast.NodeVisitor):
         self.o.w("end if")
 
     def visit_For(self, node):
-        if not isinstance(node.target, ast.Name):
-            raise NotImplementedError("for target must be a name")
-
-        if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range"):
-            raise NotImplementedError("only for .. in range(..) supported")
-
         var = node.target.id
         start, stop, step = self.range_parts(node.iter)
 
@@ -306,7 +474,6 @@ class py2f(ast.NodeVisitor):
             self.o.w(f"do {var} = {f_start}, {f_upper}")
         else:
             self.o.w(f"do {var} = {f_start}, {f_upper}, {f_step}")
-
         self.o.push()
         for s in node.body:
             self.visit(s)
@@ -314,35 +481,23 @@ class py2f(ast.NodeVisitor):
         self.o.w("end do")
 
     def visit_Expr(self, node):
-        if not isinstance(node.value, ast.Call):
-            raise NotImplementedError("only call expressions supported")
         c = node.value
-
-        # print(...)
         if isinstance(c.func, ast.Name) and c.func.id == "print":
             self.emit_print_call(c)
             return
 
-        # primes.append(i)
         if isinstance(c.func, ast.Attribute) and c.func.attr == "append":
-            if not isinstance(c.func.value, ast.Name):
-                raise NotImplementedError("append target must be a name")
             arr = c.func.value.id
-            if len(c.args) != 1:
-                raise NotImplementedError("append with 1 arg only")
             val = self.expr(c.args[0])
             self.o.w("npr = npr + 1")
             self.o.w(f"{arr}(npr) = {val}")
             return
 
-        raise NotImplementedError("unsupported expression call")
+        raise NotImplementedError("unsupported expr")
 
     def emit_print_call(self, call):
-        if len(call.args) != 1:
-            raise NotImplementedError("print with exactly 1 arg supported here")
         a = call.args[0]
 
-        # print(f"...{n}...")
         if isinstance(a, ast.JoinedStr):
             fmt_parts = []
             items = []
@@ -350,105 +505,68 @@ class py2f(ast.NodeVisitor):
                 if is_const_str(part):
                     fmt_parts.append("a")
                     items.append("'" + part.value.replace("'", "''") + "'")
-                elif isinstance(part, ast.FormattedValue):
+                else:
                     fmt_parts.append("i0")
                     items.append(self.expr(part.value))
-                else:
-                    raise NotImplementedError("unsupported f-string part")
-            fmt = "('" + "(" + ",".join(fmt_parts) + ")" + "')"
-            # write(*,'(a,i0,a)') 'primes up to ', n, ':'
+            fmt = "'" + "(" + ",".join(fmt_parts) + ")" + "'"
             self.o.w(f"write(*,{fmt}) " + ", ".join(items))
             return
 
-        # print([])
         if isinstance(a, ast.List) and len(a.elts) == 0:
             self.o.w("write(*,'(a)') '[]'")
             return
 
-        # print(primes)
         if isinstance(a, ast.Name) and a.id == "primes":
             self.o.w("call print_int_list(primes, npr)")
             return
 
         self.o.w(f"print *, {self.expr(a)}")
 
-    def generic_visit(self, node):
-        raise NotImplementedError(f"unsupported syntax: {type(node).__name__}")
 
-    # ---------- helpers emitted into fortran ----------
-    def emit_isqrt_int(self):
-        self.o.w("integer function isqrt_int(x)")
-        self.o.push()
-        self.o.w("implicit none")
-        self.o.w("integer, intent(in) :: x")
-        self.o.w("integer :: r")
-        self.o.w("if (x <= 0) then")
-        self.o.push()
-        self.o.w("isqrt_int = 0")
-        self.o.w("return")
-        self.o.pop()
-        self.o.w("end if")
-        self.o.w("r = int(sqrt(real(x)))")
-        self.o.w("do while ((r+1)*(r+1) <= x)")
-        self.o.push()
-        self.o.w("r = r + 1")
-        self.o.pop()
-        self.o.w("end do")
-        self.o.w("do while (r*r > x)")
-        self.o.push()
-        self.o.w("r = r - 1")
-        self.o.pop()
-        self.o.w("end do")
-        self.o.w("isqrt_int = r")
-        self.o.pop()
-        self.o.w("end function isqrt_int")
-        self.o.w("")
+def detect_needed_helpers(tree):
+    needed = set()
 
-    def emit_print_int_list(self):
-        self.o.w("subroutine print_int_list(a, n)")
-        self.o.push()
-        self.o.w("implicit none")
-        self.o.w("integer, intent(in) :: a(:)")
-        self.o.w("integer, intent(in) :: n")
-        self.o.w("integer :: j")
-        self.o.w("if (n <= 0) then")
-        self.o.push()
-        self.o.w("write(*,'(a)') '[]'")
-        self.o.w("return")
-        self.o.pop()
-        self.o.w("end if")
-        self.o.w("write(*,'(a)', advance='no') '['")
-        self.o.w("do j = 1, n")
-        self.o.push()
-        self.o.w("if (j > 1) write(*,'(a)', advance='no') ', '")
-        self.o.w("write(*,'(i0)', advance='no') a(j)")
-        self.o.pop()
-        self.o.w("end do")
-        self.o.w("write(*,'(a)') ']'")
-        self.o.pop()
-        self.o.w("end subroutine print_int_list")
-        self.o.w("")
+    class scan(ast.NodeVisitor):
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
+                needed.add("isqrt_int")
+            if isinstance(node.func, ast.Name) and node.func.id == "print":
+                if len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "primes":
+                    needed.add("print_int_list")
+            self.generic_visit(node)
+
+    scan().visit(tree)
+    return needed
 
 
-def transpile_file(py_path):
+def transpile_file(py_path, runtime_path):
     src = Path(py_path).read_text(encoding="utf-8")
     tree = ast.parse(src)
 
+    needed = detect_needed_helpers(tree)
+    module_name, updated = ensure_runtime_helpers(Path(runtime_path), needed)
+
     prog = Path(py_path).stem
-    t = py2f(program_name=prog)
+    t = py2f(program_name=prog, module_name=module_name, needed_helpers=needed)
     t.visit(tree)
 
     out_path = Path(py_path).with_suffix(".f90")
     out_path.write_text(t.o.text(), encoding="utf-8")
-    return out_path
+    return out_path, updated
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("usage: python p2f.py input.py")
+    if len(sys.argv) not in (2, 3):
+        print("usage: python p2f.py input.py [python.f90]")
         return 2
-    out = transpile_file(sys.argv[1])
+
+    py_path = sys.argv[1]
+    runtime_path = sys.argv[2] if len(sys.argv) == 3 else "python.f90"
+
+    out, updated = transpile_file(py_path, runtime_path)
     print(f"wrote {out}")
+    if updated:
+        print(f"updated {runtime_path} (backup: {runtime_path}.bak)")
     return 0
 
 
