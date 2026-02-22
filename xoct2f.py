@@ -357,8 +357,9 @@ class Stmt: ...
 
 @dataclass
 class Assign(Stmt):
-    lhs: Any  # Name | Index | list[str]
+    lhs: Any  # Name | Index
     rhs: Expr
+    suppress: bool = True
 
 @dataclass
 class CallStmt(Stmt):
@@ -456,9 +457,14 @@ def split_statements(text: str) -> List[str]:
             depth_brack = max(0, depth_brack - 1)
             buf.append(ch)
             continue
-        if ch in ("\n", ";") and depth_paren == 0 and depth_brack == 0:
-            flush()
-            continue
+        if depth_paren == 0 and depth_brack == 0:
+            if ch == ";":
+                buf.append(ch)
+                flush()
+                continue
+            if ch == "\n":
+                flush()
+                continue
         buf.append(ch)
 
     flush()
@@ -483,6 +489,10 @@ def parse_stmt_list(stmts: List[str], k0: int = 0, stop: Optional[set] = None) -
     k = k0
     while k < len(stmts):
         s = stmts[k].strip()
+        suppress = False
+        if s.endswith(";"):
+            suppress = True
+            s = s[:-1].rstrip()
         if not s:
             k += 1
             continue
@@ -560,7 +570,7 @@ def parse_stmt_list(stmts: List[str], k0: int = 0, stop: Optional[set] = None) -
                 raise SyntaxError(f"bad multiple assignment: {s}")
             lhs_list = [x.strip() for x in m.group(1).split(",")]
             rhs = parse_expr(m.group(2))
-            out.append(Assign(lhs_list, rhs))
+            out.append(Assign(lhs_list, rhs, suppress=suppress))
             k += 1
             continue
 
@@ -576,7 +586,7 @@ def parse_stmt_list(stmts: List[str], k0: int = 0, stop: Optional[set] = None) -
             else:
                 raise SyntaxError("lhs must be a variable or indexed variable in this subset")
             rhs = parse_expr(rhs_txt)
-            out.append(Assign(lhs, rhs))
+            out.append(Assign(lhs, rhs, suppress=suppress))
             k += 1
             continue
 
@@ -1106,6 +1116,9 @@ class Emitter:
                     raise SyntaxError("string assignment not supported")
                 inf.ensure(lhs, tr.ftype, tr.rank, alloc=(tr.rank > 0))
                 self.emit(f"{lhs} = {rhs}")
+                if not st.suppress:
+                    self.emit(f'call disp("{lhs} =")')
+                    self.emit(f"call disp({lhs})")
                 return
 
             if isinstance(st.lhs, Index):
