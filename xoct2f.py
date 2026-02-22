@@ -603,6 +603,8 @@ class Infer:
         self.used_la = False
         self.used_mldivide = False
         self.used_mrdivide = False
+        self.used_mpower = False
+        self.used_spower = False
         # Octave/Matlab predefined constants we support.
         # Note: we treat these names as constants (not user variables) in this subset.
         self.const_types = {
@@ -791,6 +793,22 @@ class Infer:
                 # Octave right-division: A / B is matrix division when both are matrices.
                 if ta.rank == 2 and tb.rank == 2:
                     self.used_mrdivide = True
+                    self.used_la = True
+                    return Sym("real", 2, alloc=True)
+
+            if e.op == "^":
+                # Octave matrix power when left operand is a matrix and exponent is scalar
+                if ta.rank == 2 and tb.rank == 0:
+                    self.used_mpower = True
+                    self.used_la = True
+                    # exponent should be integer-valued
+                    self.mark_integer_expr(e.b)
+                    return Sym("real", 2, alloc=True)
+
+            if e.op == "^":
+                # Octave scalar power with matrix exponent: s ^ A = expm(log(s) * A)
+                if ta.rank == 0 and tb.rank == 2:
+                    self.used_spower = True
                     self.used_la = True
                     return Sym("real", 2, alloc=True)
 
@@ -1037,7 +1055,17 @@ class Emitter:
             if op in (".*", "./"):
                 op3 = "*" if op == ".*" else "/"
                 return f"({a} {op3} {b})", t
-            if op in (".^", "^"):
+            if op == ".^":
+                return f"({a} ** {b})", t
+            if op == "^":
+                # Octave: matrix power when A is a matrix and exponent is scalar
+                if ta.rank == 2 and tb.rank == 0:
+                    b_int = b if tb.ftype == "integer" else f"int({b})"
+                    return f"mpower({a}, {b_int})", t
+                # Octave: scalar power with matrix exponent: s ^ A
+                if ta.rank == 0 and tb.rank == 2:
+                    a_real = f"real({a}, kind=dp)"
+                    return f"spower({a_real}, {b})", t
                 return f"({a} ** {b})", t
 
             if op in ("+", "-"):
@@ -1174,7 +1202,7 @@ def gen_runtime_module(infer: Infer) -> str:
     lines = []
     lines.append("module oct_runtime_mod")
     lines.append("use funcs_mod, only: dp")
-    if infer.used_mldivide or infer.used_mrdivide:
+    if infer.used_mldivide or infer.used_mrdivide or infer.used_mpower:
         lines.append("use linear_algebra_mod, only: inv, pinv")
     lines.append("implicit none")
     lines.append("")
@@ -1200,6 +1228,16 @@ def gen_runtime_module(infer: Infer) -> str:
         lines.append("")
         lines.append("interface mrdivide")
         lines.append("   module procedure mrdivide_mat_mat")
+        lines.append("end interface")
+    if infer.used_mpower:
+        lines.append("")
+        lines.append("interface mpower")
+        lines.append("   module procedure mpower_mat_int")
+        lines.append("end interface")
+    if infer.used_spower:
+        lines.append("")
+        lines.append("interface spower")
+        lines.append("   module procedure spower_scalar_mat")
         lines.append("end interface")
     lines.append("")
     lines.append("contains")
@@ -1332,6 +1370,66 @@ def gen_runtime_module(infer: Infer) -> str:
         lines.append("end if")
         lines.append("end function mrdivide_mat_mat")
 
+    if infer.used_mpower:
+        lines.append("")
+        lines.append("function mpower_mat_int(a, n) result(b)")
+        lines.append("real(kind=dp), intent(in) :: a(:,:)")
+        lines.append("integer, intent(in) :: n")
+        lines.append("real(kind=dp), allocatable :: b(:,:)")
+        lines.append("real(kind=dp), allocatable :: base(:,:)")
+        lines.append("integer :: k, m")
+        lines.append("m = size(a,1)")
+        lines.append("if (size(a,2) /= m) error stop \"mpower: matrix must be square\"")
+        lines.append("if (n == 0) then")
+        lines.append("   allocate(b(m,m))")
+        lines.append("   b = 0.0_dp")
+        lines.append("   do k = 1, m")
+        lines.append("      b(k,k) = 1.0_dp")
+        lines.append("   end do")
+        lines.append("   return")
+        lines.append("end if")
+        lines.append("if (n > 0) then")
+        lines.append("   base = a")
+        lines.append("else")
+        lines.append("   base = inv(a)")
+        lines.append("end if")
+        lines.append("allocate(b(m,m))")
+        lines.append("b = base")
+        lines.append("do k = 2, abs(n)")
+        lines.append("   b = matmul(b, base)")
+        lines.append("end do")
+        lines.append("end function mpower_mat_int")
+
+    if infer.used_spower:
+        lines.append("")
+        lines.append("function spower_scalar_mat(s, a) result(b)")
+        lines.append("real(kind=dp), intent(in) :: s")
+        lines.append("real(kind=dp), intent(in) :: a(:,:)")
+        lines.append("real(kind=dp), allocatable :: b(:,:)")
+        lines.append("real(kind=dp), allocatable :: term(:,:), x(:,:), i2(:,:)")
+        lines.append("real(kind=dp) :: tol, scale")
+        lines.append("integer :: k, m, km")
+        lines.append("m = size(a,1)")
+        lines.append("if (size(a,2) /= m) error stop \"spower: matrix must be square\"")
+        lines.append("if (s <= 0.0_dp) error stop \"spower: base must be > 0 for real result\"")
+        lines.append("x = log(s) * a")
+        lines.append("allocate(i2(m,m))")
+        lines.append("i2 = 0.0_dp")
+        lines.append("do k = 1, m")
+        lines.append("   i2(k,k) = 1.0_dp")
+        lines.append("end do")
+        lines.append("allocate(b(m,m))")
+        lines.append("b = i2")
+        lines.append("term = i2")
+        lines.append("tol = 1.0e-12_dp")
+        lines.append("km = 200")
+        lines.append("do k = 1, km")
+        lines.append("   term = matmul(term, x) / real(k, kind=dp)")
+        lines.append("   b = b + term")
+        lines.append("   if (maxval(abs(term)) < tol) exit")
+        lines.append("end do")
+        lines.append("end function spower_scalar_mat")
+
     lines.append("")
     lines.append("end module oct_runtime_mod")
     return "\n".join(lines)
@@ -1339,7 +1437,7 @@ def gen_runtime_module(infer: Infer) -> str:
 def render_fortran(program_name: str, infer: Infer, body_lines: List[str]) -> str:
     uses = []
     uses.append("use funcs_mod")
-    uses.append("use oct_runtime_mod, only: disp, colon_dp, rand" + (", mldivide" if infer.used_mldivide else "") + (", mrdivide" if infer.used_mrdivide else ""))
+    uses.append("use oct_runtime_mod, only: disp, colon_dp, rand" + (", mldivide" if infer.used_mldivide else "") + (", mrdivide" if infer.used_mrdivide else "") + (", mpower" if infer.used_mpower else "") + (", spower" if infer.used_spower else ""))
     if infer.used_la:
         uses.append('use linear_algebra_mod, only: inv, pinv, det, rank, trace, norm, eig, svd, qr, lu, chol')
 
