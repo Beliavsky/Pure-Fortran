@@ -586,6 +586,7 @@ class Infer:
             "qr": ("la", []),
             "lu": ("la", []),
             "chol": ("la", []),
+            "rand": ("rt", "all"),
         }
 
     def ensure(self, name: str, ftype: str, rank: int, alloc: bool):
@@ -680,6 +681,21 @@ class Infer:
                 if len(e.args) <= 2:
                     return Sym("real", 1, alloc=True)
                 return Sym("real", 2, alloc=True)
+            if fn == "rand":
+                # rand() -> scalar, rand(n) -> n-by-n, rand(m,n) -> m-by-n, rand(m,n,p) -> m-by-n-by-p
+                if len(e.args) == 0:
+                    return Sym("real", 0, alloc=False)
+                if len(e.args) == 1:
+                    self.mark_integer_expr(e.args[0])
+                    return Sym("real", 2, alloc=True)
+                if len(e.args) == 2:
+                    self.mark_integer_expr(e.args[0]); self.mark_integer_expr(e.args[1])
+                    return Sym("real", 2, alloc=True)
+                if len(e.args) == 3:
+                    self.mark_integer_expr(e.args[0]); self.mark_integer_expr(e.args[1]); self.mark_integer_expr(e.args[2])
+                    return Sym("real", 3, alloc=True)
+                error_stop = True
+                return Sym("real", 0, alloc=False)
             if fn == "diag" and len(e.args) == 1:
                 a0 = self.expr_type(e.args[0])
                 return Sym("real", 2 if a0.rank == 1 else 1, alloc=True)
@@ -914,6 +930,12 @@ class Emitter:
                 a0, _ = self.emit_expr(e.args[0])
                 return f"{f}({a0}, {a0})", Sym("real", 2, alloc=True)
 
+            # Octave/Matlab: rand(n) produces n-by-n.
+            # Provide rand(m,n) and rand(m,n,p) via oct_runtime_mod.
+            if fn == "rand" and len(e.args) == 1:
+                a0, _ = self.emit_expr(e.args[0])
+                return f"rand({a0}, {a0})", Sym("real", 2, alloc=True)
+
             args = []
             for k, ex in enumerate(e.args):
                 sx, _ = self.emit_expr(ex)
@@ -1074,12 +1096,16 @@ use funcs_mod, only: dp
 implicit none
 
 interface disp
-   module procedure disp_real0, disp_real1, disp_real2
+   module procedure disp_real0, disp_real1, disp_real2, disp_real3
    module procedure disp_int0
 end interface
 
 interface colon_dp
    module procedure colon_dp2, colon_dp3
+end interface
+
+interface rand
+   module procedure rand_2d, rand_3d
 end interface
 
 contains
@@ -1114,6 +1140,21 @@ do i = 1, size(a,1)
    write(*,"(*(f0.6,1x))") a(i,:)
 end do
 end subroutine disp_real2
+
+subroutine disp_real3(a)
+real(kind=dp), intent(in) :: a(:,:,:)
+integer :: i, k
+if (size(a,1) == 0 .or. size(a,2) == 0 .or. size(a,3) == 0) then
+   write(*,"(a)") "(empty)"
+   return
+end if
+do k = 1, size(a,3)
+   write(*,"(a,i0,a)") "(:,:,", k, "):"
+   do i = 1, size(a,1)
+      write(*,"(*(f0.6,1x))") a(i,:,k)
+   end do
+end do
+end subroutine disp_real3
 
 function colon_dp2(a, b) result(x)
 real(kind=dp), intent(in) :: a, b
@@ -1151,13 +1192,30 @@ do i = 1, size(x)
 end do
 end function colon_dp3
 
+function rand_2d(m, n) result(a)
+integer, intent(in) :: m, n
+real(kind=dp), allocatable :: a(:,:)
+if (m < 0 .or. n < 0) error stop "rand: dims must be >= 0"
+allocate(a(m, n))
+call random_number(a)
+end function rand_2d
+
+function rand_3d(m, n, p) result(a)
+integer, intent(in) :: m, n, p
+real(kind=dp), allocatable :: a(:,:,:)
+if (m < 0 .or. n < 0 .or. p < 0) error stop "rand: dims must be >= 0"
+allocate(a(m, n, p))
+call random_number(a)
+end function rand_3d
+
+
 end module oct_runtime_mod
 '''
 
 def render_fortran(program_name: str, infer: Infer, body_lines: List[str]) -> str:
     uses = []
     uses.append("use funcs_mod")
-    uses.append("use oct_runtime_mod, only: disp, colon_dp")
+    uses.append("use oct_runtime_mod, only: disp, colon_dp, rand")
     if infer.used_la:
         uses.append('use linear_algebra_mod, only: inv, pinv, det, rank, trace, norm, eig, svd, qr, lu, chol')
 
@@ -1173,22 +1231,28 @@ def render_fortran(program_name: str, infer: Infer, body_lines: List[str]) -> st
                 decl.append(f"complex(kind=dp) :: {name}")
             elif s.rank == 1:
                 decl.append(f"complex(kind=dp), allocatable :: {name}(:)")
-            else:
+            elif s.rank == 2:
                 decl.append(f"complex(kind=dp), allocatable :: {name}(:,:)")
+            else:
+                decl.append(f"complex(kind=dp), allocatable :: {name}(:,:,:)")
         elif s.ftype == "logical":
             if s.rank == 0:
                 decl.append(f"logical :: {name}")
             elif s.rank == 1:
                 decl.append(f"logical, allocatable :: {name}(:)")
-            else:
+            elif s.rank == 2:
                 decl.append(f"logical, allocatable :: {name}(:,:)")
+            else:
+                decl.append(f"logical, allocatable :: {name}(:,:,:)")
         else:
             if s.rank == 0:
                 decl.append(f"real(kind=dp) :: {name}")
             elif s.rank == 1:
                 decl.append(f"real(kind=dp), allocatable :: {name}(:)")
-            else:
+            elif s.rank == 2:
                 decl.append(f"real(kind=dp), allocatable :: {name}(:,:)")
+            else:
+                decl.append(f"real(kind=dp), allocatable :: {name}(:,:,:)")
 
     parts = []
     parts.append(gen_runtime_module())
