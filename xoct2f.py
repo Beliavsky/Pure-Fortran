@@ -546,6 +546,19 @@ class Infer:
     def __init__(self):
         self.syms: Dict[str, Sym] = {}
         self.used_la = False
+        # Octave/Matlab predefined constants we support.
+        # Note: we treat these names as constants (not user variables) in this subset.
+        self.const_types = {
+            "pi": Sym("real", 0, alloc=False),
+            "e": Sym("real", 0, alloc=False),
+            "eps": Sym("real", 0, alloc=False),
+            "realmax": Sym("real", 0, alloc=False),
+            "realmin": Sym("real", 0, alloc=False),
+            "intmax": Sym("integer", 0, alloc=False),
+            "intmin": Sym("integer", 0, alloc=False),
+            "inf": Sym("real", 0, alloc=False),
+            "nan": Sym("real", 0, alloc=False),
+        }
 
         self.builtin = {
             "linspace": ("funcs", [2]),
@@ -614,6 +627,9 @@ class Infer:
         if isinstance(e, BoolLit):
             return Sym("logical", 0, alloc=False)
         if isinstance(e, Name):
+            k = e.id.lower()
+            if k in self.const_types:
+                return self.const_types[k]
             return self.syms.get(e.id, Sym("real", 0, alloc=False))
         if isinstance(e, Unary):
             t = self.expr_type(e.x)
@@ -780,6 +796,25 @@ class Emitter:
         if isinstance(e, BoolLit):
             return (".true." if e.val else ".false."), Sym("logical", 0, alloc=False)
         if isinstance(e, Name):
+            k = e.id.lower()
+            if k == "pi":
+                return "acos(-1.0_dp)", Sym("real", 0, alloc=False)
+            if k == "e":
+                return "exp(1.0_dp)", Sym("real", 0, alloc=False)
+            if k == "eps":
+                return "epsilon(1.0_dp)", Sym("real", 0, alloc=False)
+            if k == "realmax":
+                return "huge(1.0_dp)", Sym("real", 0, alloc=False)
+            if k == "realmin":
+                return "tiny(1.0_dp)", Sym("real", 0, alloc=False)
+            if k == "intmax":
+                return "huge(0)", Sym("integer", 0, alloc=False)
+            if k == "intmin":
+                return "(-huge(0) - 1)", Sym("integer", 0, alloc=False)
+            if k == "inf":
+                return "huge(1.0_dp)", Sym("real", 0, alloc=False)
+            if k == "nan":
+                return "(0.0_dp/0.0_dp)", Sym("real", 0, alloc=False)
             return e.id, t
         if isinstance(e, Unary):
             x, tx = self.emit_expr(e.x)
