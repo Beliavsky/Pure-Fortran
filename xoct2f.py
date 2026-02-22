@@ -62,7 +62,7 @@ _token_re = re.compile(
     (?P<ws>\s+)|
     (?P<number>(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+\-]?\d+)?)|
     (?P<string>\"(?:\\.|[^\"\\])*\")|
-    (?P<op>\.\^|\.\*|\.\/|>=|<=|==|~=|&&|\|\||[+\-*/^<>=(),;\[\]:'\\]|~)|
+    (?P<op>\.\^|\.\*|\.\/|\.\'|>=|<=|==|~=|&&|\|\||[+\-*/^<>=(),;\[\]:'\\]|~)|
     (?P<name>[A-Za-z_]\w*)
     """,
     re.VERBOSE,
@@ -225,8 +225,11 @@ class Parser:
         self.i += 1
         left = self.nud(t)
 
-        while self.cur().kind == "op" and self.cur().val == "'":
-            self.eat("op", "'")
+        while self.cur().kind == "op" and self.cur().val in ("'", ".'"):
+            if self.cur().val == "'":
+                self.eat("op", "'")
+            else:
+                self.eat("op", ".'")
             left = PostTranspose(left)
 
         while rbp < self.lbp(self.cur()):
@@ -234,7 +237,7 @@ class Parser:
             self.i += 1
             left = self.led(t, left)
 
-            while self.cur().kind == "op" and self.cur().val == "'":
+            while self.cur().kind == "op" and self.cur().val in ("'", ".'"):
                 self.eat("op", "'")
                 left = PostTranspose(left)
 
