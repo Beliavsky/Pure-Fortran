@@ -62,7 +62,7 @@ _token_re = re.compile(
     (?P<ws>\s+)|
     (?P<number>(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+\-]?\d+)?)|
     (?P<string>\"(?:\\.|[^\"\\])*\")|
-    (?P<op>\.\^|\.\*|\.\/|>=|<=|==|~=|&&|\|\||[+\-*/^<>=(),;\[\]:']|~)|
+    (?P<op>\.\^|\.\*|\.\/|>=|<=|==|~=|&&|\|\||[+\-*/^<>=(),;\[\]:'\\]|~)|
     (?P<name>[A-Za-z_]\w*)
     """,
     re.VERBOSE,
@@ -72,6 +72,28 @@ def tokenize(s: str) -> List[Tok]:
     out: List[Tok] = []
     i = 0
     while i < len(s):
+        # fast whitespace skip
+        if s[i].isspace():
+            i += 1
+            continue
+
+        # manual string scan so backslashes inside strings never conflict with operators
+        if s[i] == '"':
+            j = i + 1
+            while j < len(s):
+                if s[j] == '\\':
+                    j += 2
+                    continue
+                if s[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            if j > len(s) or s[j-1] != '"':
+                raise SyntaxError(f"unterminated string starting at {i}")
+            out.append(Tok("string", s[i:j], i))
+            i = j
+            continue
+
         m = _token_re.match(s, i)
         if not m:
             raise SyntaxError(f"unexpected character at {i}: {s[i:i+20]!r}")
@@ -85,8 +107,42 @@ def tokenize(s: str) -> List[Tok]:
     out.append(Tok("eof", "", len(s)))
     return out
 
+
+def find_assignment_eq(s: str) -> Optional[int]:
+    """Return index of assignment '=' not inside strings, excluding '==', '<=', '>=', '~='."""
+    in_str = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                i += 1
+                continue
+            if ch == '=':
+                prev = s[i-1] if i > 0 else ''
+                nxt = s[i+1] if i+1 < len(s) else ''
+                if prev in "<>~=:":
+                    i += 1
+                    continue
+                if nxt == '=':
+                    i += 1
+                    continue
+                return i
+            i += 1
+    return None
+
 # -------------------------
 # AST nodes
+
 # -------------------------
 
 @dataclass
@@ -263,7 +319,7 @@ class Parser:
             return 40
         if op in ("+", "-"):
             return 50
-        if op in ("*", "/", ".*", "./"):
+        if op in ("*", "/", "\\", ".*", "./"):
             return 60
         if op in ("^", ".^"):
             return 80
@@ -279,7 +335,7 @@ class Parser:
                 return Range(left, right2, step=right)
             return Range(left, right, step=None)
 
-        if op in ("+", "-", "*", "/", ".*", "./", "^", ".^",
+        if op in ("+", "-", "*", "/", "\\", ".*", "./", "^", ".^",
                   "==", "~=", "<", "<=", ">", ">=", "&&", "||"):
             rbp = self.lbp(Tok("op", op, 0))
             if op in ("^", ".^"):
@@ -505,22 +561,21 @@ def parse_stmt_list(stmts: List[str], k0: int = 0, stop: Optional[set] = None) -
             k += 1
             continue
 
-        if "=" in s and not re.match(r"^\s*==", s):
-            parts = re.split(r"(?<![<>=~])=(?!=)", s, maxsplit=1)
-            if len(parts) == 2:
-                lhs_txt = parts[0].strip()
-                rhs_txt = parts[1].strip()
-                lhs_expr = parse_expr(lhs_txt)
-                if isinstance(lhs_expr, Name):
-                    lhs = lhs_expr
-                elif isinstance(lhs_expr, Call):
-                    lhs = Index(lhs_expr.fn, lhs_expr.args)
-                else:
-                    raise SyntaxError("lhs must be a variable or indexed variable in this subset")
-                rhs = parse_expr(rhs_txt)
-                out.append(Assign(lhs, rhs))
-                k += 1
-                continue
+        eq = find_assignment_eq(s)
+        if eq is not None:
+            lhs_txt = s[:eq].strip()
+            rhs_txt = s[eq+1:].strip()
+            lhs_expr = parse_expr(lhs_txt)
+            if isinstance(lhs_expr, Name):
+                lhs = lhs_expr
+            elif isinstance(lhs_expr, Call):
+                lhs = Index(lhs_expr.fn, lhs_expr.args)
+            else:
+                raise SyntaxError("lhs must be a variable or indexed variable in this subset")
+            rhs = parse_expr(rhs_txt)
+            out.append(Assign(lhs, rhs))
+            k += 1
+            continue
 
         e = parse_expr(s)
         if isinstance(e, Call):
@@ -546,6 +601,8 @@ class Infer:
     def __init__(self):
         self.syms: Dict[str, Sym] = {}
         self.used_la = False
+        self.used_mldivide = False
+        self.used_mrdivide = False
         # Octave/Matlab predefined constants we support.
         # Note: we treat these names as constants (not user variables) in this subset.
         self.const_types = {
@@ -719,6 +776,24 @@ class Infer:
         if isinstance(e, Bin):
             ta = self.expr_type(e.a)
             tb = self.expr_type(e.b)
+
+            if e.op == "\\":
+                # Octave left-division: A \ b  (solve linear system / least squares)
+                self.used_mldivide = True
+                self.used_la = True
+                if ta.rank == 2 and tb.rank == 1:
+                    return Sym("real", 1, alloc=True)
+                if ta.rank == 2 and tb.rank == 2:
+                    return Sym("real", 2, alloc=True)
+                return Sym("real", max(ta.rank, tb.rank), alloc=max(ta.rank, tb.rank) > 0)
+
+            if e.op == "/":
+                # Octave right-division: A / B is matrix division when both are matrices.
+                if ta.rank == 2 and tb.rank == 2:
+                    self.used_mrdivide = True
+                    self.used_la = True
+                    return Sym("real", 2, alloc=True)
+
             if e.op in ("==", "~=", "<", "<=", ">", ">="):
                 return Sym("logical", max(ta.rank, tb.rank), alloc=max(ta.rank, tb.rank) > 0)
             if e.op in ("&&", "||"):
@@ -967,8 +1042,13 @@ class Emitter:
 
             if op in ("+", "-"):
                 return f"({a} {op} {b})", t
+
+            if op == "\\":
+                return f"mldivide({a}, {b})", t
             if op in ("*", "/"):
                 if op == "/":
+                    if ta.rank == 2 and tb.rank == 2:
+                        return f"mrdivide({a}, {b})", t
                     return f"({a} / {b})", t
                 ra = ta.rank
                 rb = tb.rank
@@ -1090,132 +1170,176 @@ class Emitter:
 
         raise SyntaxError("unknown statement type")
 
-def gen_runtime_module() -> str:
-    return '''module oct_runtime_mod
-use funcs_mod, only: dp
-implicit none
+def gen_runtime_module(infer: Infer) -> str:
+    lines = []
+    lines.append("module oct_runtime_mod")
+    lines.append("use funcs_mod, only: dp")
+    if infer.used_mldivide or infer.used_mrdivide:
+        lines.append("use linear_algebra_mod, only: inv, pinv")
+    lines.append("implicit none")
+    lines.append("")
+    lines.append("interface disp")
+    lines.append("   module procedure disp_real0, disp_real1, disp_real2, disp_real3")
+    lines.append("   module procedure disp_int0")
+    lines.append("   module procedure disp_char0")
+    lines.append("end interface")
+    lines.append("")
+    lines.append("interface colon_dp")
+    lines.append("   module procedure colon_dp2, colon_dp3")
+    lines.append("end interface")
+    lines.append("")
+    lines.append("interface rand")
+    lines.append("   module procedure rand_2d, rand_3d")
+    lines.append("end interface")
+    if infer.used_mldivide:
+        lines.append("")
+        lines.append("interface mldivide")
+        lines.append("   module procedure mldivide_mat_vec, mldivide_mat_mat")
+        lines.append("end interface")
+    if infer.used_mrdivide:
+        lines.append("")
+        lines.append("interface mrdivide")
+        lines.append("   module procedure mrdivide_mat_mat")
+        lines.append("end interface")
+    lines.append("")
+    lines.append("contains")
+    lines.append("")
+    lines.append("subroutine disp_real0(x)")
+    lines.append("real(kind=dp), intent(in) :: x")
+    lines.append('write(*,"(f0.6)") x')
+    lines.append("end subroutine disp_real0")
+    lines.append("")
+    lines.append("subroutine disp_int0(i)")
+    lines.append("integer, intent(in) :: i")
+    lines.append('write(*,"(i0)") i')
+    lines.append("end subroutine disp_int0")
+    lines.append("")
+    lines.append("subroutine disp_char0(s)")
+    lines.append("character(len=*), intent(in) :: s")
+    lines.append('write(*,"(a)") s')
+    lines.append("end subroutine disp_char0")
+    lines.append("")
+    lines.append("subroutine disp_real1(x)")
+    lines.append("real(kind=dp), intent(in) :: x(:)")
+    lines.append("if (size(x) == 0) then")
+    lines.append('   write(*,"(a)") "(empty)"')
+    lines.append("else")
+    lines.append('   write(*,"(*(f0.6,1x))") x')
+    lines.append("end if")
+    lines.append("end subroutine disp_real1")
+    lines.append("")
+    lines.append("subroutine disp_real2(a)")
+    lines.append("real(kind=dp), intent(in) :: a(:,:)")
+    lines.append("integer :: i")
+    lines.append("if (size(a,1) == 0 .or. size(a,2) == 0) then")
+    lines.append('   write(*,"(a)") "(empty)"')
+    lines.append("   return")
+    lines.append("end if")
+    lines.append("do i = 1, size(a,1)")
+    lines.append('   write(*,"(*(f0.6,1x))") a(i,:)')
+    lines.append("end do")
+    lines.append("end subroutine disp_real2")
+    lines.append("")
+    lines.append("subroutine disp_real3(a)")
+    lines.append("real(kind=dp), intent(in) :: a(:,:,:)")
+    lines.append("integer :: i, k")
+    lines.append("if (size(a,1) == 0 .or. size(a,2) == 0 .or. size(a,3) == 0) then")
+    lines.append('   write(*,"(a)") "(empty)"')
+    lines.append("   return")
+    lines.append("end if")
+    lines.append("do k = 1, size(a,3)")
+    lines.append('   write(*,"(a,i0,a)") "(:,:,", k, "):"')
+    lines.append("   do i = 1, size(a,1)")
+    lines.append('      write(*,"(*(f0.6,1x))") a(i,:,k)')
+    lines.append("   end do")
+    lines.append("end do")
+    lines.append("end subroutine disp_real3")
+    lines.append("")
+    lines.append("function colon_dp2(a, b) result(x)")
+    lines.append("real(kind=dp), intent(in) :: a, b")
+    lines.append("real(kind=dp), allocatable :: x(:)")
+    lines.append("integer :: n, i")
+    lines.append("if (b < a) then")
+    lines.append("   n = 0")
+    lines.append("else")
+    lines.append("   n = int(floor(b - a)) + 1")
+    lines.append("end if")
+    lines.append("allocate(x(n))")
+    lines.append("if (n > 0) x = [(a + real(i-1,kind=dp), i=1,n)]")
+    lines.append("end function colon_dp2")
+    lines.append("")
+    lines.append("function colon_dp3(a, step, b) result(x)")
+    lines.append("real(kind=dp), intent(in) :: a, step, b")
+    lines.append("real(kind=dp), allocatable :: x(:)")
+    lines.append("integer :: n, i")
+    lines.append("if (step == 0.0_dp) then")
+    lines.append('   error stop "colon_dp: step must be nonzero"')
+    lines.append("end if")
+    lines.append("if ((step > 0.0_dp .and. b < a) .or. (step < 0.0_dp .and. b > a)) then")
+    lines.append("   n = 0")
+    lines.append("else")
+    lines.append("   n = int(floor((b - a)/step)) + 1")
+    lines.append("end if")
+    lines.append("allocate(x(n))")
+    lines.append("if (n > 0) x = [(a + real(i-1,kind=dp)*step, i=1,n)]")
+    lines.append("end function colon_dp3")
+    lines.append("")
+    lines.append("function rand_2d(m, n) result(a)")
+    lines.append("integer, intent(in) :: m, n")
+    lines.append("real(kind=dp), allocatable :: a(:,:)")
+    lines.append('if (m < 0 .or. n < 0) error stop "rand: dims must be >= 0"')
+    lines.append("allocate(a(m, n))")
+    lines.append("call random_number(a)")
+    lines.append("end function rand_2d")
+    lines.append("")
+    lines.append("function rand_3d(m, n, p) result(a)")
+    lines.append("integer, intent(in) :: m, n, p")
+    lines.append("real(kind=dp), allocatable :: a(:,:,:)")
+    lines.append('if (m < 0 .or. n < 0 .or. p < 0) error stop "rand: dims must be >= 0"')
+    lines.append("allocate(a(m, n, p))")
+    lines.append("call random_number(a)")
+    lines.append("end function rand_3d")
+    if infer.used_mldivide:
+        lines.append("")
+        lines.append("function mldivide_mat_vec(a, b) result(x)")
+        lines.append("real(kind=dp), intent(in) :: a(:,:), b(:)")
+        lines.append("real(kind=dp), allocatable :: x(:)")
+        lines.append("if (size(a,1) == size(a,2)) then")
+        lines.append("   x = matmul(inv(a), b)")
+        lines.append("else")
+        lines.append("   x = matmul(pinv(a), b)")
+        lines.append("end if")
+        lines.append("end function mldivide_mat_vec")
+        lines.append("")
+        lines.append("function mldivide_mat_mat(a, b) result(x)")
+        lines.append("real(kind=dp), intent(in) :: a(:,:), b(:,:)")
+        lines.append("real(kind=dp), allocatable :: x(:,:)")
+        lines.append("if (size(a,1) == size(a,2)) then")
+        lines.append("   x = matmul(inv(a), b)")
+        lines.append("else")
+        lines.append("   x = matmul(pinv(a), b)")
+        lines.append("end if")
+        lines.append("end function mldivide_mat_mat")
+    if infer.used_mrdivide:
+        lines.append("")
+        lines.append("function mrdivide_mat_mat(a, b) result(x)")
+        lines.append("real(kind=dp), intent(in) :: a(:,:), b(:,:)")
+        lines.append("real(kind=dp), allocatable :: x(:,:)")
+        lines.append("if (size(b,1) == size(b,2)) then")
+        lines.append("   x = matmul(a, inv(b))")
+        lines.append("else")
+        lines.append("   x = matmul(a, pinv(b))")
+        lines.append("end if")
+        lines.append("end function mrdivide_mat_mat")
 
-interface disp
-   module procedure disp_real0, disp_real1, disp_real2, disp_real3
-   module procedure disp_int0
-end interface
-
-interface colon_dp
-   module procedure colon_dp2, colon_dp3
-end interface
-
-interface rand
-   module procedure rand_2d, rand_3d
-end interface
-
-contains
-
-subroutine disp_real0(x)
-real(kind=dp), intent(in) :: x
-write(*,"(f0.6)") x
-end subroutine disp_real0
-
-subroutine disp_int0(i)
-integer, intent(in) :: i
-write(*,"(i0)") i
-end subroutine disp_int0
-
-subroutine disp_real1(x)
-real(kind=dp), intent(in) :: x(:)
-if (size(x) == 0) then
-   write(*,"(a)") "(empty)"
-else
-   write(*,"(*(f0.6,1x))") x
-end if
-end subroutine disp_real1
-
-subroutine disp_real2(a)
-real(kind=dp), intent(in) :: a(:,:)
-integer :: i
-if (size(a,1) == 0 .or. size(a,2) == 0) then
-   write(*,"(a)") "(empty)"
-   return
-end if
-do i = 1, size(a,1)
-   write(*,"(*(f0.6,1x))") a(i,:)
-end do
-end subroutine disp_real2
-
-subroutine disp_real3(a)
-real(kind=dp), intent(in) :: a(:,:,:)
-integer :: i, k
-if (size(a,1) == 0 .or. size(a,2) == 0 .or. size(a,3) == 0) then
-   write(*,"(a)") "(empty)"
-   return
-end if
-do k = 1, size(a,3)
-   write(*,"(a,i0,a)") "(:,:,", k, "):"
-   do i = 1, size(a,1)
-      write(*,"(*(f0.6,1x))") a(i,:,k)
-   end do
-end do
-end subroutine disp_real3
-
-function colon_dp2(a, b) result(x)
-real(kind=dp), intent(in) :: a, b
-real(kind=dp), allocatable :: x(:)
-integer :: n, i
-real(kind=dp) :: step
-
-if (b >= a) then
-   n = int(b - a) + 1
-   step = 1.0_dp
-else
-   n = int(a - b) + 1
-   step = -1.0_dp
-end if
-allocate(x(n))
-do i = 1, n
-   x(i) = a + real(i-1,kind=dp)*step
-end do
-end function colon_dp2
-
-function colon_dp3(a, s, b) result(x)
-real(kind=dp), intent(in) :: a, s, b
-real(kind=dp), allocatable :: x(:)
-integer :: n, i
-real(kind=dp) :: step
-
-step = s
-if (step == 0.0_dp) error stop "colon_dp: step cannot be 0"
-
-n = int((b - a)/step) + 1
-if (n < 0) n = 0
-allocate(x(max(0,n)))
-do i = 1, size(x)
-   x(i) = a + real(i-1,kind=dp)*step
-end do
-end function colon_dp3
-
-function rand_2d(m, n) result(a)
-integer, intent(in) :: m, n
-real(kind=dp), allocatable :: a(:,:)
-if (m < 0 .or. n < 0) error stop "rand: dims must be >= 0"
-allocate(a(m, n))
-call random_number(a)
-end function rand_2d
-
-function rand_3d(m, n, p) result(a)
-integer, intent(in) :: m, n, p
-real(kind=dp), allocatable :: a(:,:,:)
-if (m < 0 .or. n < 0 .or. p < 0) error stop "rand: dims must be >= 0"
-allocate(a(m, n, p))
-call random_number(a)
-end function rand_3d
-
-
-end module oct_runtime_mod
-'''
+    lines.append("")
+    lines.append("end module oct_runtime_mod")
+    return "\n".join(lines)
 
 def render_fortran(program_name: str, infer: Infer, body_lines: List[str]) -> str:
     uses = []
     uses.append("use funcs_mod")
-    uses.append("use oct_runtime_mod, only: disp, colon_dp, rand")
+    uses.append("use oct_runtime_mod, only: disp, colon_dp, rand" + (", mldivide" if infer.used_mldivide else "") + (", mrdivide" if infer.used_mrdivide else ""))
     if infer.used_la:
         uses.append('use linear_algebra_mod, only: inv, pinv, det, rank, trace, norm, eig, svd, qr, lu, chol')
 
@@ -1255,7 +1379,7 @@ def render_fortran(program_name: str, infer: Infer, body_lines: List[str]) -> st
                 decl.append(f"real(kind=dp), allocatable :: {name}(:,:,:)")
 
     parts = []
-    parts.append(gen_runtime_module())
+    parts.append(gen_runtime_module(infer))
     parts.append("")
     parts.append(f"program {program_name}")
     for u in uses:
