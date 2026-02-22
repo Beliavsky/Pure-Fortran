@@ -1118,7 +1118,11 @@ class Emitter:
                 self.emit(f"{lhs} = {rhs}")
                 if not st.suppress:
                     self.emit(f'call disp("{lhs} =")')
+                    if tr.rank > 0:
+                        self.emit('call disp("")')
                     self.emit(f"call disp({lhs})")
+                    if tr.rank > 0:
+                        self.emit('call disp("")')
                 return
 
             if isinstance(st.lhs, Index):
