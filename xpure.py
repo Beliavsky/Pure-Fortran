@@ -611,6 +611,7 @@ def analyze_lines(
     external_name_status: Optional[Dict[str, bool]] = None,
     generic_interfaces: Optional[Dict[str, Set[str]]] = None,
     strict_unknown_calls: bool = False,
+    conservative_call_block: bool = True,
 ) -> AnalysisResult:
     """Analyze procedures and classify likely pure candidates or rejections."""
     procs = parse_procedures(lines)
@@ -751,9 +752,10 @@ def analyze_lines(
 
             for m in CALL_RE.finditer(low):
                 callee = m.group(1).lower()
-                reasons.append(
-                    f"line {ln}: CALL to procedure '{callee}' (conservative pure check)"
-                )
+                if conservative_call_block:
+                    reasons.append(
+                        f"line {ln}: CALL to procedure '{callee}' (conservative pure check)"
+                    )
                 generic_targets = generics.get(callee, set())
                 if callee in has_nonpure_name:
                     reasons.append(f"line {ln}: calls non-pure procedure '{callee}'")
