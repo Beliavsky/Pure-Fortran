@@ -27,6 +27,8 @@ import tokenize
 from datetime import datetime
 from fortran_scan import (
     coalesce_simple_declarations,
+    ensure_space_before_inline_comments,
+    prune_unused_use_only_lines,
     remove_empty_if_blocks,
     simplify_redundant_parens_in_lines,
     simplify_integer_arithmetic_in_lines,
@@ -192,8 +194,9 @@ def const_comment(name, tree):
 
 
 def extract_python_comments(src_text):
-    """Map source line -> list of Python comment texts (without '#')."""
+    """Map source line -> comment entries with inline/standalone classification."""
     out = {}
+    src_lines = src_text.splitlines()
     try:
         toks = tokenize.generate_tokens(io.StringIO(src_text).readline)
     except Exception:
@@ -202,7 +205,11 @@ def extract_python_comments(src_text):
         if tok_type == tokenize.COMMENT:
             ln = start[0]
             txt = tok_str[1:].strip()
-            out.setdefault(ln, []).append(txt)
+            col = start[1]
+            line_txt = src_lines[ln - 1] if 1 <= ln <= len(src_lines) else ""
+            prefix = line_txt[:col]
+            is_inline = bool(prefix.strip())
+            out.setdefault(ln, []).append({"text": txt, "inline": is_inline})
     return out
 
 
@@ -1432,9 +1439,29 @@ class translator(ast.NodeVisitor):
             return
         for i in range(self._last_comment_line + 1, ln + 1):
             for c in self.comment_map.get(i, []):
-                self.o.w(f"! {c}")
+                txt = c.get("text", "") if isinstance(c, dict) else str(c)
+                is_inline = bool(c.get("inline", False)) if isinstance(c, dict) else False
+                if not is_inline:
+                    self.o.w(f"! {txt}")
         if ln > self._last_comment_line:
             self._last_comment_line = ln
+
+    def _take_inline_comment(self, node):
+        ln = getattr(node, "lineno", None)
+        if ln is None:
+            return ""
+        items = self.comment_map.get(ln, [])
+        for it in items:
+            if isinstance(it, dict) and it.get("inline", False) and not it.get("_used", False):
+                it["_used"] = True
+                return str(it.get("text", "")).strip()
+        return ""
+
+    @staticmethod
+    def _with_inline_comment(stmt, inline_comment):
+        if inline_comment:
+            return f"{stmt} ! {inline_comment}"
+        return stmt
 
     def _expr_kind(self, node):
         if isinstance(node, ast.Constant):
@@ -2971,12 +2998,48 @@ class translator(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
+        inline_comment = self._take_inline_comment(node)
         if len(node.targets) != 1:
             raise NotImplementedError("multiple assignment not supported")
         t = node.targets[0]
         v = node.value
         if isinstance(t, ast.Name) and t.id in self.reserved_names:
             # keep translator-owned kind parameters stable
+            return
+
+        # Parallel tuple/list assignment:
+        #   a, b = b, a + b
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and isinstance(v, (ast.Tuple, ast.List))
+            and len(t.elts) == len(v.elts)
+        ):
+            lhs_names = []
+            for e in t.elts:
+                if not isinstance(e, ast.Name):
+                    raise NotImplementedError("tuple assignment targets must be names")
+                lhs_names.append(e.id)
+            rhs_exprs = [self.expr(e) for e in v.elts]
+            rhs_kinds = [self._expr_kind(e) for e in v.elts]
+            self.o.w("block")
+            self.o.push()
+            tmp_names = []
+            for i, (rexpr, rkind) in enumerate(zip(rhs_exprs, rhs_kinds), start=1):
+                tnm = f"tmp_tuple_{i}"
+                tmp_names.append(tnm)
+                if rkind == "int":
+                    self.o.w(f"integer :: {tnm}")
+                elif rkind == "logical":
+                    self.o.w(f"logical :: {tnm}")
+                else:
+                    # Conservative fallback for unknown/mixed numeric kinds.
+                    self.o.w(f"real(kind=dp) :: {tnm}")
+            for tnm, rexpr in zip(tmp_names, rhs_exprs):
+                self.o.w(f"{tnm} = {rexpr}")
+            for nm, tnm in zip(lhs_names, tmp_names):
+                self.o.w(f"{nm} = {tnm}")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         # Shape-intent marker rewrites from NumPy axis insertion:
@@ -3122,14 +3185,14 @@ class translator(ast.NodeVisitor):
 
         # simple int literal assignment
         if isinstance(t, ast.Name) and is_const_int(v):
-            self.o.w(f"{t.id} = {v.value}")
+            self.o.w(self._with_inline_comment(f"{t.id} = {v.value}", inline_comment))
             return
 
         # None sentinel assignment
         if isinstance(t, ast.Name) and is_none(v):
             if t.id in self.dict_typed_vars:
                 return
-            self.o.w(f"{t.id} = -1")
+            self.o.w(self._with_inline_comment(f"{t.id} = -1", inline_comment))
             return
 
         # x = random.random() -> call random_number(x)
@@ -3840,7 +3903,7 @@ class translator(ast.NodeVisitor):
                 self.o.pop()
                 self.o.w("end if")
                 return
-            self.o.w(f"{t.id} = {self.expr(v)}")
+            self.o.w(self._with_inline_comment(f"{t.id} = {self.expr(v)}", inline_comment))
             return
 
         stmt_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
@@ -5666,6 +5729,8 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = simplify_redundant_parens_in_lines(f90_lines)
     f90_lines = remove_empty_if_blocks(f90_lines)
     f90_lines = inline_shape_comments(f90_lines)
+    f90_lines = ensure_space_before_inline_comments(f90_lines)
+    f90_lines = prune_unused_use_only_lines(f90_lines)
     # First coalesce adjacent declarations without wrapping, then apply
     # the dedicated 80-column wrapper that packs continuation lines.
     f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
