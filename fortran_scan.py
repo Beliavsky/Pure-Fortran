@@ -1040,9 +1040,9 @@ def simplify_redundant_parens_in_line(line: str) -> str:
 
     # Remove parentheses around simple atoms globally.
     atom_pat = re.compile(
-        r"(?:(?<=^)|(?<=[\s=,+\-*/(]))"
-        r"\(\s*([a-z][a-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[de][+-]?[0-9]+)?)\s*\)"
-        r"(?:(?=$)|(?=[\s,+\-*/)]))",
+        r"(?:(?<=^)|(?<=[\s=,+\-*/(\[]))"
+        r"\(\s*([a-z][a-z0-9_]*|[+\-]?[0-9]+(?:\.[0-9]*)?(?:[de][+\-]?[0-9]+)?(?:_[a-z][a-z0-9_]*)?)\s*\)"
+        r"(?:(?=$)|(?=[\s,+\-*/)\]]))",
         re.IGNORECASE,
     )
     while True:
@@ -1624,7 +1624,7 @@ def remove_redundant_tail_deallocations(lines: List[str]) -> List[str]:
     return out
 
 
-def coalesce_simple_declarations(lines: List[str]) -> List[str]:
+def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[str]:
     """Merge adjacent declaration lines with identical type-spec.
 
     Conservative scope:
@@ -1658,14 +1658,15 @@ def coalesce_simple_declarations(lines: List[str]) -> List[str]:
         indent = m.group(1)
         spec = m.group(2).strip()
         entity = m.group(3).strip()
-        # Skip initialized or multi-entity declarations.
-        if "=" in entity or "," in entity:
+        # Skip initialized declarations.
+        # Note: entity may legally contain commas inside shape, e.g. a(:,:).
+        if "=" in entity:
             out.append(line)
             i += 1
             continue
         names = [entity]
         j = i + 1
-        eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "\n")
+        eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
         while j < len(lines):
             codej0 = lines[j].rstrip("\r\n")
             code_j, comment_j = _split_code_comment(codej0)
@@ -1678,7 +1679,7 @@ def coalesce_simple_declarations(lines: List[str]) -> List[str]:
             if mj.group(1) != indent or mj.group(2).strip().lower() != spec.lower():
                 break
             entj = mj.group(3).strip()
-            if "=" in entj or "," in entj:
+            if "=" in entj:
                 break
             names.append(entj)
             eol = "\r\n" if lines[j].endswith("\r\n") else ("\n" if lines[j].endswith("\n") else eol)
@@ -1686,8 +1687,207 @@ def coalesce_simple_declarations(lines: List[str]) -> List[str]:
         if len(names) == 1:
             out.append(line)
         else:
-            out.append(f"{indent}{spec} :: {', '.join(names)}{eol}")
+            merged = f"{indent}{spec} :: {', '.join(names)}"
+            if len(merged) <= max_len:
+                out.append(f"{merged}{eol}")
+            else:
+                first = f"{indent}{spec} :: {names[0]}, &"
+                if len(first) <= max_len:
+                    out.append(f"{first}{eol}")
+                    start_idx = 1
+                else:
+                    out.append(f"{indent}{spec} :: &{eol}")
+                    start_idx = 0
+                for k in range(start_idx, len(names)):
+                    nm = names[k]
+                    is_last = (k == len(names) - 1)
+                    tail = "" if is_last else ", &"
+                    out.append(f"{indent}   & {nm}{tail}{eol}")
         i = j
+    return out
+
+
+def wrap_long_declaration_lines(lines: List[str], max_len: int = 80) -> List[str]:
+    """Wrap long declaration lines with free-form continuation at entity commas."""
+    out: List[str] = []
+    decl_re = re.compile(r"^(\s*)([^:][^:]*)\s*::\s*(.+?)\s*$", re.IGNORECASE)
+
+    def _split_entities(s: str) -> List[str]:
+        items: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        in_single = False
+        in_double = False
+        for ch in s:
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                cur.append(ch)
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                cur.append(ch)
+                continue
+            if in_single or in_double:
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                continue
+            if ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                if part:
+                    items.append(part)
+                cur = []
+                continue
+            cur.append(ch)
+        part = "".join(cur).strip()
+        if part:
+            items.append(part)
+        return items
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        code0 = raw.rstrip("\r\n")
+        code, comment = _split_code_comment(code0)
+        eol = _line_eol(raw)
+        if comment.strip():
+            out.append(raw)
+            i += 1
+            continue
+        m = decl_re.match(code.rstrip())
+        if not m:
+            out.append(raw)
+            i += 1
+            continue
+        indent, spec, ent_text = m.group(1), m.group(2).strip(), m.group(3).strip()
+
+        # If this declaration already uses continuation lines, normalize them
+        # into one entity list before re-wrapping.
+        j = i
+        ent_chunks: List[str] = [ent_text]
+        while True:
+            cur = ent_chunks[-1].rstrip()
+            if not cur.endswith("&"):
+                break
+            j += 1
+            if j >= len(lines):
+                break
+            nxt = lines[j].rstrip("\r\n")
+            nxt_code, nxt_comment = _split_code_comment(nxt)
+            if nxt_comment.strip():
+                break
+            ms = re.match(r"^\s*&\s*(.*)\s*$", nxt_code)
+            if not ms:
+                break
+            ent_chunks[-1] = cur[:-1].rstrip()
+            ent_chunks.append(ms.group(1).strip())
+        if j > i:
+            cleaned = ", ".join(s.strip().rstrip(",") for s in ent_chunks if s.strip())
+            ent_text = cleaned
+            i = j
+
+        full = f"{indent}{spec} :: {ent_text}"
+        if len(full) <= max_len:
+            out.append(f"{full}{eol}")
+            i += 1
+            continue
+        ents = _split_entities(ent_text)
+        if len(ents) <= 1:
+            out.append(f"{full}{eol}")
+            i += 1
+            continue
+        first_prefix = f"{indent}{spec} :: "
+        cont_prefix = f"{indent}   & "
+        rows: List[List[str]] = []
+        cur: List[str] = []
+        cur_prefix = first_prefix
+        for ent in ents:
+            trial = ", ".join(cur + [ent])
+            if len(cur_prefix + trial) <= max_len or not cur:
+                cur.append(ent)
+            else:
+                rows.append(cur)
+                cur = [ent]
+                cur_prefix = cont_prefix
+        if cur:
+            rows.append(cur)
+
+        for ridx, row in enumerate(rows):
+            is_last_row = (ridx == len(rows) - 1)
+            prefix = first_prefix if ridx == 0 else cont_prefix
+            body = ", ".join(row)
+            if is_last_row:
+                out.append(f"{prefix}{body}{eol}")
+            else:
+                out.append(f"{prefix}{body}, &{eol}")
+        i += 1
+    return out
+
+
+def remove_empty_if_blocks(lines: List[str]) -> List[str]:
+    """Remove conservative empty IF blocks:
+
+      if (<cond>) then
+         ! comments / blank only
+      end if
+
+    Keeps blocks that contain executable statements or any ELSE/ELSE IF branch.
+    """
+    out: List[str] = []
+    i = 0
+    if_then_re = re.compile(r"^\s*if\s*\(.*\)\s*then\s*$", re.IGNORECASE)
+    else_re = re.compile(r"^\s*else(\s+if\b.*)?\s*$", re.IGNORECASE)
+    end_if_re = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
+
+    while i < len(lines):
+        code_i = strip_comment(lines[i]).strip()
+        if not if_then_re.match(code_i):
+            out.append(lines[i])
+            i += 1
+            continue
+
+        depth = 1
+        j = i + 1
+        has_else = False
+        has_exec = False
+        end_idx = -1
+        while j < len(lines):
+            code_j = strip_comment(lines[j]).strip()
+            low_j = code_j.lower()
+            if if_then_re.match(code_j):
+                depth += 1
+                has_exec = True
+                j += 1
+                continue
+            if end_if_re.match(low_j):
+                depth -= 1
+                if depth == 0:
+                    end_idx = j
+                    break
+                has_exec = True
+                j += 1
+                continue
+            if depth == 1 and else_re.match(code_j):
+                has_else = True
+                j += 1
+                continue
+            if code_j:
+                has_exec = True
+            j += 1
+
+        if end_idx >= 0 and (not has_else) and (not has_exec):
+            i = end_idx + 1
+            continue
+
+        out.append(lines[i])
+        i += 1
+
     return out
 
 
