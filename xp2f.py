@@ -26,8 +26,12 @@ import io
 import tokenize
 from datetime import datetime
 from fortran_scan import (
+    coalesce_simple_declarations,
+    remove_empty_if_blocks,
+    simplify_redundant_parens_in_lines,
     simplify_integer_arithmetic_in_lines,
     strip_redundant_outer_parens_expr,
+    wrap_long_declaration_lines,
 )
 
 
@@ -202,6 +206,33 @@ def extract_python_comments(src_text):
     return out
 
 
+def _comment_map_for_top_level(tree, comment_map):
+    """Keep only comments that are not inside nested def/class bodies."""
+    if not comment_map:
+        return {}
+    blocked = set()
+    for n in getattr(tree, "body", []):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = getattr(n, "lineno", None)
+            end = getattr(n, "end_lineno", None)
+            if isinstance(start, int) and isinstance(end, int) and end >= start:
+                blocked.update(range(start, end + 1))
+    filtered = {ln: vals for ln, vals in comment_map.items() if ln not in blocked}
+    body_lines = [getattr(n, "lineno", None) for n in getattr(tree, "body", [])]
+    body_lines = [ln for ln in body_lines if isinstance(ln, int)]
+    if not body_lines:
+        return filtered
+    lo = min(body_lines)
+    hi = max(
+        [
+            getattr(n, "end_lineno", getattr(n, "lineno", lo))
+            for n in getattr(tree, "body", [])
+            if isinstance(getattr(n, "lineno", None), int)
+        ]
+    )
+    return {ln: vals for ln, vals in filtered.items() if lo <= ln <= hi}
+
+
 def procedure_comment(proc_name, kind):
     words = proc_name.replace("_", " ")
     if proc_name.startswith("run_"):
@@ -226,6 +257,16 @@ def argument_comment(name, intent):
     else:
         base = "argument"
     return f"{base} ({intent})"
+
+
+def emit_python_docstring_as_fortran_comments(o, fn_node):
+    """Emit Python docstring text as Fortran comment lines."""
+    doc = ast.get_docstring(fn_node, clean=False)
+    if not doc:
+        return
+    for ln in doc.splitlines():
+        txt = ln.rstrip()
+        o.w(f"! {txt}" if txt else "!")
 
 
 def function_is_pure(fn_node, known_pure_calls=None):
@@ -436,10 +477,254 @@ def simplify_generated_parentheses(lines):
         # x((i+1)) -> x(i+1)
         code = re.sub(r"\(\(([^()]+)\)\)", r"(\1)", code)
 
+        # Keyword args like dim=(1) -> dim=1
+        code = re.sub(r"\b(dim|axis|ncopies)\s*=\s*\(\s*([^()]+?)\s*\)", r"\1=\2", code, flags=re.IGNORECASE)
+
+        # Assignment RHS outer-paren cleanup:
+        #   x = (expr) -> x = expr
+        #   x = ((expr)) -> x = expr
+        # Skip declarations, pointers, and control-flow statements.
+        if "=" in code and "::" not in code and "=>" not in code and not re.match(r"^\s*(if|do|where|forall|select)\b", code, flags=re.IGNORECASE):
+            m_asn = re.match(r"^(\s*[^=]+?=\s*)(.+)$", code)
+            if m_asn:
+                lhs, rhs = m_asn.group(1), m_asn.group(2).rstrip()
+                prev = rhs
+                while True:
+                    cur = strip_redundant_outer_parens_expr(prev)
+                    if cur == prev:
+                        break
+                    prev = cur
+                code = lhs + prev
+
         if bang:
             out.append(code + bang + comment)
         else:
             out.append(code)
+    return out
+
+
+def inline_shape_comments(lines):
+    """
+    Move standalone shape comments like '! (n,k)' onto the next executable line.
+    """
+    out = list(lines)
+    i = 0
+    pat_shape = re.compile(r"^\s*!\s*(\([^()]+\))\s*$")
+    while i < len(out):
+        m = pat_shape.match(out[i])
+        if not m:
+            i += 1
+            continue
+        shape_txt = m.group(1).strip()
+        j = i + 1
+        while j < len(out):
+            s = out[j].strip()
+            if not s:
+                j += 1
+                continue
+            if s.startswith("!"):
+                j += 1
+                continue
+            break
+        if j >= len(out):
+            i += 1
+            continue
+        code, bang, cmt = out[j].partition("!")
+        code = code.rstrip()
+        if bang:
+            cmt_txt = cmt.strip()
+            if cmt_txt:
+                out[j] = f"{code} ! {cmt_txt}; {shape_txt}"
+            else:
+                out[j] = f"{code} ! {shape_txt}"
+        else:
+            out[j] = f"{code} ! {shape_txt}"
+        out.pop(i)
+    return out
+
+
+def add_pure_procedure_attrs_with_xpure(src_text, helper_uses=None, pure_helper_names=None):
+    """
+    Use xpure's Fortran-side analysis to add PURE where safely inferred.
+    Falls back to no-op if xpure is unavailable.
+    """
+    try:
+        import xpure  # local tool module
+    except Exception:
+        return src_text
+
+    lines = src_text.splitlines()
+    # Less conservative for transpiled code: don't reject every CALL by default.
+    helper_uses = helper_uses or {}
+    pure_helper_names = {s.lower() for s in (pure_helper_names or set())}
+    external_status = {}
+    for syms in helper_uses.values():
+        for s in syms:
+            sl = s.lower()
+            external_status[sl] = (sl in pure_helper_names)
+
+    res = xpure.analyze_lines(
+        lines,
+        external_name_status=external_status,
+        strict_unknown_calls=False,
+        conservative_call_block=False,
+    )
+    if not res.candidates:
+        return src_text
+    changed = False
+    for proc in res.candidates:
+        idx = proc.start - 1
+        if xpure.apply_decl_edit_at_or_continuation(lines, idx, xpure.add_pure_to_declaration):
+            changed = True
+    if not changed:
+        return src_text
+    return "\n".join(lines) + ("\n" if src_text.endswith("\n") else "")
+
+
+def collapse_alloc_dealloc_before_assignment(lines):
+    """
+    Collapse conservative allocatable init triplets:
+      if (allocated(x)) deallocate(x)
+      allocate(x(...))
+      x = <expr>
+    into:
+      x = <expr>
+    """
+    out = []
+    i = 0
+    re_dealloc = re.compile(
+        r"^\s*if\s*\(\s*allocated\s*\(\s*([a-z_]\w*)\s*\)\s*\)\s*deallocate\s*\(\s*\1\s*\)\s*$",
+        re.IGNORECASE,
+    )
+    re_alloc = re.compile(r"^\s*allocate\s*\(\s*([a-z_]\w*)\s*\(.+\)\s*\)\s*$", re.IGNORECASE)
+    re_assign = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+)$", re.IGNORECASE)
+    while i < len(lines):
+        if i + 2 < len(lines):
+            c0 = lines[i].split("!", 1)[0].strip()
+            c1 = lines[i + 1].split("!", 1)[0].strip()
+            c2 = lines[i + 2].split("!", 1)[0].strip()
+            m0 = re_dealloc.match(c0)
+            m1 = re_alloc.match(c1)
+            m2 = re_assign.match(c2)
+            if m0 and m1 and m2:
+                n0 = m0.group(1).lower()
+                n1 = m1.group(1).lower()
+                n2 = m2.group(1).lower()
+                rhs = m2.group(2).strip()
+                # Only whole-variable assignment (no section/ref on lhs).
+                # Collapse only when RHS is an explicit array constructor, which
+                # safely triggers allocation-on-assignment for allocatables.
+                # Do not collapse scalar RHS (e.g., var = var0) because scalar-to-
+                # array assignment requires prior allocation.
+                if (
+                    n0 == n1 == n2
+                    and not rhs.lower().startswith("allocate(")
+                    and ("[" in rhs and "]" in rhs)
+                ):
+                    out.append(lines[i + 2])
+                    i += 3
+                    continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
+def collapse_allocate_before_array_constructor_assignment(lines):
+    """
+    Collapse:
+      allocate(x(...))
+      x = [ ... ]
+    into:
+      x = [ ... ]
+    This is safe for allocatables due to allocation-on-assignment.
+    """
+    out = []
+    i = 0
+    re_alloc = re.compile(r"^\s*allocate\s*\(\s*([a-z_]\w*)\s*\(.+\)\s*\)\s*$", re.IGNORECASE)
+    re_assign = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+)$", re.IGNORECASE)
+    while i < len(lines):
+        if i + 1 < len(lines):
+            c0 = lines[i].split("!", 1)[0].strip()
+            c1 = lines[i + 1].split("!", 1)[0].strip()
+            m0 = re_alloc.match(c0)
+            m1 = re_assign.match(c1)
+            if m0 and m1:
+                n0 = m0.group(1).lower()
+                n1 = m1.group(1).lower()
+                rhs = m1.group(2).strip()
+                if n0 == n1 and ("[" in rhs and "]" in rhs):
+                    out.append(lines[i + 1])
+                    i += 2
+                    continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
+def remove_redundant_first_guarded_deallocate(lines):
+    """
+    Remove:
+      if (allocated(x)) deallocate(x)
+    when:
+    - the next nonblank/non-comment line is allocate(x(...))
+    - x has not appeared in prior executable statements.
+    """
+    out = list(lines)
+    re_guard = re.compile(
+        r"^\s*if\s*\(\s*allocated\s*\(\s*([a-z_]\w*)\s*\)\s*\)\s*deallocate\s*\(\s*\1\s*\)\s*$",
+        re.IGNORECASE,
+    )
+    re_alloc = re.compile(r"^\s*allocate\s*\(\s*([a-z_]\w*)\s*\(.+\)\s*\)\s*$", re.IGNORECASE)
+    re_declish = re.compile(
+        r"^\s*(?:use\b|implicit\b|contains\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|interface\b|module\b|program\b|subroutine\b|function\b|end\b)",
+        re.IGNORECASE,
+    )
+
+    i = 0
+    while i < len(out):
+        code_i = out[i].split("!", 1)[0].strip()
+        m = re_guard.match(code_i)
+        if not m:
+            i += 1
+            continue
+        var = m.group(1)
+
+        j = i + 1
+        while j < len(out):
+            cj = out[j].split("!", 1)[0].strip()
+            if not cj:
+                j += 1
+                continue
+            break
+        if j >= len(out):
+            i += 1
+            continue
+        m_alloc = re_alloc.match(out[j].split("!", 1)[0].strip())
+        if not (m_alloc and m_alloc.group(1).lower() == var.lower()):
+            i += 1
+            continue
+
+        prior_use = False
+        tok_re = re.compile(rf"\b{re.escape(var)}\b", re.IGNORECASE)
+        re_flow = re.compile(r"^\s*(?:do\b|if\b|select\b|where\b|forall\b|block\b)", re.IGNORECASE)
+        for k in range(i):
+            ck = out[k].split("!", 1)[0].strip()
+            if not ck:
+                continue
+            # Conservative: once control-flow has started, keep guarded deallocate.
+            if re_flow.match(ck):
+                prior_use = True
+                break
+            if re_declish.match(ck):
+                continue
+            if tok_re.search(ck):
+                prior_use = True
+                break
+        if not prior_use:
+            del out[i]
+            # do not advance i; next line shifts into current slot
+            continue
+        i += 1
     return out
 
 
@@ -4089,6 +4374,7 @@ def _emit_local_function(
     if fn.name == "logsumexp" and len(args) >= 3:
         o.w(f"function {fn.name}(" + ", ".join(args[:3]) + f") result({ret_name})")
         o.push()
+        emit_python_docstring_as_fortran_comments(o, fn)
         o.w("real(kind=dp), intent(in) :: a(:,:)")
         o.w("integer, intent(in) :: axis")
         o.w("logical, intent(in) :: keepdims")
@@ -4145,6 +4431,7 @@ def _emit_local_function(
         xnm, munm, varnm = args[:3]
         o.w(f"function {fn.name}({xnm}, {munm}, {varnm}) result({ret_name})")
         o.push()
+        emit_python_docstring_as_fortran_comments(o, fn)
         o.w(f"real(kind=dp), intent(in) :: {xnm}(:)")
         o.w(f"real(kind=dp), intent(in) :: {munm}(:)")
         o.w(f"real(kind=dp), intent(in) :: {varnm}(:)")
@@ -4170,6 +4457,7 @@ def _emit_local_function(
         xnm, munm, varnm = args[:3]
         o.w(f"function {fn.name}({xnm}, {munm}, {varnm}) result({ret_name})")
         o.push()
+        emit_python_docstring_as_fortran_comments(o, fn)
         o.w(f"real(kind=dp), intent(in) :: {xnm}(:)")
         o.w(f"real(kind=dp), intent(in) :: {munm}(:)")
         o.w(f"real(kind=dp), intent(in) :: {varnm}(:)")
@@ -4207,6 +4495,9 @@ def _emit_local_function(
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
     )
+    # Scope comment emission to this procedure body; otherwise comments from
+    # earlier procedures leak into the first emitted statement.
+    tr._last_comment_line = getattr(fn, "lineno", 0)
     for anm, tnm in (dict_arg_types or {}).items():
         tr.dict_typed_vars[anm] = tnm
         tr.dict_var_components[anm] = list((dict_type_components or {}).get(tnm, {}).keys())
@@ -4314,6 +4605,7 @@ def _emit_local_function(
     else:
         o.w(f"{pure_prefix}function {fn.name}(" + ", ".join(args) + f") result({ret_name})")
     o.push()
+    emit_python_docstring_as_fortran_comments(o, fn)
     if not no_comment:
         o.w(f"! {procedure_comment(fn.name, 'subroutine' if tuple_return else 'function')}")
     ann_map = {}
@@ -4390,9 +4682,41 @@ def _emit_local_function(
         return rr
 
     def _arg_is_assigned(nm):
+        def _is_noop_self_rebind(assign_node):
+            if not (isinstance(assign_node, ast.Assign) and len(assign_node.targets) == 1):
+                return False
+            tg = assign_node.targets[0]
+            if not (isinstance(tg, ast.Name) and tg.id == nm):
+                return False
+            v = assign_node.value
+            # x = np.asarray(x, ...)
+            if (
+                isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Attribute)
+                and isinstance(v.func.value, ast.Name)
+                and v.func.value.id == "np"
+                and v.func.attr in {"asarray", "array"}
+                and len(v.args) >= 1
+                and isinstance(v.args[0], ast.Name)
+                and v.args[0].id == nm
+            ):
+                return True
+            # x = x.copy()
+            if (
+                isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Attribute)
+                and v.func.attr == "copy"
+                and isinstance(v.func.value, ast.Name)
+                and v.func.value.id == nm
+            ):
+                return True
+            return False
+
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.Assign):
+                    if _is_noop_self_rebind(n):
+                        continue
                     for tg in n.targets:
                         if isinstance(tg, ast.Name) and tg.id == nm:
                             return True
@@ -4643,6 +4967,7 @@ def _local_return_maps(local_funcs, params):
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None
 ):
+    top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
     def _infer_arg_rank_in_fn(fn, nm):
         rr = 0
         for st in fn.body:
@@ -4754,7 +5079,7 @@ def generate_flat(
         params=params,
         context="flat",
         list_counts=list_counts,
-        comment_map=comment_map,
+        comment_map=top_level_comment_map,
         tuple_return_funcs=tuple_return_funcs,
         dict_return_types=dict_return_types,
         local_return_specs=local_return_specs,
@@ -4861,6 +5186,7 @@ def generate_flat(
 
 
 def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_counts, no_comment=False, comment_map=None):
+    top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
     o = emit()
     run_name = f"run_{stem}"
     compute_name = f"compute_{stem}"
@@ -4953,7 +5279,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
         o.w(f"integer, allocatable :: {lst}(:)")
 
     o.w("")
-    tr_print = translator(o, params=params, context="run_print", list_counts=list_counts, comment_map=comment_map)
+    tr_print = translator(o, params=params, context="run_print", list_counts=list_counts, comment_map=top_level_comment_map)
 
     # initialize list outputs for all branches
     for lst, cnt in sorted(list_counts.items()):
@@ -5054,7 +5380,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
             continue
         compute_nodes.append(s)
 
-    tr_comp = translator(o, params=params, context="compute", list_counts=list_counts, comment_map=comment_map)
+    tr_comp = translator(o, params=params, context="compute", list_counts=list_counts, comment_map=top_level_comment_map)
     tr_comp.prescan(compute_nodes)
 
     exclude = set(settings) | set(list_counts.values()) | set(list_counts.keys()) | set(scalar_outs)
@@ -5332,9 +5658,24 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     # General Fortran cleanup: fold simple integer arithmetic and remove
     # conservative redundant parentheses in generated statements.
     f90_lines = f90.splitlines()
+    f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
+    f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
+    f90_lines = collapse_allocate_before_array_constructor_assignment(f90_lines)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
+    f90_lines = simplify_redundant_parens_in_lines(f90_lines)
+    f90_lines = remove_empty_if_blocks(f90_lines)
+    f90_lines = inline_shape_comments(f90_lines)
+    # First coalesce adjacent declarations without wrapping, then apply
+    # the dedicated 80-column wrapper that packs continuation lines.
+    f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
+    f90_lines = wrap_long_declaration_lines(f90_lines, max_len=80)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = add_pure_procedure_attrs_with_xpure(
+        f90,
+        helper_uses=helper_uses,
+        pure_helper_names=pure_helpers,
+    )
     out_path = Path(out_path) if out_path else Path(py_path).with_name(f"{Path(py_path).stem}_p.f90")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     f90 = f"! transpiled by xp2f.py from {Path(py_path).name} on {stamp}\n" + f90
@@ -5522,9 +5863,12 @@ def main():
             rows.append(("fortran run", timings["fortran_run"]))
         rows.append(("total", timings["total"]))
 
-        print("  stage         seconds    ratio(vs python run)")
+        stage_w = max(len("stage"), max(len(name) for name, _ in rows))
+        sec_vals = [f"{val:.6f}" for _name, val in rows]
+        sec_w = max(len("seconds"), max(len(s) for s in sec_vals))
+        print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    ratio(vs python run)")
         for name, val in rows:
-            print(f"  {name:<12} {val:>8.6f}    {_ratio(val)}")
+            print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}    {_ratio(val)}")
     return 0
 
 
