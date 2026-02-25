@@ -225,6 +225,107 @@ def _split_sprintf_format(fmt: str) -> tuple[list[str], int]:
     return pieces, nspec
 
 
+def _replace_balanced_func_calls(expr: str, fname: str, repl_fn) -> str:
+    """Replace `fname(<arg>)` calls using balanced-parentheses parsing."""
+    out: list[str] = []
+    i = 0
+    n = len(expr)
+    fnlow = fname.lower()
+    while i < n:
+        m = re.search(rf"\b{re.escape(fname)}\b", expr[i:], re.IGNORECASE)
+        if m is None:
+            out.append(expr[i:])
+            break
+        s0 = i + m.start()
+        e0 = i + m.end()
+        out.append(expr[i:s0])
+        j = e0
+        while j < n and expr[j].isspace():
+            j += 1
+        if j >= n or expr[j] != "(":
+            out.append(expr[s0:e0])
+            i = e0
+            continue
+        depth = 0
+        in_single = False
+        in_double = False
+        k = j
+        close = -1
+        while k < n:
+            ch = expr[k]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close = k
+                        break
+            k += 1
+        if close < 0:
+            out.append(expr[s0:])
+            break
+        inner = expr[j + 1 : close]
+        out.append(repl_fn(inner))
+        i = close + 1
+    return "".join(out)
+
+
+def _display_expr_to_fortran(expr: str) -> str:
+    """Lower display-oriented R wrappers (sprintf/paste) to printable Fortran expr."""
+    s = expr.strip()
+    cinfo = parse_call_text(s)
+    if cinfo is not None:
+        nm, pos, kw = cinfo
+        low = nm.lower()
+        if low == "sprintf":
+            if len(pos) >= 2:
+                return r_expr_to_fortran(pos[1])
+            if len(pos) == 1:
+                return r_expr_to_fortran(pos[0])
+        if low == "paste":
+            # Common case: paste(sprintf(fmt, arr), collapse=" ")
+            if pos:
+                inner = pos[0].strip()
+                c2 = parse_call_text(inner)
+                if c2 is not None and c2[0].lower() == "sprintf":
+                    p2 = c2[1]
+                    if len(p2) >= 2:
+                        return r_expr_to_fortran(p2[1])
+                return r_expr_to_fortran(inner)
+    return r_expr_to_fortran(s)
+
+
+def _sprintf_arg_items(expr: str) -> list[str] | None:
+    """Lower sprintf(fmt, ...) into printable Fortran item expressions."""
+    ci = parse_call_text(expr.strip())
+    if ci is None or ci[0].lower() != "sprintf":
+        return None
+    pos = ci[1]
+    if not pos:
+        return []
+    fmt_raw = _dequote_string_literal(pos[0])
+    vals = [r_expr_to_fortran(a) for a in pos[1:]]
+    if fmt_raw is None:
+        return vals
+    pieces, nspec = _split_sprintf_format(fmt_raw)
+    out_items: list[str] = []
+    nuse = min(nspec, len(vals))
+    for i in range(nuse + 1):
+        lit = pieces[i].replace("\\n", "").replace("\\t", " ")
+        if lit:
+            out_items.append(_fortran_str_literal(lit))
+        if i < nuse:
+            out_items.append(vals[i])
+    if nuse < len(vals):
+        out_items.extend(vals[nuse:])
+    return out_items
+
+
 def strip_r_comment(line: str) -> str:
     out = []
     in_single = False
@@ -336,6 +437,37 @@ def split_top_level_semicolons(s: str) -> list[str]:
 def preprocess_r_lines(src: str) -> list[str]:
     lines0 = [strip_r_comment(ln) for ln in src.splitlines()]
     lines0 = [ln for ln in lines0 if ln.strip()]
+    # Join multiline statements by balanced parentheses.
+    joined: list[str] = []
+    cur = ""
+    depth = 0
+    in_single = False
+    in_double = False
+    for ln in lines0:
+        txt = ln.strip()
+        if not cur:
+            cur = txt
+        else:
+            cur = cur + " " + txt
+        i = 0
+        while i < len(txt):
+            ch = txt[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")" and depth > 0:
+                    depth -= 1
+            i += 1
+        if depth == 0 and not in_single and not in_double:
+            joined.append(cur)
+            cur = ""
+    if cur.strip():
+        joined.append(cur)
+    lines0 = joined
     out: list[str] = []
     for ln in lines0:
         # split top-level semicolon-separated statements
@@ -363,6 +495,10 @@ def preprocess_r_lines(src: str) -> list[str]:
 
 def parse_single_statement(ln: str) -> object:
     ln = ln.strip()
+    if ln == "break":
+        return ExprStmt(expr="break")
+    if ln == "next":
+        return ExprStmt(expr="next")
     if ln.startswith("function("):
         raise NotImplementedError("nested/anonymous function definitions not supported")
     if ln.startswith("print(") and ln.endswith(")"):
@@ -373,6 +509,13 @@ def parse_single_statement(ln: str) -> object:
     if m_asn:
         rhs = m_asn.group(3).strip()
         return Assign(name=m_asn.group(1), expr=rhs)
+    m_asn_any = re.match(
+        r"^([A-Za-z]\w*(?:\[[^\]]+\])?(?:\$[A-Za-z]\w*(?:\[[^\]]+\])?)*)\s*(<-|=)\s*(.+)$",
+        ln,
+    )
+    if m_asn_any:
+        # Keep non-simple LHS assignments as generic expr statements.
+        return ExprStmt(expr=ln)
     cinfo = parse_call_text(ln)
     if cinfo is not None:
         nm, pos, kw = cinfo
@@ -383,13 +526,16 @@ def parse_single_statement(ln: str) -> object:
     return ExprStmt(expr=ln)
 
 
-def parse_block(lines: list[str], i0: int = 0) -> tuple[list[object], int]:
+def parse_block(lines: list[str], i0: int = 0, *, stop_at_rbrace: bool = False) -> tuple[list[object], int]:
     stmts: list[object] = []
     i = i0
     while i < len(lines):
         ln = lines[i].strip()
         if ln == "}":
-            return stmts, i + 1
+            if stop_at_rbrace:
+                return stmts, i + 1
+            i += 1
+            continue
         if ln == "{":
             i += 1
             continue
@@ -401,7 +547,7 @@ def parse_block(lines: list[str], i0: int = 0) -> tuple[list[object], int]:
             i += 1
             if i >= len(lines) or lines[i].strip() != "{":
                 raise NotImplementedError("for requires braced body in this subset")
-            body, i = parse_block(lines, i + 1)
+            body, i = parse_block(lines, i + 1, stop_at_rbrace=True)
             stmts.append(ForStmt(var=var, iter_expr=itexpr, body=body))
             continue
 
@@ -423,7 +569,7 @@ def parse_block(lines: list[str], i0: int = 0) -> tuple[list[object], int]:
             i += 1
             if i >= len(lines) or lines[i].strip() != "{":
                 raise NotImplementedError("function requires braced body in this subset")
-            body, i = parse_block(lines, i + 1)
+            body, i = parse_block(lines, i + 1, stop_at_rbrace=True)
             stmts.append(FuncDef(name=fname, args=args, defaults=defaults, body=body))
             continue
 
@@ -444,7 +590,7 @@ def parse_block(lines: list[str], i0: int = 0) -> tuple[list[object], int]:
             else:
                 i += 1
                 if i < len(lines) and lines[i].strip() == "{":
-                    then_body, i = parse_block(lines, i + 1)
+                    then_body, i = parse_block(lines, i + 1, stop_at_rbrace=True)
                 else:
                     # accept single next-statement body without braces
                     if i >= len(lines):
@@ -454,7 +600,7 @@ def parse_block(lines: list[str], i0: int = 0) -> tuple[list[object], int]:
                 if i < len(lines) and lines[i].strip() == "else":
                     i += 1
                     if i < len(lines) and lines[i].strip() == "{":
-                        else_body, i = parse_block(lines, i + 1)
+                        else_body, i = parse_block(lines, i + 1, stop_at_rbrace=True)
                     else:
                         if i >= len(lines):
                             raise NotImplementedError("else missing body")
@@ -497,12 +643,15 @@ def infer_assigned_names(stmts: list[object], out: dict[str, int] | None = None)
 
 def _is_int_literal(txt: str) -> bool:
     t = txt.strip()
-    return re.match(r"^[+-]?\d+[lL]?$", t) is not None
+    return re.match(r"^[+-]?\d+[lL]?(?:_[A-Za-z]\w*)?$", t) is not None
 
 
 def _is_real_literal(txt: str) -> bool:
     t = txt.strip()
-    return re.match(r"^[+-]?\d+\.\d*([eE][+-]?\d+)?$", t) is not None or re.match(r"^[+-]?\d+[eE][+-]?\d+$", t) is not None
+    return (
+        re.match(r"^[+-]?\d+\.\d*([eE][+-]?\d+)?(?:_[A-Za-z]\w*)?$", t) is not None
+        or re.match(r"^[+-]?\d+[eE][+-]?\d+(?:_[A-Za-z]\w*)?$", t) is not None
+    )
 
 
 def _contains_name(expr: str, name: str) -> bool:
@@ -528,10 +677,21 @@ def classify_vars(
     params: dict[str, str] = {}
     known_arrays = set(known_arrays or set())
 
+    def mark_array_uses(txt: str) -> None:
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*\[", txt):
+            nm = m.group(1)
+            known_arrays.add(nm)
+            real_arrays.add(nm)
+            int_arrays.discard(nm)
+            real_scalars.discard(nm)
+            ints.discard(nm)
+            params.pop(nm, None)
+
     def walk(ss: list[object]) -> None:
         for st in ss:
             if isinstance(st, ForStmt):
                 it = st.iter_expr.strip()
+                mark_array_uses(it)
                 if re.match(r"^seq_len\s*\(", it) or re.match(r"^.+:.+$", it):
                     ints.add(st.var)
                     real_scalars.discard(st.var)
@@ -543,45 +703,59 @@ def classify_vars(
                     ints.add(st.var)
                 walk(st.body)
             elif isinstance(st, IfStmt):
+                mark_array_uses(st.cond)
                 walk(st.then_body)
                 walk(st.else_body)
             elif isinstance(st, Assign):
                 rhs = st.expr.strip()
+                mark_array_uses(rhs)
                 if _ifelse_integer_coded(rhs):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                    ints.discard(st.name)
                 elif rhs.lower().startswith("sample.int("):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                    ints.discard(st.name)
                 elif rhs.startswith("c(") or rhs.startswith("runif(") or rhs.startswith("rnorm(") or rhs.startswith("ifelse("):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                 elif re.match(r"^(length|size)\s*\(", rhs):
                     ints.add(st.name)
+                    params.pop(st.name, None)
                     known_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
                 elif re.match(r"^(sum|mean|sd|sqrt|max|min)\s*\(", rhs):
                     real_scalars.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
                     known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
                 elif any(re.search(rf"\b{re.escape(a)}\b", rhs) for a in known_arrays):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                 elif _is_int_literal(rhs):
-                    if assign_counts.get(st.name, 0) == 1:
+                    # Do not force integer typing for variables already inferred real.
+                    if st.name in real_scalars or st.name in real_arrays:
+                        pass
+                    elif assign_counts.get(st.name, 0) == 1:
                         params[st.name] = rhs
                     else:
                         ints.add(st.name)
@@ -589,6 +763,8 @@ def classify_vars(
                         int_arrays.discard(st.name)
                 else:
                     real_scalars.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
                     known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
@@ -971,12 +1147,21 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"\bis\.finite\s*\(\s*([A-Za-z]\w*)\s*\)", r"ieee_is_finite(\1)", s)
     s = re.sub(r"\bis\.null\s*\(\s*([A-Za-z]\w*)\s*\)", r"(\1 == -1)", s)
     s = re.sub(r"\bNULL\b", "-1", s)
+    s = re.sub(r"\bNaN\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
     s = re.sub(r"\bNA_real_\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
-    s = re.sub(r"\bmean\s*\(\s*([^)]+?)\s*\)", r"(sum(\1)/real(size(\1), kind=dp))", s)
-    # c(...) -> [...]
-    if s.startswith("c(") and s.endswith(")"):
-        inner = s[2:-1].strip()
-        parts = split_top_level_commas(inner)
+    s = _replace_balanced_func_calls(
+        s,
+        "mean",
+        lambda inner: f"(sum({inner})/real(size({inner}), kind=dp))",
+    )
+    s = _replace_balanced_func_calls(
+        s,
+        "dnorm",
+        lambda inner: "dnorm(" + re.sub(r"\blog\s*=", "log_=", inner) + ")",
+    )
+    # c(...) -> [...] (also for nested occurrences).
+    def _repl_c(inner: str) -> str:
+        parts = split_top_level_commas(inner.strip())
         vals = []
         for p in parts:
             t = p.strip()
@@ -986,7 +1171,8 @@ def r_expr_to_fortran(expr: str) -> str:
                 vals.append(f"{t}_dp")
             else:
                 vals.append(t)
-        s = "[" + ", ".join(vals) + "]"
+        return "[" + ", ".join(vals) + "]"
+    s = _replace_balanced_func_calls(s, "c", _repl_c)
     # decorate bare real literals
     s = re.sub(r"(?<![\w.])(\d+\.\d*([eE][+-]?\d+)?|\d+[eE][+-]?\d+)(?![\w.])", r"\1_dp", s)
     # R list member access: a$b$c -> a%b%c
@@ -1053,8 +1239,13 @@ def emit_stmts(
                 continue
             m_pack = re.match(rf"^{re.escape(st.name)}\s*\[\s*(.+)\s*\]\s*$", rhs)
             if m_pack:
-                mask = r_expr_to_fortran(m_pack.group(1).strip())
-                o.w(f"{st.name} = pack({st.name}, {mask})")
+                inner = m_pack.group(1).strip()
+                if ":" in inner:
+                    sec = r_expr_to_fortran(inner)
+                    o.w(f"{st.name} = {st.name}({sec})")
+                else:
+                    mask = r_expr_to_fortran(inner)
+                    o.w(f"{st.name} = pack({st.name}, {mask})")
                 continue
             m_if_runif = re.match(r"^ifelse\s*\(\s*runif\((.+)\)\s*<\s*(.+)\s*,\s*(.+)\s*,\s*(.+)\s*\)\s*$", rhs)
             if m_if_runif:
@@ -1218,38 +1409,30 @@ def emit_stmts(
                 continue
             if nm == "cat":
                 if st.args:
-                    # cat(sprintf(fmt,args...), ...) -> print args directly (first-pass)
-                    if len(st.args) >= 1 and st.args[0].strip().startswith("sprintf("):
-                        ci = parse_call_text(st.args[0].strip())
-                        if ci is not None and ci[0].lower() == "sprintf":
-                            pos, kw = ci[1], ci[2]
-                            if pos:
-                                fmt_raw = _dequote_string_literal(pos[0])
-                                vals = [r_expr_to_fortran(a) for a in pos[1:]]
-                                if fmt_raw is not None:
-                                    pieces, nspec = _split_sprintf_format(fmt_raw)
-                                    out_items: list[str] = []
-                                    nuse = min(nspec, len(vals))
-                                    for i in range(nuse + 1):
-                                        lit = pieces[i].replace("\\n", "").replace("\\t", " ")
-                                        if lit:
-                                            out_items.append(_fortran_str_literal(lit))
-                                        if i < nuse:
-                                            out_items.append(vals[i])
-                                    # append unconsumed values (defensive)
-                                    if nuse < len(vals):
-                                        out_items.extend(vals[nuse:])
-                                    # append extra cat args except newline-only
-                                    for a in st.args[1:]:
-                                        if a.strip() in {'"\\n"', "'\\n'"}:
-                                            continue
-                                        out_items.append(r_expr_to_fortran(a))
-                                    if out_items:
-                                        o.w("print *, " + ", ".join(out_items))
-                                    else:
-                                        o.w("print *")
-                                    continue
-                    o.w("print *, " + ", ".join(r_expr_to_fortran(a) for a in st.args))
+                    out_items: list[str] = []
+                    for a in st.args:
+                        at = a.strip()
+                        if at in {'"\\n"', "'\\n'"}:
+                            continue
+                        sp_items = _sprintf_arg_items(at)
+                        if sp_items is not None:
+                            out_items.extend(sp_items)
+                            continue
+                        lit = _dequote_string_literal(at)
+                        if lit is not None:
+                            lit2 = lit.replace("\\n", "").replace("\\t", " ")
+                            if lit2.endswith("="):
+                                lit2 = lit2 + " "
+                            if lit2.endswith(":"):
+                                lit2 = lit2 + " "
+                            if lit2:
+                                out_items.append(_fortran_str_literal(lit2))
+                            continue
+                        out_items.append(_display_expr_to_fortran(a))
+                    if out_items:
+                        o.w("print *, " + ", ".join(out_items))
+                    else:
+                        o.w("print *")
                 else:
                     o.w("print *")
                 continue
@@ -1315,6 +1498,18 @@ def emit_stmts(
                 o.pop()
             o.w("end if")
         elif isinstance(st, ExprStmt):
+            if st.expr.strip() == "break":
+                o.w("exit")
+                continue
+            if st.expr.strip() == "next":
+                o.w("cycle")
+                continue
+            m_asn = re.match(r"^(.+?)\s*(<-|=)\s*(.+)$", st.expr.strip())
+            if m_asn:
+                lhs = r_expr_to_fortran(m_asn.group(1).strip())
+                rhs = r_expr_to_fortran(m_asn.group(3).strip())
+                o.w(f"{lhs} = {rhs}")
+                continue
             raise NotImplementedError(f"unsupported expression statement: {st.expr}")
         else:
             raise NotImplementedError(f"unsupported statement: {type(st).__name__}")
@@ -1358,7 +1553,6 @@ def emit_function(
     rname = f"{fn.name}_result"
     pref = "pure " if can_be_pure else ""
     o.w(f"{pref}function {fn.name}({', '.join(fn.args)}) result({rname})")
-    o.push()
     # argument declarations (first-pass heuristics)
     arg_rank = {a: infer_arg_rank(fn, a) for a in fn.args}
     written_args = infer_written_args(fn)
@@ -1474,7 +1668,6 @@ def emit_function(
                     vv = _replace_idents(str(v), arg_local_map) if arg_local_map else str(v)
                     o.w(f"{prefix}%{k} = {r_expr_to_fortran(vv)}")
         _emit_assign(rname, list_spec.root_fields)
-    o.pop()
     o.w(f"end function {fn.name}")
     return bool(need_rnorm_local["used"])
 
@@ -1510,7 +1703,11 @@ def infer_function_integer_array_names(fn: FuncDef) -> set[str]:
     return int_arrays
 
 
-def _rewrite_named_calls(expr: str, fn_arg_order: dict[str, list[str]]) -> str:
+def _rewrite_named_calls(
+    expr: str,
+    fn_arg_order: dict[str, list[str]],
+    fn_arg_defaults: dict[str, dict[str, str]],
+) -> str:
     cinfo = parse_call_text(expr)
     if cinfo is None:
         return expr
@@ -1518,6 +1715,7 @@ def _rewrite_named_calls(expr: str, fn_arg_order: dict[str, list[str]]) -> str:
     order = fn_arg_order.get(nm)
     if order is None or not kw:
         return expr
+    defaults = fn_arg_defaults.get(nm, {})
     vals: list[str] = []
     ip = 0
     for anm in order:
@@ -1526,6 +1724,8 @@ def _rewrite_named_calls(expr: str, fn_arg_order: dict[str, list[str]]) -> str:
             ip += 1
         elif anm in kw:
             vals.append(kw[anm])
+        elif anm in defaults:
+            vals.append(defaults[anm])
         else:
             # keep placeholder name if not provided
             vals.append(anm)
@@ -1541,8 +1741,65 @@ def _fortran_ident(name: str) -> str:
     return s
 
 
+def _module_name_from_stem(stem: str) -> str:
+    base = _fortran_ident(stem)
+    if base.lower().startswith("x") and len(base) > 1:
+        base = base[1:]
+    return _fortran_ident(base + "_mod")
+
+
+def _infer_literal_array_parameter(rhs: str) -> tuple[str, int, str] | None:
+    """Infer array-parameter declaration info from a literal constructor RHS.
+
+    Returns `(kind, n, expr_f)` where kind is `"integer"` or `"real"`.
+    """
+    expr_f = r_expr_to_fortran(rhs.strip())
+    t = expr_f.strip()
+    if not (t.startswith("[") and t.endswith("]")):
+        return None
+    inner = t[1:-1].strip()
+    if not inner:
+        return None
+    vals = [x.strip() for x in split_top_level_commas(inner) if x.strip()]
+    if not vals:
+        return None
+    all_int = True
+    all_num = True
+    for v in vals:
+        if _is_int_literal(v):
+            continue
+        if _is_real_literal(v):
+            all_int = False
+            continue
+        all_num = False
+        break
+    if not all_num:
+        return None
+    kind = "integer" if all_int else "real"
+    return kind, len(vals), expr_f
+
+
+def infer_main_array_params(stmts: list[object], assign_counts: dict[str, int]) -> dict[str, tuple[str, int, str]]:
+    """Find conservative top-level named-constant array candidates."""
+    out: dict[str, tuple[str, int, str]] = {}
+    for st in stmts:
+        if not isinstance(st, Assign):
+            continue
+        if assign_counts.get(st.name, 0) != 1:
+            continue
+        rhs = st.expr.strip()
+        if not (rhs.startswith("c(") or rhs.startswith("[") or rhs.startswith("array(")):
+            continue
+        info = _infer_literal_array_parameter(rhs)
+        if info is None:
+            continue
+        out[st.name] = info
+    return out
+
+
 def transpile_r_to_fortran(src: str, stem: str, helper_modules: set[str] | None = None) -> str:
     unit_name = _fortran_ident(stem)
+    module_name = _module_name_from_stem(stem)
     lines = preprocess_r_lines(src)
     stmts, i = parse_block(lines, 0)
     if i != len(lines):
@@ -1551,34 +1808,175 @@ def transpile_r_to_fortran(src: str, stem: str, helper_modules: set[str] | None 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     fn_arg_order = {f.name: list(f.args) for f in funcs}
+    fn_arg_defaults = {f.name: dict(f.defaults) for f in funcs}
     for f in funcs:
         for st in f.body:
             if isinstance(st, Assign):
-                st.expr = _rewrite_named_calls(st.expr, fn_arg_order)
+                st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
             elif isinstance(st, ExprStmt):
-                st.expr = _rewrite_named_calls(st.expr, fn_arg_order)
+                st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
     for st in main_stmts:
         if isinstance(st, Assign):
-            st.expr = _rewrite_named_calls(st.expr, fn_arg_order)
+            st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
         elif isinstance(st, ExprStmt):
-            st.expr = _rewrite_named_calls(st.expr, fn_arg_order)
+            st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
     list_specs = _list_return_specs(funcs)
     fn_int_names: dict[str, set[str]] = {f.name: infer_function_integer_names(f) for f in funcs}
     fn_int_array_names: dict[str, set[str]] = {f.name: infer_function_integer_array_names(f) for f in funcs}
     helper_modules = set(m.lower() for m in (helper_modules or set()))
-    helper_ctx: dict[str, object] = {
+    helper_ctx_mod: dict[str, object] = {
+        "has_r_mod": ("r_mod" in helper_modules),
+        "need_r_mod": set(),
+    }
+    helper_ctx_main: dict[str, object] = {
         "has_r_mod": ("r_mod" in helper_modules),
         "need_r_mod": set(),
     }
 
     assign_counts = infer_assigned_names(main_stmts)
     ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
+    array_params = infer_main_array_params(main_stmts, assign_counts)
+
+    # Main program declarations/body (without header/footer).
+    pbody = FEmit()
+    int_param_pairs: list[tuple[str, str]] = sorted((p, v) for p, v in params.items())
+    # Reuse named size constants when multiple array-parameters share extent.
+    size_groups: dict[int, list[str]] = {}
+    for nm, (_knd, nsz, _expr_f) in array_params.items():
+        size_groups.setdefault(nsz, []).append(nm)
+    used_names = set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays
+    size_name_for_n: dict[int, str] = {}
+    for nsz, names in sorted(size_groups.items()):
+        if len(names) < 2:
+            continue
+        base = "n_param"
+        cand = base
+        k = 2
+        while cand in used_names:
+            cand = f"{base}_{k}"
+            k += 1
+        used_names.add(cand)
+        size_name_for_n[nsz] = cand
+        int_param_pairs.append((cand, str(nsz)))
+    if int_param_pairs:
+        rhs = ", ".join(f"{k} = {v}" for k, v in int_param_pairs)
+        pbody.w(f"integer, parameter :: {rhs}")
+    for nm, (knd, nsz, expr_f) in sorted(array_params.items()):
+        n_decl = size_name_for_n.get(nsz, str(nsz))
+        if knd == "integer":
+            pbody.w(f"integer, parameter :: {nm}({n_decl}) = {expr_f}")
+        else:
+            pbody.w(f"real(kind=dp), parameter :: {nm}({n_decl}) = {expr_f}")
+
+    # Variables assigned from list-return function calls.
+    list_vars: dict[str, str] = {}
+    call_pat = re.compile(r"^([A-Za-z]\w*)\s*\(")
+    for st in main_stmts:
+        if isinstance(st, Assign):
+            m = call_pat.match(st.expr.strip())
+            if not m:
+                continue
+            fnm = m.group(1)
+            if fnm in list_specs:
+                list_vars[st.name] = _type_name_for_path(fnm, ())
+    for nm in list_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+    for nm in array_params:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+    if ints:
+        pbody.w("integer :: " + ", ".join(sorted(ints)))
+    if int_arrays:
+        pbody.w("integer, allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(int_arrays)))
+    if real_arrays:
+        pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(real_arrays)))
+    if real_scalars:
+        pbody.w("real(kind=dp) :: " + ", ".join(sorted(real_scalars)))
+    if list_vars:
+        for nm, tn in sorted(list_vars.items()):
+            pbody.w(f"type({tn}) :: {nm}")
+    pbody.w("")
+
+    need_rnorm_main = {"used": False}
+    emit_stmts(
+        pbody,
+        main_stmts,
+        need_rnorm_main,
+        set(params.keys()) | set(array_params.keys()),
+        helper_ctx=helper_ctx_main,
+    )
+
+    # Module procedures body (without header/footer).
+    mprocs = FEmit()
+    fn_needs_rnorm = False
+    for fn in funcs:
+        fn_needs_rnorm = emit_function(mprocs, fn, list_specs, helper_ctx=helper_ctx_mod) or fn_needs_rnorm
+        mprocs.w("")
+    if need_rnorm_main["used"] or fn_needs_rnorm:
+        mprocs.w("subroutine rnorm_vec(n, x)")
+        mprocs.w("integer, intent(in) :: n")
+        mprocs.w("real(kind=dp), allocatable, intent(inout) :: x(:)")
+        mprocs.w("integer :: i")
+        mprocs.w("real(kind=dp) :: u1, u2, r, t")
+        mprocs.w("if (allocated(x)) deallocate(x)")
+        mprocs.w("allocate(x(n))")
+        mprocs.w("i = 1")
+        mprocs.w("do while (i <= n)")
+        mprocs.push()
+        mprocs.w("call random_number(u1)")
+        mprocs.w("call random_number(u2)")
+        mprocs.w("if (u1 <= tiny(1.0_dp)) cycle")
+        mprocs.w("r = sqrt(-2.0_dp * log(u1))")
+        mprocs.w("t = 2.0_dp * acos(-1.0_dp) * u2")
+        mprocs.w("x(i) = r * cos(t)")
+        mprocs.w("if (i + 1 <= n) x(i + 1) = r * sin(t)")
+        mprocs.w("i = i + 2")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end subroutine rnorm_vec")
+        mprocs.w("")
+
+    helper_names = {
+        "runif_vec",
+        "rnorm_vec",
+        "random_choice2_prob",
+        "sample_int",
+        "quantile",
+        "dnorm",
+        "tail",
+        "cbind2",
+        "cbind",
+        "numeric",
+        "pmax",
+        "sd",
+    }
+    mod_needed: set[str] = set()
+    main_needed: set[str] = set()
+    nr_mod = helper_ctx_mod.get("need_r_mod")
+    nr_main = helper_ctx_main.get("need_r_mod")
+    if isinstance(nr_mod, set):
+        mod_needed.update(nr_mod)
+    if isinstance(nr_main, set):
+        main_needed.update(nr_main)
+    mod_text_now = "\n".join(mprocs.lines)
+    main_text_now = "\n".join(pbody.lines)
+    for hn in helper_names:
+        if re.search(rf"\b{re.escape(hn)}\s*\(", mod_text_now):
+            mod_needed.add(hn)
+        if re.search(rf"\b{re.escape(hn)}\s*\(", main_text_now):
+            main_needed.add(hn)
 
     o = FEmit()
-    o.w(f"program {unit_name}")
-    o.push()
+    o.w(f"module {module_name}")
     o.w("use, intrinsic :: iso_fortran_env, only: real64")
     o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
+    if ("r_mod" in helper_modules) and mod_needed:
+        o.w("use r_mod, only: " + ", ".join(sorted(mod_needed)))
     o.w("implicit none")
     o.w("integer, parameter :: dp = real64")
     # Derived types for list-return functions.
@@ -1609,6 +2007,8 @@ def transpile_r_to_fortran(src: str, stem: str, helper_modules: set[str] | None 
                         o.w(f"integer :: {k}")
                     elif re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_int_arrays:
                         o.w(f"integer, allocatable :: {k}(:)")
+                    elif txt.startswith("cbind(") or txt.startswith("cbind2("):
+                        o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
                     elif k in {"pi", "mu", "sigma", "x", "z", "resp", "cluster", "loglik"}:
                         o.w(f"real(kind=dp), allocatable :: {k}(:)")
                     elif txt.startswith("c(") or txt.startswith("[") or txt.startswith("runif(") or txt.startswith("rnorm("):
@@ -1621,85 +2021,21 @@ def transpile_r_to_fortran(src: str, stem: str, helper_modules: set[str] | None 
                             o.w(f"real(kind=dp) :: {k}")
             o.pop()
             o.w(f"end type {tname}")
-    for p, v in sorted(params.items()):
-        o.w(f"integer, parameter :: {p} = {v}")
-    # Variables assigned from list-return function calls.
-    list_vars: dict[str, str] = {}
-    call_pat = re.compile(r"^([A-Za-z]\w*)\s*\(")
-    for st in main_stmts:
-        if isinstance(st, Assign):
-            m = call_pat.match(st.expr.strip())
-            if not m:
-                continue
-            fnm = m.group(1)
-            if fnm in list_specs:
-                list_vars[st.name] = _type_name_for_path(fnm, ())
-    for nm in list_vars:
-        ints.discard(nm)
-        real_scalars.discard(nm)
-        int_arrays.discard(nm)
-        real_arrays.discard(nm)
-    if ints:
-        o.w("integer :: " + ", ".join(sorted(ints)))
-    if int_arrays:
-        o.w("integer, allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(int_arrays)))
-    if real_arrays:
-        o.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(real_arrays)))
-    if real_scalars:
-        o.w("real(kind=dp) :: " + ", ".join(sorted(real_scalars)))
-    if list_vars:
-        for nm, tn in sorted(list_vars.items()):
-            o.w(f"type({tn}) :: {nm}")
-    o.w("")
-
-    need_rnorm = {"used": False}
-    emit_stmts(o, main_stmts, need_rnorm, set(params.keys()), helper_ctx=helper_ctx)
-    need_contains = bool(funcs) or need_rnorm["used"]
-    fn_needs_rnorm = False
+    need_contains = bool(funcs) or need_rnorm_main["used"] or fn_needs_rnorm
     if need_contains:
         o.w("")
         o.w("contains")
         o.w("")
-    for fn in funcs:
-        fn_needs_rnorm = emit_function(o, fn, list_specs, helper_ctx=helper_ctx) or fn_needs_rnorm
-        o.w("")
-    if need_rnorm["used"] or fn_needs_rnorm:
-        o.w("subroutine rnorm_vec(n, x)")
-        o.push()
-        o.w("integer, intent(in) :: n")
-        o.w("real(kind=dp), allocatable, intent(inout) :: x(:)")
-        o.w("integer :: i")
-        o.w("real(kind=dp) :: u1, u2, r, t")
-        o.w("if (allocated(x)) deallocate(x)")
-        o.w("allocate(x(n))")
-        o.w("i = 1")
-        o.w("do while (i <= n)")
-        o.push()
-        o.w("call random_number(u1)")
-        o.w("call random_number(u2)")
-        o.w("if (u1 <= tiny(1.0_dp)) cycle")
-        o.w("r = sqrt(-2.0_dp * log(u1))")
-        o.w("t = 2.0_dp * acos(-1.0_dp) * u2")
-        o.w("x(i) = r * cos(t)")
-        o.w("if (i + 1 <= n) x(i + 1) = r * sin(t)")
-        o.w("i = i + 2")
-        o.pop()
-        o.w("end do")
-        o.pop()
-        o.w("end subroutine rnorm_vec")
-
-    need_r_mod = helper_ctx.get("need_r_mod")
-    if helper_ctx.get("has_r_mod") and isinstance(need_r_mod, set) and need_r_mod:
-        use_line = "   use r_mod, only: " + ", ".join(sorted(str(x) for x in need_r_mod))
-        # Program header layout:
-        # 0: program ...
-        # 1..: indented USE/implicit declarations.
-        insert_at = 1
-        while insert_at < len(o.lines) and o.lines[insert_at].lstrip().lower().startswith("use, intrinsic"):
-            insert_at += 1
-        o.lines.insert(insert_at, use_line)
-
-    o.pop()
+        o.lines.extend(mprocs.lines)
+    o.w(f"end module {module_name}")
+    o.w("")
+    o.w(f"program {unit_name}")
+    o.w(f"use {module_name}")
+    o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
+    if ("r_mod" in helper_modules) and main_needed:
+        o.w("use r_mod, only: " + ", ".join(sorted(main_needed)))
+    o.w("implicit none")
+    o.lines.extend(pbody.lines)
     o.w(f"end program {unit_name}")
     return o.text()
 
@@ -1773,6 +2109,33 @@ def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     return out
 
 
+def _run_capture(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run command with robust text decoding on Windows."""
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def _print_captured(cp: subprocess.CompletedProcess[str], normalize_num_output: bool = False) -> None:
+    out = cp.stdout or ""
+    err = cp.stderr or ""
+    if normalize_num_output:
+        out = fscan.normalize_numeric_leading_zeros_text(out)
+        err = fscan.normalize_numeric_leading_zeros_text(err)
+    if out.strip():
+        txt = out.rstrip()
+        try:
+            print(txt)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((txt + "\n").encode("utf-8", errors="replace"))
+            sys.stdout.flush()
+    if err.strip():
+        txt = err.rstrip()
+        try:
+            print(txt)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((txt + "\n").encode("utf-8", errors="replace"))
+            sys.stdout.flush()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Partial R-to-Fortran transpiler")
     ap.add_argument("input_r", help="input .R/.r source file")
@@ -1803,6 +2166,11 @@ def main() -> int:
     )
     ap.add_argument("--compiler", default="gfortran -O3 -march=native -flto -Wfatal-errors", help='compiler command, e.g. "gfortran -O2 -Wall"')
     ap.add_argument("--rscript", default="rscript", help="command to run R scripts")
+    ap.add_argument(
+        "--normalize-num-output",
+        action="store_true",
+        help="normalize Fortran run output numeric tokens like .5/-.5 to 0.5/-0.5",
+    )
     args = ap.parse_args()
 
     if args.time_both:
@@ -1837,22 +2205,16 @@ def main() -> int:
     if args.time_both or args.run_both:
         cmd = [args.rscript, str(in_path)]
         t0 = time.perf_counter() if args.time_both else None
-        r_run = subprocess.run(cmd, capture_output=True, text=True)
+        r_run = _run_capture(cmd)
         if args.time_both:
             timings["r_run"] = time.perf_counter() - t0
         print("Run (r):", " ".join(cmd))
         if r_run.returncode != 0:
             print(f"Run (r): FAIL (exit {r_run.returncode})")
-            if r_run.stdout.strip():
-                print(r_run.stdout.rstrip())
-            if r_run.stderr.strip():
-                print(r_run.stderr.rstrip())
+            _print_captured(r_run)
             return r_run.returncode
         print("Run (r): PASS")
-        if r_run.stdout.strip():
-            print(r_run.stdout.rstrip())
-        if r_run.stderr.strip():
-            print(r_run.stderr.rstrip())
+        _print_captured(r_run)
 
     t0 = time.perf_counter()
     src = in_path.read_text(encoding="utf-8")
@@ -1876,9 +2238,12 @@ def main() -> int:
     f90_lines = fscan.collapse_single_stmt_if_blocks(f90_lines)
     if not args.no_format_print:
         f90_lines = fscan.rewrite_list_directed_print_reals(f90_lines, real_fmt=args.real_print_fmt)
+    f90_lines = fscan.compact_repeated_edit_descriptors(f90_lines)
+    f90_lines = fscan.coalesce_simple_declarations(f90_lines, max_len=80)
+    f90_lines = fscan.wrap_long_declaration_lines(f90_lines, max_len=80)
     f90_lines = normalize_fortran_lines(f90_lines, max_consecutive_blank=1)
     f90_lines = fscan.wrap_long_fortran_lines(f90_lines, max_len=80)
-    f90 = fscan.indent_fortran_blocks("\n".join(f90_lines) + ("\n" if f90.endswith("\n") else ""), indent_step=3)
+    f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     f90 = f"! transpiled by xr2f.py from {in_path.name} on {stamp}\n" + f90
     out_path.write_text(f90, encoding="utf-8")
@@ -1902,37 +2267,31 @@ def main() -> int:
             print("Compile options:", " ".join(cparts[1:]) if len(cparts) > 1 else "<none>")
         print("Build:", " ".join(cmd))
         t0 = time.perf_counter()
-        cp = subprocess.run(cmd, capture_output=True, text=True)
+        cp = _run_capture(cmd)
         timings["compile"] = time.perf_counter() - t0
         if cp.returncode != 0:
             print(f"Build: FAIL (exit {cp.returncode})")
-            if cp.stdout.strip():
-                print(cp.stdout.rstrip())
-            if cp.stderr.strip():
-                print(cp.stderr.rstrip())
+            _print_captured(cp)
             return cp.returncode
         print("Build: PASS")
 
         if args.run:
             t0 = time.perf_counter()
-            frun = subprocess.run([str(exe)], capture_output=True, text=True)
+            frun = _run_capture([str(exe)])
             timings["fortran_run"] = time.perf_counter() - t0
             if frun.returncode != 0:
                 print(f"Run: FAIL (exit {frun.returncode})")
-                if frun.stdout.strip():
-                    print(frun.stdout.rstrip())
-                if frun.stderr.strip():
-                    print(frun.stderr.rstrip())
+                _print_captured(frun)
                 return frun.returncode
             print("Run: PASS")
-            if frun.stdout.strip():
-                print(frun.stdout.rstrip())
-            if frun.stderr.strip():
-                print(frun.stderr.rstrip())
+            _print_captured(frun, normalize_num_output=args.normalize_num_output)
 
             if args.run_diff and r_run is not None:
                 r_lines = _norm_output((r_run.stdout or "") + (("\n" + r_run.stderr) if r_run.stderr else ""))
-                f_lines = _norm_output((frun.stdout or "") + (("\n" + frun.stderr) if frun.stderr else ""))
+                f_blob = (frun.stdout or "") + (("\n" + frun.stderr) if frun.stderr else "")
+                if args.normalize_num_output:
+                    f_blob = fscan.normalize_numeric_leading_zeros_text(f_blob)
+                f_lines = _norm_output(f_blob)
                 if r_lines == f_lines:
                     print("Run diff: MATCH")
                 else:
