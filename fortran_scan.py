@@ -1012,6 +1012,10 @@ def simplify_redundant_parens_in_stmt(stmt: str) -> str:
     if m_if:
         cond = strip_redundant_outer_parens_expr(m_if.group(2))
         return f"{m_if.group(1)}{cond}{m_if.group(3)}"
+    m_do_while = re.match(r"^(\s*do\s+while\s*\()(.+?)(\)\s*)$", s, re.IGNORECASE)
+    if m_do_while:
+        cond = strip_redundant_outer_parens_expr(m_do_while.group(2))
+        return f"{m_do_while.group(1)}{cond}{m_do_while.group(3)}"
     m_asn = re.match(r"^(\s*[^!]*?=\s*)(.+)$", s)
     if m_asn:
         rhs = strip_redundant_outer_parens_expr(m_asn.group(2))
@@ -1037,6 +1041,10 @@ def simplify_redundant_parens_in_line(line: str) -> str:
     code, comment = _split_code_comment(line.rstrip("\r\n"))
     eol = _line_eol(line)
     s = simplify_redundant_parens_in_stmt(code)
+    if re.match(r"^\s*if\s*\(.+\)\s*then\s*$", s, re.IGNORECASE):
+        return f"{s}{comment}{eol}"
+    if re.match(r"^\s*do\s+while\s*\(.+\)\s*$", s, re.IGNORECASE):
+        return f"{s}{comment}{eol}"
 
     # Remove parentheses around simple atoms globally.
     atom_pat = re.compile(
@@ -1071,8 +1079,9 @@ def simplify_redundant_parens_in_line(line: str) -> str:
 
     # Unwrap one redundant nested layer around multiplicative groups:
     # "((X) * Y)" -> "(X) * Y", then previous passes can simplify further.
+    # Match only single * or / operators here; do not split exponentiation (**).
     nested_mul_pat = re.compile(
-        r"\(\s*\(\s*([^()]+?)\s*\)\s*([*/])\s*([^()]+?)\s*\)",
+        r"\(\s*\(\s*([^()]+?)\s*\)\s*((?<!\*)[*/](?!\*))\s*([^()]+?)\s*\)",
         re.IGNORECASE,
     )
     prev = None
