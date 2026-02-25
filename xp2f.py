@@ -23,12 +23,14 @@ import subprocess
 import time
 import difflib
 import io
+import copy
 import tokenize
 from datetime import datetime
+import xparam
+import xunused
 from fortran_scan import (
     coalesce_simple_declarations,
     ensure_space_before_inline_comments,
-    prune_unused_use_only_lines,
     remove_empty_if_blocks,
     simplify_redundant_parens_in_lines,
     simplify_integer_arithmetic_in_lines,
@@ -169,10 +171,59 @@ def const_int_expr_to_fortran(node, allowed_names=None):
     return None
 
 
+def const_real_expr_to_fortran(node, allowed_names=None):
+    """Return Fortran real-constant expression text or None if unsupported."""
+    if allowed_names is None:
+        allowed_names = set()
+
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return f"{v}.0_dp"
+        if isinstance(v, float):
+            return f"{repr(v)}_dp"
+        return None
+
+    if isinstance(node, ast.Name):
+        if node.id in allowed_names:
+            return node.id
+        return None
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        inner = const_real_expr_to_fortran(node.operand, allowed_names)
+        if inner is None:
+            return None
+        if isinstance(node.op, ast.UAdd):
+            return f"(+{inner})"
+        return f"(-{inner})"
+
+    if isinstance(node, ast.BinOp):
+        left = const_real_expr_to_fortran(node.left, allowed_names)
+        right = const_real_expr_to_fortran(node.right, allowed_names)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return f"({left} + {right})"
+        if isinstance(node.op, ast.Sub):
+            return f"({left} - {right})"
+        if isinstance(node.op, ast.Mult):
+            return f"({left} * {right})"
+        if isinstance(node.op, ast.Div):
+            return f"({left} / {right})"
+        if isinstance(node.op, ast.Pow):
+            return f"({left} ** {right})"
+        return None
+
+    return None
+
+
 def find_parameters(tree):
-    # module-level integer constant expression assigned once => integer, parameter
+    # module-level constant expressions assigned once => typed Fortran PARAMETERs
     counts = count_assignments(tree)
     params = {}
+    param_types = {}
     for node in tree.body:
         if not (
             isinstance(node, ast.Assign)
@@ -183,10 +234,23 @@ def find_parameters(tree):
         k = node.targets[0].id
         if counts.get(k, 0) != 1:
             continue
-        expr_txt = const_int_expr_to_fortran(node.value, allowed_names=set(params.keys()))
+        int_names = {nm for nm, kind in param_types.items() if kind == "integer"}
+        expr_txt = const_int_expr_to_fortran(node.value, allowed_names=int_names)
         if expr_txt is not None:
-            params[k] = strip_redundant_outer_parens_expr(expr_txt)
-    return params
+            expr_txt = strip_redundant_outer_parens_expr(expr_txt)
+            ok, _why = xparam.is_parameter_safe_expr(expr_txt, set(params.keys()))
+            if ok:
+                params[k] = expr_txt
+                param_types[k] = "integer"
+                continue
+        real_txt = const_real_expr_to_fortran(node.value, allowed_names=set(params.keys()))
+        if real_txt is not None:
+            real_txt = strip_redundant_outer_parens_expr(real_txt)
+            ok, _why = xparam.is_parameter_safe_expr(real_txt, set(params.keys()))
+            if ok:
+                params[k] = real_txt
+                param_types[k] = "real"
+    return params, param_types
 
 
 def const_comment(name, tree):
@@ -550,6 +614,80 @@ def inline_shape_comments(lines):
     return out
 
 
+def prune_unused_intrinsic_use_only_lines(lines):
+    """
+    Prune only `use, intrinsic :: ... , only: ...` entities that are unused.
+    Avoid touching non-intrinsic helper-module imports.
+    """
+    out = list(lines)
+    use_re = re.compile(
+        r"^(?P<indent>\s*)use\s*,\s*intrinsic\s*::\s*(?P<mod>[a-z][a-z0-9_]*)\s*,\s*only\s*:\s*(?P<tail>.+)$",
+        re.IGNORECASE,
+    )
+    id_re = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+
+    # Build global usage (excluding USE lines themselves).
+    used = set()
+    for ln in out:
+        code = ln.split("!", 1)[0]
+        if re.match(r"^\s*use\b", code, re.IGNORECASE):
+            continue
+        for m in id_re.finditer(code):
+            used.add(m.group(1).lower())
+
+    new_lines = []
+    for ln in out:
+        code, bang, cmt = ln.partition("!")
+        m = use_re.match(code.rstrip())
+        if not m:
+            new_lines.append(ln)
+            continue
+        indent = m.group("indent")
+        mod = m.group("mod")
+        ents = [s.strip() for s in m.group("tail").split(",") if s.strip()]
+        keep = [e for e in ents if e.lower() in used]
+        if not keep:
+            continue
+        rebuilt = f"{indent}use, intrinsic :: {mod}, only: " + ", ".join(keep)
+        if bang:
+            rebuilt += bang + cmt
+        new_lines.append(rebuilt)
+    return new_lines
+
+
+def normalize_if_condition_parens(lines):
+    """Fix `if cond then` -> `if (cond) then` for simple conditions."""
+    out = []
+    pat = re.compile(r"^(\s*)if\s+([a-z][a-z0-9_]*)\s+then\s*$", re.IGNORECASE)
+    for ln in lines:
+        code, bang, cmt = ln.partition("!")
+        m = pat.match(code.rstrip())
+        if m:
+            code = f"{m.group(1)}if ({m.group(2)}) then"
+        out.append(code + (bang + cmt if bang else ""))
+    return out
+
+
+def promote_stop_to_error_stop(lines):
+    """Rewrite STOP statements to ERROR STOP in generated code."""
+    out = []
+    stop_re = re.compile(r"^(\s*)stop(\b.*)$", re.IGNORECASE)
+    err_re = re.compile(r"^\s*error\s+stop\b", re.IGNORECASE)
+    for ln in lines:
+        code, bang, cmt = ln.partition("!")
+        code_r = code.rstrip()
+        if err_re.match(code_r):
+            out.append(ln)
+            continue
+        m = stop_re.match(code_r)
+        if m:
+            new_code = f"{m.group(1)}error stop{m.group(2)}"
+            out.append(new_code + (bang + cmt if bang else ""))
+        else:
+            out.append(ln)
+    return out
+
+
 def add_pure_procedure_attrs_with_xpure(src_text, helper_uses=None, pure_helper_names=None):
     """
     Use xpure's Fortran-side analysis to add PURE where safely inferred.
@@ -757,6 +895,13 @@ def is_main_guard_if(node):
     return False
 
 
+def _attr_root_name(node):
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        cur = cur.value
+    return cur.id if isinstance(cur, ast.Name) else None
+
+
 def detect_needed_helpers(tree):
     needed = set()
 
@@ -809,6 +954,47 @@ def detect_needed_helpers(tree):
                 and node.func.attr == "argsort"
             ):
                 needed.add("argsort_real")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and not (_attr_root_name(node.func.value) in {"np", "math", "random"})
+            ):
+                attr = node.func.attr
+                if attr == "lower":
+                    needed.add("to_lower")
+                elif attr == "upper":
+                    needed.add("to_upper")
+                elif attr == "strip":
+                    needed.add("str_strip")
+                elif attr == "lstrip":
+                    needed.add("str_lstrip")
+                elif attr == "rstrip":
+                    needed.add("str_rstrip")
+                elif attr == "startswith":
+                    needed.add("starts_with")
+                elif attr == "endswith":
+                    needed.add("ends_with")
+                elif attr == "find":
+                    needed.add("str_find")
+                elif attr == "rfind":
+                    needed.add("str_rfind")
+                elif attr == "replace":
+                    needed.add("str_replace")
+                elif attr == "split":
+                    needed.add("str_split")
+                    needed.add("strvec_t")
+                elif attr == "join":
+                    needed.add("str_join")
+                    needed.add("strvec_t")
+                elif attr == "count":
+                    needed.add("str_count")
+                elif attr == "isdigit":
+                    needed.add("str_isdigit")
+                elif attr == "isalpha":
+                    needed.add("str_isalpha")
+                elif attr == "isalnum":
+                    needed.add("str_isalnum")
+                elif attr == "isspace":
+                    needed.add("str_isspace")
             if isinstance(node.func, ast.Name) and node.func.id == "print":
                 if len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "primes":
                     needed.add("print_int_list")
@@ -1338,6 +1524,8 @@ class translator(ast.NodeVisitor):
         tuple_return_out_kinds=None,
         dict_type_components=None,
         local_func_arg_ranks=None,
+        class_method_map=None,
+        class_ctor_fields=None,
     ):
         # context: "flat" | "compute" | "run_print"
         self.o = out
@@ -1346,6 +1534,9 @@ class translator(ast.NodeVisitor):
         self.list_counts = list_counts  # map list var -> count var
         self.ints = set()
         self.reals = set()
+        self.logs = set()
+        self.chars = set()
+        self.strvecs = set()
         self.alloc_logs = set()
         self.alloc_ints = set()
         self.alloc_reals = set()
@@ -1362,9 +1553,47 @@ class translator(ast.NodeVisitor):
         self.dict_typed_vars = {}
         self.dict_aliases = {}
         self.dict_type_components = dict(dict_type_components or {})
+        self.derived_ctor_types = set(self.dict_type_components.keys())
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
+        self.class_method_map = dict(class_method_map or {})
+        self.class_ctor_fields = dict(class_ctor_fields or {})
         self.dict_var_components = {}
         self.reserved_names = {"dp"}
+
+    def _ns_type_name_for_var(self, var_name):
+        return f"{var_name}_ns_t"
+
+    def _ensure_ns_type_for_var(self, var_name):
+        tname = self.dict_typed_vars.get(var_name, self._ns_type_name_for_var(var_name))
+        if tname not in self.dict_type_components:
+            self.dict_type_components[tname] = {}
+        self.derived_ctor_types = set(self.dict_type_components.keys())
+        self.dict_typed_vars[var_name] = tname
+        self.dict_var_components[var_name] = list(self.dict_type_components.get(tname, {}).keys())
+        self.ints.discard(var_name)
+        self.reals.discard(var_name)
+        self.logs.discard(var_name)
+        self.alloc_ints.discard(var_name)
+        self.alloc_reals.discard(var_name)
+        self.alloc_logs.discard(var_name)
+        self.chars.discard(var_name)
+        self.strvecs.discard(var_name)
+        return tname
+
+    def _infer_component_kind_rank(self, v):
+        ek = self._expr_kind(v)
+        rk = self._rank_expr(v)
+        if rk > 0:
+            if ek == "logical":
+                return "logical_array", max(1, rk)
+            if ek == "int":
+                return "int_array", max(1, rk)
+            return "real_array", max(1, rk)
+        if ek == "logical":
+            return "logical_scalar", 0
+        if ek == "real":
+            return "real_scalar", 0
+        return "int_scalar", 0
 
     def _mark_int(self, name):
         if name == "_":
@@ -1374,6 +1603,8 @@ class translator(ast.NodeVisitor):
         if name in self.params:
             return
         if name in self.reals:
+            return
+        if name in self.logs:
             return
         if name in self.alloc_ints or name in self.alloc_logs:
             return
@@ -1390,6 +1621,55 @@ class translator(ast.NodeVisitor):
             return
         self.reals.add(name)
         self.ints.discard(name)
+        self.logs.discard(name)
+        self.chars.discard(name)
+        self.strvecs.discard(name)
+
+    def _mark_log(self, name):
+        if name == "_":
+            return
+        if name in self.reserved_names:
+            return
+        if name in self.params:
+            return
+        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals:
+            return
+        self.logs.add(name)
+        self.ints.discard(name)
+        self.reals.discard(name)
+        self.chars.discard(name)
+        self.strvecs.discard(name)
+
+    def _mark_char(self, name):
+        if name == "_":
+            return
+        if name in self.reserved_names:
+            return
+        if name in self.params:
+            return
+        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals:
+            return
+        self.chars.add(name)
+        self.ints.discard(name)
+        self.reals.discard(name)
+        self.logs.discard(name)
+        self.strvecs.discard(name)
+
+    def _mark_strvec(self, name):
+        if name == "_":
+            return
+        if name in self.reserved_names:
+            return
+        if name in self.params:
+            return
+        self.strvecs.add(name)
+        self.ints.discard(name)
+        self.reals.discard(name)
+        self.logs.discard(name)
+        self.chars.discard(name)
+        self.alloc_logs.discard(name)
+        self.alloc_ints.discard(name)
+        self.alloc_reals.discard(name)
 
     def _mark_alloc_int(self, name):
         if name == "_":
@@ -1401,6 +1681,9 @@ class translator(ast.NodeVisitor):
         self.alloc_ints.add(name)
         self.ints.discard(name)
         self.reals.discard(name)
+        self.logs.discard(name)
+        self.chars.discard(name)
+        self.strvecs.discard(name)
         self.alloc_logs.discard(name)
         self.alloc_reals.discard(name)
 
@@ -1417,6 +1700,9 @@ class translator(ast.NodeVisitor):
         self.alloc_real_rank[name] = max(rank, self.alloc_real_rank.get(name, 1))
         self.ints.discard(name)
         self.reals.discard(name)
+        self.logs.discard(name)
+        self.chars.discard(name)
+        self.strvecs.discard(name)
         self.alloc_logs.discard(name)
         self.alloc_ints.discard(name)
 
@@ -1430,6 +1716,9 @@ class translator(ast.NodeVisitor):
         self.alloc_logs.add(name)
         self.ints.discard(name)
         self.reals.discard(name)
+        self.logs.discard(name)
+        self.chars.discard(name)
+        self.strvecs.discard(name)
         self.alloc_ints.discard(name)
         self.alloc_reals.discard(name)
 
@@ -1471,10 +1760,18 @@ class translator(ast.NodeVisitor):
                 return "int"
             if isinstance(node.value, float):
                 return "real"
+            if isinstance(node.value, str):
+                return "char"
             return None
         if isinstance(node, ast.Name):
             if node.id in self.dict_typed_vars:
                 return None
+            if node.id in self.strvecs:
+                return "strvec"
+            if node.id in self.chars:
+                return "char"
+            if node.id in self.logs:
+                return "logical"
             if node.id in self.reals:
                 return "real"
             if node.id in self.ints:
@@ -1489,6 +1786,12 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.UnaryOp):
             return self._expr_kind(node.operand)
         if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.BitXor):
+                lk = self._expr_kind(node.left)
+                rk = self._expr_kind(node.right)
+                if lk == "logical" and rk == "logical":
+                    return "logical"
+                return "int"
             if isinstance(node.op, ast.Div):
                 return "real"
             lk = self._expr_kind(node.left)
@@ -1538,6 +1841,33 @@ class translator(ast.NodeVisitor):
             return None
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
+                if node.func.id == "_f_size":
+                    if len(node.args) == 1:
+                        return f"size({self.expr(node.args[0])})"
+                    if len(node.args) >= 2:
+                        return f"size({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                    raise NotImplementedError("_f_size requires at least one argument")
+                if node.func.id == "_f_spread":
+                    if len(node.args) < 1:
+                        raise NotImplementedError("_f_spread requires array argument")
+                    arr = self.expr(node.args[0])
+                    dim_expr = "1"
+                    nc_expr = "1"
+                    if len(node.args) >= 2:
+                        dim_expr = self.expr(node.args[1])
+                    if len(node.args) >= 3:
+                        nc_expr = self.expr(node.args[2])
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg == "dim":
+                            dim_expr = self.expr(kw.value)
+                        elif kw.arg == "ncopies":
+                            nc_expr = self.expr(kw.value)
+                    return f"spread({arr}, dim={dim_expr}, ncopies={nc_expr})"
+                if node.func.id == "_f_assign_array":
+                    # Functional helper used by xf2p.py; expression value is RHS.
+                    if len(node.args) >= 2:
+                        return self.expr(node.args[1])
+                    raise NotImplementedError("_f_assign_array requires lhs,rhs")
                 if node.func.id in self.local_func_arg_ranks:
                     ranks = self.local_func_arg_ranks.get(node.func.id, [])
                     parts = []
@@ -1566,6 +1896,24 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.id in {"int", "isqrt", "size", "len"}:
                     return "int"
+                if node.func.id in {"open"}:
+                    return "int"
+                if node.func.id in {
+                    "to_lower",
+                    "to_upper",
+                    "str_strip",
+                    "str_lstrip",
+                    "str_rstrip",
+                    "str_replace",
+                    "str_join",
+                }:
+                    return "char"
+                if node.func.id in {"str_split"}:
+                    return "strvec"
+                if node.func.id in {"starts_with", "ends_with", "str_isdigit", "str_isalpha", "str_isalnum", "str_isspace"}:
+                    return "logical"
+                if node.func.id in {"str_find", "str_rfind", "str_count"}:
+                    return "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -1589,10 +1937,19 @@ class translator(ast.NodeVisitor):
                 if "int" in dtype_txt:
                     return "int"
                 return self._expr_kind(node.args[0])
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr in {"lower", "upper", "strip", "lstrip", "rstrip", "replace", "join"}:
+                    return "char"
+                if node.func.attr in {"split"}:
+                    return "strvec"
+                if node.func.attr in {"startswith", "endswith", "isdigit", "isalpha", "isalnum", "isspace"}:
+                    return "logical"
+                if node.func.attr in {"find", "rfind", "count"}:
+                    return "int"
             if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
                 if node.func.attr == "copy" and len(node.args) == 0:
                     return self._expr_kind(node.func.value)
-                if node.func.value.id in {"math", "np"} and node.func.attr == "sqrt":
+                if node.func.value.id in {"math", "np"} and node.func.attr in {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan"}:
                     return "real"
                 if node.func.value.id == "random" and node.func.attr == "random":
                     return "real"
@@ -1908,6 +2265,19 @@ class translator(ast.NodeVisitor):
             return 0
         return self._rank_expr(node)
 
+    def _ifexp_safe_for_merge(self, node):
+        if not isinstance(node, ast.IfExp):
+            return False
+
+        def _trivial_term(t):
+            if isinstance(t, ast.Name):
+                return self._rank_expr(t) == 0
+            if isinstance(t, ast.Constant):
+                return isinstance(t.value, (bool, int, float))
+            return False
+
+        return _trivial_term(node.body) and _trivial_term(node.orelse)
+
     def expr(self, node):
         def _module_attr_root_name(n):
             cur = n
@@ -1934,9 +2304,28 @@ class translator(ast.NodeVisitor):
                 return "-1"
             raise NotImplementedError("unsupported constant")
 
+        if isinstance(node, (ast.List, ast.Tuple)):
+            # Python sequence literals used as value expressions map to
+            # Fortran array constructors.
+            return "[" + ", ".join(self.expr(e) for e in node.elts) + "]"
+
+        if isinstance(node, ast.IfExp):
+            # Python conditional expression: a if cond else b
+            # MERGE is only safe when both branches are trivial scalar terms.
+            # Otherwise callers should lower with explicit IF blocks.
+            if not self._ifexp_safe_for_merge(node):
+                raise NotImplementedError("unsafe if-expression requires statement lowering")
+            return f"merge({self.expr(node.body)}, {self.expr(node.orelse)}, {self.expr(node.test)})"
+
         if isinstance(node, ast.BinOp):
             op = type(node.op)
             opmap = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/", ast.FloorDiv: "/", ast.Mod: "mod", ast.Pow: "**"}
+            if op is ast.BitXor:
+                a = self.expr(node.left)
+                b = self.expr(node.right)
+                if self._expr_kind(node.left) == "logical" and self._expr_kind(node.right) == "logical":
+                    return f"({a} .neqv. {b})"
+                return f"ieor({a}, {b})"
             if op not in opmap:
                 raise NotImplementedError("unsupported binop")
             a0 = self.expr(node.left)
@@ -2108,7 +2497,15 @@ class translator(ast.NodeVisitor):
                     return f"{base}(:, ({self.expr(a1)} + 1))"
                 if full1 and (not full0) and (not none0):
                     return f"{base}(({self.expr(a0)} + 1), :)"
-                raise NotImplementedError("only [None,:] and [:,None] tuple subscripts are supported")
+                if (not full0) and (not full1) and (not none0) and (not none1):
+                    return f"{base}(({self.expr(a0)} + 1), ({self.expr(a1)} + 1))"
+                sub_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
+                raise NotImplementedError(
+                    f"only [None,:] and [:,None] tuple subscripts are supported (got: {sub_txt})"
+                )
+            # Boolean-mask indexing: x[mask] -> pack(x, mask)
+            if self._expr_kind(node.slice) == "logical":
+                return f"pack({base}, {self.expr(node.slice)})"
             # Python emitters in this project use 0-based forms like (i)-1;
             # map those back to natural Fortran 1-based indexing.
             if (
@@ -2141,6 +2538,24 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
                 return self.expr(node.func.value)
+            # Simple class method call lowering:
+            #   obj.m(a,b) -> Class_m(obj,a,b)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.dict_typed_vars
+            ):
+                obj = node.func.value.id
+                tname = self.dict_typed_vars.get(obj)
+                mname = node.func.attr
+                lowered = self.class_method_map.get((tname, mname))
+                if lowered is not None:
+                    args_nodes = [node.func.value] + list(node.args)
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg is None:
+                            raise NotImplementedError("**kwargs not supported")
+                        args_nodes.append(kw.value)
+                    return f"{lowered}(" + ", ".join(self.expr(a) for a in args_nodes) + ")"
             # Method-call reductions: a.sum(), a.mean(), a.var(ddof=...)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -2167,7 +2582,7 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         if self._expr_kind(node.func.value) == "logical":
                             return f"(real(count({base_expr}), kind=dp) / real(size({base_expr}), kind=dp))"
-                        return f"mean_1d({base_expr})"
+                        return f"(sum({base_expr}) / real(size({base_expr}), kind=dp))"
                     dim_expr = f"({self.expr(axis_node)} + 1)"
                     return f"(sum({base_expr}, dim={dim_expr}) / real(size({base_expr}, dim={dim_expr}), kind=dp))"
                 if attr == "var":
@@ -2185,6 +2600,70 @@ class translator(ast.NodeVisitor):
                     return f"var_1d({base_expr}, {self.expr(ddof_node)})"
                 if attr == "ravel":
                     return f"reshape({base_expr}, [size({base_expr})])"
+                if attr == "lower":
+                    return f"to_lower({base_expr})"
+                if attr == "upper":
+                    return f"to_upper({base_expr})"
+                if attr == "strip":
+                    if len(node.args) == 0:
+                        return f"str_strip({base_expr})"
+                    if len(node.args) == 1:
+                        return f"str_strip({base_expr}, {self.expr(node.args[0])})"
+                    raise NotImplementedError("strip() supports at most one argument")
+                if attr == "lstrip":
+                    if len(node.args) == 0:
+                        return f"str_lstrip({base_expr})"
+                    if len(node.args) == 1:
+                        return f"str_lstrip({base_expr}, {self.expr(node.args[0])})"
+                    raise NotImplementedError("lstrip() supports at most one argument")
+                if attr == "rstrip":
+                    if len(node.args) == 0:
+                        return f"str_rstrip({base_expr})"
+                    if len(node.args) == 1:
+                        return f"str_rstrip({base_expr}, {self.expr(node.args[0])})"
+                    raise NotImplementedError("rstrip() supports at most one argument")
+                if attr == "startswith":
+                    if len(node.args) != 1:
+                        raise NotImplementedError("startswith() supports one argument")
+                    return f"starts_with({base_expr}, {self.expr(node.args[0])})"
+                if attr == "endswith":
+                    if len(node.args) != 1:
+                        raise NotImplementedError("endswith() supports one argument")
+                    return f"ends_with({base_expr}, {self.expr(node.args[0])})"
+                if attr == "find":
+                    if len(node.args) != 1:
+                        raise NotImplementedError("find() supports one argument")
+                    return f"str_find({base_expr}, {self.expr(node.args[0])})"
+                if attr == "rfind":
+                    if len(node.args) != 1:
+                        raise NotImplementedError("rfind() supports one argument")
+                    return f"str_rfind({base_expr}, {self.expr(node.args[0])})"
+                if attr == "replace":
+                    if len(node.args) != 2:
+                        raise NotImplementedError("replace() supports exactly two arguments")
+                    return f"str_replace({base_expr}, {self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                if attr == "split":
+                    if len(node.args) == 0:
+                        return f"str_split({base_expr})"
+                    if len(node.args) == 1:
+                        return f"str_split({base_expr}, {self.expr(node.args[0])})"
+                    raise NotImplementedError("split() supports at most one argument")
+                if attr == "join":
+                    if len(node.args) != 1:
+                        raise NotImplementedError("join() supports one argument")
+                    return f"str_join({base_expr}, {self.expr(node.args[0])})"
+                if attr == "count":
+                    if len(node.args) != 1:
+                        raise NotImplementedError("count() supports one argument")
+                    return f"str_count({base_expr}, {self.expr(node.args[0])})"
+                if attr == "isdigit":
+                    return f"str_isdigit({base_expr})"
+                if attr == "isalpha":
+                    return f"str_isalpha({base_expr})"
+                if attr == "isalnum":
+                    return f"str_isalnum({base_expr})"
+                if attr == "isspace":
+                    return f"str_isspace({base_expr})"
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 return f"isqrt_int({self.expr(node.args[0])})"
@@ -2198,7 +2677,77 @@ class translator(ast.NodeVisitor):
                 a0 = node.args[0]
                 if isinstance(a0, ast.Name) and a0.id in self.list_counts:
                     return self.list_counts[a0.id]
+                if self._expr_kind(a0) == "strvec":
+                    return f"size({self.expr(a0)}%v)"
+                if self._expr_kind(a0) == "char":
+                    return f"len({self.expr(a0)})"
                 return f"size({self.expr(a0)})"
+            if isinstance(node.func, ast.Name) and node.func.id == "_f_size":
+                if len(node.args) == 1:
+                    return f"size({self.expr(node.args[0])})"
+                if len(node.args) >= 2:
+                    return f"size({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                raise NotImplementedError("_f_size requires at least one argument")
+            if isinstance(node.func, ast.Name) and node.func.id == "_f_spread":
+                if len(node.args) < 1:
+                    raise NotImplementedError("_f_spread requires array argument")
+                arr = self.expr(node.args[0])
+                dim_expr = "1"
+                nc_expr = "1"
+                if len(node.args) >= 2:
+                    dim_expr = self.expr(node.args[1])
+                if len(node.args) >= 3:
+                    nc_expr = self.expr(node.args[2])
+                for kw in getattr(node, "keywords", []):
+                    if kw.arg == "dim":
+                        dim_expr = self.expr(kw.value)
+                    elif kw.arg == "ncopies":
+                        nc_expr = self.expr(kw.value)
+                return f"spread({arr}, dim={dim_expr}, ncopies={nc_expr})"
+            if isinstance(node.func, ast.Name) and node.func.id == "_f_assign_array":
+                if len(node.args) >= 2:
+                    return self.expr(node.args[1])
+                raise NotImplementedError("_f_assign_array requires lhs,rhs")
+            if isinstance(node.func, ast.Name) and node.func.id == "SimpleNamespace":
+                if len(node.args) != 0:
+                    raise NotImplementedError("SimpleNamespace positional arguments are not supported")
+                # Try to resolve by exact component-key match for keyword constructor form.
+                kw_names = [kw.arg for kw in getattr(node, "keywords", []) if kw.arg is not None]
+                if not kw_names:
+                    raise NotImplementedError(
+                        "SimpleNamespace() cannot be used as an expression without assignment target"
+                    )
+                kset = set(kw_names)
+                matches = []
+                for tnm, cmap in self.dict_type_components.items():
+                    if set(cmap.keys()) == kset:
+                        matches.append(tnm)
+                if len(matches) == 1:
+                    tname = matches[0]
+                elif len(matches) > 1:
+                    tname = sorted(matches)[0]
+                else:
+                    raise NotImplementedError(
+                        "SimpleNamespace keyword constructor needs a known inferred type in this scope"
+                    )
+                parts = [f"{kw.arg}={self.expr(kw.value)}" for kw in node.keywords if kw.arg is not None]
+                return f"{tname}(" + ", ".join(parts) + ")"
+            if isinstance(node.func, ast.Name) and node.func.id in self.derived_ctor_types:
+                parts = []
+                ctor_fields = self.class_ctor_fields.get(node.func.id, None)
+                if ctor_fields and len(node.args) > 0:
+                    for i, a in enumerate(node.args):
+                        if i < len(ctor_fields):
+                            parts.append(f"{ctor_fields[i]}={self.expr(a)}")
+                        else:
+                            parts.append(self.expr(a))
+                else:
+                    parts = [self.expr(a) for a in node.args]
+                for kw in getattr(node, "keywords", []):
+                    if kw.arg is None:
+                        raise NotImplementedError("**kwargs not supported in constructor")
+                    parts.append(f"{kw.arg}={self.expr(kw.value)}")
+                return f"{node.func.id}(" + ", ".join(parts) + ")"
             if isinstance(node.func, ast.Name):
                 args_nodes = list(node.args)
                 for kw in getattr(node, "keywords", []):
@@ -2314,10 +2863,26 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"sin", "cos", "tan", "asin", "acos", "atan"}
+                and len(node.args) == 1
+            ):
+                return f"{node.func.attr}({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "exp"
                 and len(node.args) == 1
             ):
                 return f"exp({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"arccos", "acos"}
+                and len(node.args) == 1
+            ):
+                return f"acos({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -2335,6 +2900,32 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 return f"reshape({a0}, [size({a0})])"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "reshape"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                shp = self.expr(node.args[1])
+                return f"reshape({a0}, {shp})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"float64", "float32", "float_"}
+                and len(node.args) == 1
+            ):
+                return f"real({self.expr(node.args[0])}, kind=dp)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"int64", "int32", "int_"}
+                and len(node.args) == 1
+            ):
+                return f"int({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Attribute):
                 arr = self.expr(node.func.value)
                 if node.func.attr == "mean" and len(node.args) == 0:
@@ -2379,10 +2970,10 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "math"
-                and node.func.attr == "sqrt"
+                and node.func.attr in {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan"}
                 and len(node.args) == 1
             ):
-                return f"sqrt({self.expr(node.args[0])})"
+                return f"{node.func.attr}({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -2411,6 +3002,31 @@ class translator(ast.NodeVisitor):
                 return "acos(-1.0_dp)"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "inf":
                 return "huge(1.0_dp)"
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "np"
+                and node.value.func.attr == "finfo"
+            ):
+                if node.attr == "tiny":
+                    return "tiny(1.0_dp)"
+                if node.attr in {"eps", "epsilon"}:
+                    return "epsilon(1.0_dp)"
+                if node.attr == "max":
+                    return "huge(1.0_dp)"
+                if node.attr == "min":
+                    return "(-huge(1.0_dp))"
+            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "random":
+                # RNG namespace object; only meaningful as method receiver.
+                return "0"
+            # Map Python attribute access on local objects/namespaces to
+            # Fortran derived-type component access.
+            if isinstance(node.value, ast.Name) and node.value.id not in {"np", "math", "random"}:
+                return f"{node.value.id}%{node.attr}"
+            if isinstance(node.value, ast.Attribute):
+                base = self.expr(node.value)
+                return f"{base}%{node.attr}"
             attr_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported attribute expr: {attr_txt}")
 
@@ -2423,6 +3039,19 @@ class translator(ast.NodeVisitor):
                     tname = node.target.id
                     ann_txt = ast.unparse(node.annotation) if hasattr(ast, "unparse") else ""
                     low_ann = ann_txt.lower()
+                    ann_base = ann_txt.split("[", 1)[0].strip()
+                    if ann_base in self.derived_ctor_types:
+                        self.dict_typed_vars[tname] = ann_base
+                        self.dict_var_components[tname] = list(self.dict_type_components.get(ann_base, {}).keys())
+                        self.ints.discard(tname)
+                        self.reals.discard(tname)
+                        self.alloc_ints.discard(tname)
+                        self.alloc_reals.discard(tname)
+                        self.alloc_logs.discard(tname)
+                        if node.value is not None:
+                            fake = ast.Assign(targets=[node.target], value=node.value)
+                            self.prescan([fake])
+                        continue
                     if "ndarray" in low_ann:
                         if "bool" in low_ann:
                             self._mark_alloc_log(tname)
@@ -2464,6 +3093,45 @@ class translator(ast.NodeVisitor):
                 t = node.targets[0]
                 v = node.value
 
+                # x = SimpleNamespace(...) -> infer a derived-type schema.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Name)
+                    and v.func.id == "SimpleNamespace"
+                ):
+                    tname = self._ensure_ns_type_for_var(t.id)
+                    comps = self.dict_type_components.setdefault(tname, {})
+                    for kw in getattr(v, "keywords", []):
+                        if kw.arg is None:
+                            continue
+                        ckind, crank = self._infer_component_kind_rank(kw.value)
+                        prev = comps.get(kw.arg, None)
+                        if prev is None:
+                            comps[kw.arg] = (ckind, crank)
+                        else:
+                            pk, pr = prev if isinstance(prev, tuple) else (prev, 0)
+                            # widen conservatively
+                            if "array" in pk or "array" in ckind:
+                                if pk.startswith("real") or ckind.startswith("real"):
+                                    nk = "real_array"
+                                elif pk.startswith("logical") and ckind.startswith("logical"):
+                                    nk = "logical_array"
+                                else:
+                                    nk = "int_array"
+                                nr = max(int(pr), int(crank), 1)
+                            else:
+                                if pk == "real_scalar" or ckind == "real_scalar":
+                                    nk = "real_scalar"
+                                elif pk == "logical_scalar" and ckind == "logical_scalar":
+                                    nk = "logical_scalar"
+                                else:
+                                    nk = "int_scalar"
+                                nr = 0
+                            comps[kw.arg] = (nk, nr)
+                    self.dict_var_components[t.id] = list(comps.keys())
+                    continue
+
                 if isinstance(t, ast.Name) and is_const_int(v):
                     self._mark_int(t.id)
 
@@ -2472,9 +3140,27 @@ class translator(ast.NodeVisitor):
 
                 # name = other_name  (needed for e.g. largest = i)
                 if isinstance(t, ast.Name) and isinstance(v, ast.Name):
+                    if v.id in self.dict_typed_vars:
+                        self.dict_typed_vars[t.id] = self.dict_typed_vars[v.id]
+                        self.dict_var_components[t.id] = list(
+                            self.dict_type_components.get(self.dict_typed_vars[v.id], {}).keys()
+                        )
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.strvecs.discard(t.id)
                     k = self._expr_kind(v)
                     if k == "real":
                         self._mark_real(t.id)
+                    elif k == "logical":
+                        self._mark_log(t.id)
+                    elif k == "char":
+                        self._mark_char(t.id)
+                    elif k == "strvec":
+                        self._mark_strvec(t.id)
                     elif k == "int":
                         self._mark_int(t.id)
                 if isinstance(t, ast.Name):
@@ -2537,6 +3223,12 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_real(t.id, rank=max(1, self._rank_expr(v)))
                     elif k == "real":
                         self._mark_real(t.id)
+                    elif k == "char":
+                        self._mark_char(t.id)
+                    elif k == "strvec":
+                        self._mark_strvec(t.id)
+                    elif k == "logical":
+                        self._mark_log(t.id)
                     elif k == "int":
                         self._mark_int(t.id)
                     elif (
@@ -2544,6 +3236,8 @@ class translator(ast.NodeVisitor):
                         and t.id not in self.alloc_ints
                         and t.id not in self.alloc_reals
                         and t.id not in self.alloc_logs
+                        and t.id not in self.chars
+                        and t.id not in self.strvecs
                     ):
                         # Python numeric default is real; use as fallback when kind
                         # inference is inconclusive.
@@ -2621,6 +3315,56 @@ class translator(ast.NodeVisitor):
                     self.alloc_ints.discard(t.id)
                     self.alloc_reals.discard(t.id)
                     self.alloc_logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.strvecs.discard(t.id)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Name)
+                    and v.func.id in self.derived_ctor_types
+                ):
+                    self.dict_typed_vars[t.id] = v.func.id
+                    self.dict_var_components[t.id] = list(self.dict_type_components.get(v.func.id, {}).keys())
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.strvecs.discard(t.id)
+                if (
+                    isinstance(t, ast.Attribute)
+                    and isinstance(t.value, ast.Name)
+                    and t.value.id in self.dict_typed_vars
+                ):
+                    base = t.value.id
+                    comp = t.attr
+                    tname = self.dict_typed_vars[base]
+                    comps = self.dict_type_components.setdefault(tname, {})
+                    ckind, crank = self._infer_component_kind_rank(v)
+                    prev = comps.get(comp, None)
+                    if prev is None:
+                        comps[comp] = (ckind, crank)
+                    else:
+                        pk, pr = prev if isinstance(prev, tuple) else (prev, 0)
+                        if "array" in pk or "array" in ckind:
+                            if pk.startswith("real") or ckind.startswith("real"):
+                                nk = "real_array"
+                            elif pk.startswith("logical") and ckind.startswith("logical"):
+                                nk = "logical_array"
+                            else:
+                                nk = "int_array"
+                            nr = max(int(pr), int(crank), 1)
+                        else:
+                            if pk == "real_scalar" or ckind == "real_scalar":
+                                nk = "real_scalar"
+                            elif pk == "logical_scalar" and ckind == "logical_scalar":
+                                nk = "logical_scalar"
+                            else:
+                                nk = "int_scalar"
+                            nr = 0
+                        comps[comp] = (nk, nr)
+                    self.dict_var_components[base] = list(comps.keys())
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Dict)
@@ -2962,6 +3706,8 @@ class translator(ast.NodeVisitor):
                 for nm in extract_target_names(node.target):
                     if nm in self.reals:
                         self._mark_real(nm)
+                    elif nm in self.logs:
+                        self._mark_log(nm)
                     else:
                         self._mark_int(nm)
 
@@ -2969,7 +3715,36 @@ class translator(ast.NodeVisitor):
                 if node.target.id == "_":
                     self._mark_int("i_")
                 else:
-                    self._mark_int(node.target.id)
+                    if (
+                        isinstance(node.iter, ast.Call)
+                        and isinstance(node.iter.func, ast.Name)
+                        and node.iter.func.id == "range"
+                    ):
+                        self._mark_int(node.target.id)
+                    elif isinstance(node.iter, (ast.List, ast.Tuple)) and len(node.iter.elts) > 0:
+                        ek = None
+                        for e in node.iter.elts:
+                            k = self._expr_kind(e)
+                            if k == "real":
+                                ek = "real"
+                                break
+                            if k == "logical":
+                                ek = "logical"
+                                break
+                            if k == "char":
+                                ek = "char"
+                            elif k == "int" and ek is None:
+                                ek = "int"
+                        if ek == "real":
+                            self._mark_real(node.target.id)
+                        elif ek == "logical":
+                            self._mark_log(node.target.id)
+                        elif ek == "char":
+                            self._mark_char(node.target.id)
+                        else:
+                            self._mark_int(node.target.id)
+                    else:
+                        self._mark_int(node.target.id)
                 self.prescan(node.body)
 
             if isinstance(node, ast.If):
@@ -3006,6 +3781,17 @@ class translator(ast.NodeVisitor):
         if isinstance(t, ast.Name) and t.id in self.reserved_names:
             # keep translator-owned kind parameters stable
             return
+
+        def _is_np_random_random_call(n):
+            return (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Attribute)
+                and isinstance(n.func.value.value, ast.Name)
+                and n.func.value.value.id == "np"
+                and n.func.value.attr == "random"
+                and n.func.attr == "random"
+            )
 
         # Parallel tuple/list assignment:
         #   a, b = b, a + b
@@ -3162,6 +3948,21 @@ class translator(ast.NodeVisitor):
         if isinstance(t, ast.Name) and t.id in self.params:
             return
 
+        # x = SimpleNamespace(...)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id == "SimpleNamespace"
+        ):
+            # Variable typing/schema is handled in prescan. Emit only component sets.
+            self._ensure_ns_type_for_var(t.id)
+            for kw in getattr(v, "keywords", []):
+                if kw.arg is None:
+                    raise NotImplementedError("SimpleNamespace(**kwargs) not supported")
+                self.o.w(self._with_inline_comment(f"{t.id}%{kw.arg} = {self.expr(kw.value)}", inline_comment))
+            return
+
         # d = {"k": expr, ...}
         if isinstance(t, ast.Name) and isinstance(v, ast.Dict):
             # If the target is a known typed-dict variable, emit component
@@ -3195,6 +3996,38 @@ class translator(ast.NodeVisitor):
             self.o.w(self._with_inline_comment(f"{t.id} = -1", inline_comment))
             return
 
+        # fp = open("file", "mode")
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id == "open"
+            and len(v.args) >= 1
+            and is_const_str(v.args[0])
+        ):
+            file_expr = self.expr(v.args[0])
+            mode = "r"
+            if len(v.args) >= 2 and is_const_str(v.args[1]):
+                mode = str(v.args[1].value)
+            status = "old"
+            action = "read"
+            position = None
+            if "w" in mode:
+                status = "replace"
+                action = "write"
+            elif "a" in mode:
+                status = "unknown"
+                action = "write"
+                position = "append"
+            elif "r" in mode:
+                status = "old"
+                action = "read"
+            spec = f"newunit={t.id}, file={file_expr}, status={fstr(status)}, action={fstr(action)}"
+            if position is not None:
+                spec = spec + f", position={fstr(position)}"
+            self.o.w(f"open({spec})")
+            return
+
         # x = random.random() -> call random_number(x)
         if (
             isinstance(t, ast.Name)
@@ -3211,14 +4044,54 @@ class translator(ast.NodeVisitor):
         # x = np.random.random() -> call random_number(x)
         if (
             isinstance(t, ast.Name)
-            and isinstance(v, ast.Call)
-            and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Attribute)
-            and isinstance(v.func.value.value, ast.Name)
-            and v.func.value.value.id == "np"
-            and v.func.value.attr == "random"
-            and v.func.attr == "random"
+            and _is_np_random_random_call(v)
             and len(v.args) == 0
+        ):
+            self.o.w(f"call random_number({t.id})")
+            return
+
+        # x[:] = np.random.random(size=x.shape)
+        if (
+            isinstance(t, ast.Subscript)
+            and isinstance(t.value, ast.Name)
+            and isinstance(t.slice, ast.Slice)
+            and t.slice.lower is None
+            and t.slice.upper is None
+            and t.slice.step is None
+            and _is_np_random_random_call(v)
+        ):
+            size_kw = None
+            for kw in v.keywords:
+                if kw.arg == "size":
+                    size_kw = kw.value
+                    break
+            # In this subset, treat size=... as shape hint only and fill target.
+            # This exactly matches common forms like size=x.shape.
+            self.o.w(f"call random_number({t.value.id})")
+            return
+
+        # x = np.float64(np.random.random()) / float(np.random.random())
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and (
+                (isinstance(v.func, ast.Name) and v.func.id == "float")
+                or (
+                    isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id == "np"
+                    and v.func.attr in {"float64", "float32", "float_"}
+                )
+            )
+            and len(v.args) == 1
+            and isinstance(v.args[0], ast.Call)
+            and isinstance(v.args[0].func, ast.Attribute)
+            and isinstance(v.args[0].func.value, ast.Attribute)
+            and isinstance(v.args[0].func.value.value, ast.Name)
+            and v.args[0].func.value.value.id == "np"
+            and v.args[0].func.value.attr == "random"
+            and v.args[0].func.attr == "random"
+            and len(v.args[0].args) == 0
         ):
             self.o.w(f"call random_number({t.id})")
             return
@@ -3890,6 +4763,11 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{self.expr(t)} = {self.expr(v)}")
             return
 
+        # attribute/component assignment, e.g. params.w = w
+        if isinstance(t, ast.Attribute):
+            self.o.w(self._with_inline_comment(f"{self.expr(t)} = {self.expr(v)}", inline_comment))
+            return
+
         # NEW: fallback for name = <simple expr>  (e.g., largest = i)
         if isinstance(t, ast.Name):
             if isinstance(v, ast.IfExp):
@@ -4067,8 +4945,6 @@ class translator(ast.NodeVisitor):
 
     def visit_For(self, node):
         self._emit_comments_for(node)
-        if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range"):
-            raise NotImplementedError("only for .. in range(..) supported")
         if not isinstance(node.target, ast.Name):
             raise NotImplementedError("for target must be a name")
 
@@ -4076,6 +4952,100 @@ class translator(ast.NodeVisitor):
         if var == "_":
             var = "i_"
             self._mark_int(var)
+
+        if isinstance(node.iter, (ast.List, ast.Tuple)):
+            elts = node.iter.elts
+            n_elts = len(elts)
+            if n_elts == 0:
+                return
+
+            def _fresh_local(base):
+                taken = set(self.ints) | set(self.reals) | set(self.logs) | set(self.alloc_ints) | set(self.alloc_reals) | set(self.alloc_logs) | set(self.params.keys()) | set(self.reserved_names)
+                nm = base
+                while nm in taken:
+                    nm = nm + "_"
+                return nm
+
+            kinds = [self._expr_kind(e) for e in elts]
+            if any(k == "real" for k in kinds):
+                iter_decl = "real(kind=dp)"
+                if node.target.id != "_":
+                    self._mark_real(var)
+            elif any(k == "logical" for k in kinds):
+                iter_decl = "logical"
+                if node.target.id != "_":
+                    self._mark_log(var)
+            else:
+                iter_decl = "integer"
+                if node.target.id != "_":
+                    self._mark_int(var)
+
+            idx = _fresh_local("i_for_")
+            vals = _fresh_local("vals_for_")
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {idx}")
+            vals_init = "[" + ", ".join(self.expr(e) for e in elts) + "]"
+
+            # Prefer local named constants when list elements are compile-time
+            # constant expressions. This avoids mutable temporaries for fixed
+            # iteration sets and improves downstream parameter analysis.
+            allowed = set(self.params.keys())
+            can_param = False
+            if iter_decl.startswith("real"):
+                can_param = all(const_real_expr_to_fortran(e, allowed_names=allowed) is not None for e in elts)
+            elif iter_decl == "integer":
+                can_param = all(const_int_expr_to_fortran(e, allowed_names=allowed) is not None for e in elts)
+            if can_param:
+                self.o.w(f"{iter_decl}, parameter :: {vals}({n_elts}) = {vals_init}")
+            else:
+                self.o.w(f"{iter_decl} :: {vals}(1:{n_elts})")
+                self.o.w(f"{vals} = {vals_init}")
+            self.o.w(f"do {idx} = 1, size({vals})")
+            self.o.push()
+            if node.target.id != "_":
+                self.o.w(f"{var} = {vals}({idx})")
+            for s in node.body:
+                self.visit(s)
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
+        # for x in arr: iterate rank-1 array by index instead of unrolling.
+        if isinstance(node.iter, ast.Name) and self._rank_expr(node.iter) == 1:
+            arr = node.iter.id
+
+            def _fresh_local(base):
+                taken = set(self.ints) | set(self.reals) | set(self.logs) | set(self.alloc_ints) | set(self.alloc_reals) | set(self.alloc_logs) | set(self.params.keys()) | set(self.reserved_names)
+                nm = base
+                while nm in taken:
+                    nm = nm + "_"
+                return nm
+
+            idx = _fresh_local("i_for_")
+            self._mark_int(idx)
+            self.o.w(f"do {idx} = 1, size({arr})")
+            self.o.push()
+            if node.target.id != "_":
+                k = self._expr_kind(node.iter)
+                if k == "real":
+                    self._mark_real(var)
+                elif k == "logical":
+                    self._mark_log(var)
+                else:
+                    self._mark_int(var)
+                self.o.w(f"{var} = {arr}({idx})")
+            for s in node.body:
+                self.visit(s)
+            self.o.pop()
+            self.o.w("end do")
+            return
+
+        if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range"):
+            raise NotImplementedError("only for .. in range(..), for .. in [..]/(..), or for .. in rank-1 array supported")
+
         start, stop, step = self._range_parts(node.iter)
         f_start = self.expr(start)
         f_step = self.expr(step)
@@ -4118,6 +5088,34 @@ class translator(ast.NodeVisitor):
             and c.func.attr == "seed"
         ):
             return
+        # np.random.seed(...)
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Attribute)
+            and isinstance(c.func.value.value, ast.Name)
+            and c.func.value.value.id == "np"
+            and c.func.value.attr == "random"
+            and c.func.attr == "seed"
+        ):
+            seed_node = c.args[0] if c.args else None
+            if seed_node is None:
+                self.o.w("call random_seed()")
+                return
+            seed_expr = self.expr(seed_node)
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: nseed_rng, i_rng")
+            self.o.w("integer, allocatable :: seed_rng(:)")
+            self.o.w("call random_seed(size=nseed_rng)")
+            self.o.w("allocate(seed_rng(1:nseed_rng))")
+            self.o.w("do i_rng = 1, nseed_rng")
+            self.o.w(f"   seed_rng(i_rng) = int({seed_expr}) + 104729 * (i_rng - 1)")
+            self.o.w("end do")
+            self.o.w("call random_seed(put=seed_rng)")
+            self.o.w("if (allocated(seed_rng)) deallocate(seed_rng)")
+            self.o.pop()
+            self.o.w("end block")
+            return
 
         if isinstance(c.func, ast.Name) and c.func.id == "print":
             if self.context == "compute":
@@ -4137,25 +5135,45 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{name}({cnt}) = {val}")
             return
 
-        raise NotImplementedError("unsupported expression call")
+        call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+        raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
     def _emit_print_call(self, call):
+        unit = "*"
+        for kw in getattr(call, "keywords", []):
+            if kw.arg == "file":
+                unit = self.expr(kw.value)
+
+        def _emit_list_directed(items):
+            if unit == "*":
+                if items:
+                    self.o.w("print *, " + ", ".join(items))
+                else:
+                    self.o.w("print *")
+            else:
+                if items:
+                    self.o.w(f"write({unit},*) " + ", ".join(items))
+                else:
+                    self.o.w(f"write({unit},*)")
+
         if len(call.args) == 0:
-            self.o.w("print *")
+            _emit_list_directed([])
             return
         if len(call.args) != 1:
             # Conservative multi-argument handling.
             # If list outputs are mixed with other args, emit in parts.
             has_list = any(isinstance(a, ast.Name) and a.id in self.list_counts for a in call.args)
             if has_list:
+                if unit != "*":
+                    raise NotImplementedError("print(..., file=fp) for list variables is not supported in this subset")
                 for a in call.args:
                     if isinstance(a, ast.Name) and a.id in self.list_counts:
                         cnt = self.list_counts[a.id]
                         self.o.w(f"call print_int_list({a.id}, {cnt})")
                     elif is_const_str(a):
-                        self.o.w(f"write(*,{fstr('(a)')}) {fstr(a.value)}")
+                        self.o.w(f"write({unit},{fstr('(a)')}) {fstr(a.value)}")
                     else:
-                        self.o.w(f"print *, {self.expr(a)}")
+                        _emit_list_directed([self.expr(a)])
                 return
             parts = []
             for a in call.args:
@@ -4165,13 +5183,41 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("f-string in multi-argument print not supported")
                 else:
                     parts.append(self.expr(a))
-            self.o.w("print *, " + ", ".join(parts))
+            _emit_list_directed(parts)
             return
         a = call.args[0]
 
+        # print(a if cond else b): lower safely without MERGE for nontrivial branches.
+        if isinstance(a, ast.IfExp):
+            if self._ifexp_safe_for_merge(a):
+                _emit_list_directed([self.expr(a)])
+                return
+            k = self._expr_kind(a)
+            decl = "real(kind=dp)"
+            if k == "int":
+                decl = "integer"
+            elif k == "logical":
+                decl = "logical"
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"{decl} :: ifexp_tmp")
+            self.o.w(f"if ({self.expr(a.test)}) then")
+            self.o.push()
+            self.o.w(f"ifexp_tmp = {self.expr(a.body)}")
+            self.o.pop()
+            self.o.w("else")
+            self.o.push()
+            self.o.w(f"ifexp_tmp = {self.expr(a.orelse)}")
+            self.o.pop()
+            self.o.w("end if")
+            _emit_list_directed(["ifexp_tmp"])
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         # print("literal")
         if is_const_str(a):
-            self.o.w(f"write(*,{fstr('(a)')}) {fstr(a.value)}")
+            self.o.w(f"write({unit},{fstr('(a)')}) {fstr(a.value)}")
             return
 
         # print(f"...{x}...")
@@ -4205,22 +5251,54 @@ class translator(ast.NodeVisitor):
                 else:
                     raise NotImplementedError("unsupported f-string part")
             fmt = fstr("(" + ",".join(fmt_parts) + ")")
-            self.o.w(f"write(*,{fmt}) " + ", ".join(items))
+            self.o.w(f"write({unit},{fmt}) " + ", ".join(items))
             return
 
         # print([])
         if isinstance(a, ast.List) and len(a.elts) == 0:
-            self.o.w(f"write(*,{fstr('(a)')}) {fstr('[]')}")
+            self.o.w(f"write({unit},{fstr('(a)')}) {fstr('[]')}")
             return
 
         # print(primes)
         if isinstance(a, ast.Name) and a.id in self.list_counts:
             cnt = self.list_counts[a.id]
+            if unit != "*":
+                raise NotImplementedError("print(list_var, file=fp) is not supported in this subset")
             self.o.w(f"call print_int_list({a.id}, {cnt})")
             return
 
+        # print(namespace_like) where value is a known derived-type object.
+        tname = None
+        if isinstance(a, ast.Name) and a.id in self.dict_typed_vars:
+            tname = self.dict_typed_vars[a.id]
+        elif (
+            isinstance(a, ast.Call)
+            and isinstance(a.func, ast.Name)
+            and a.func.id in self.dict_return_types
+        ):
+            tname = self.dict_return_types[a.func.id]
+        if tname is not None and tname in self.dict_type_components:
+            comps = list(self.dict_type_components.get(tname, {}).keys())
+            if comps:
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"type({tname}) :: ns_print_tmp")
+                self.o.w(f"ns_print_tmp = {self.expr(a)}")
+                self.o.w(f"write({unit},{fstr('(a)')}, advance={fstr('no')}) {fstr('namespace(')}")
+                for i, cname in enumerate(comps):
+                    if i > 0:
+                        self.o.w(f"write({unit},{fstr('(a)')}, advance={fstr('no')}) {fstr(', ')}")
+                    self.o.w(
+                        f"write({unit},{fstr('(a)')}, advance={fstr('no')}) {fstr(cname + '=')}"
+                    )
+                    self.o.w(f"write({unit},{fstr('(g0)')}, advance={fstr('no')}) ns_print_tmp%{cname}")
+                self.o.w(f"write({unit},{fstr('(a)')}) {fstr(')')}")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
         # fallback
-        self.o.w(f"print *, {self.expr(a)}")
+        _emit_list_directed([self.expr(a)])
 
 
 # -------------------------
@@ -4257,7 +5335,27 @@ def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
             dict_assign = st
             break
 
-    if dict_assign is None and ret_dict_node is None:
+    def _is_simple_namespace_call(n):
+        return (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "SimpleNamespace"
+        )
+
+    simple_ns_ctor = None
+    if ret_name not in {None, "__direct_return_dict__"}:
+        for st in ast.walk(fn):
+            if (
+                isinstance(st, ast.Assign)
+                and len(st.targets) == 1
+                and isinstance(st.targets[0], ast.Name)
+                and st.targets[0].id == ret_name
+                and _is_simple_namespace_call(st.value)
+            ):
+                simple_ns_ctor = st.value
+                break
+
+    if dict_assign is None and ret_dict_node is None and simple_ns_ctor is None:
         return None
 
     tmp_out = emit()
@@ -4286,123 +5384,164 @@ def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
                 else:
                     list_elem_kind[lst] = ek
     dict_src = dict_assign.value if dict_assign is not None else ret_dict_node
-    for k, v in zip(dict_src.keys, dict_src.values):
-        if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
-            continue
-        cname = k.value
+    def _key_from_subscript(sub):
+        """Return dict key string from subscript like d['k'] when available."""
+        if not isinstance(sub, ast.Subscript):
+            return None
+        sl = sub.slice
+        # py3.9+: slice is expr; older ast may wrap with Index.
+        if hasattr(ast, "Index") and isinstance(sl, ast.Index):  # pragma: no cover
+            sl = sl.value
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+            return sl.value
+        return None
+
+    def _infer_component_kind_rank(v):
         ckind = "int_scalar"
         crank = 0
         if isinstance(v, ast.Name):
             nm = v.id
             if nm in tr0.alloc_reals:
-                ckind = "real_array"
-                crank = max(1, tr0.alloc_real_rank.get(nm, 1))
-            elif nm in tr0.alloc_ints:
-                ckind = "int_array"
-                crank = 1
-            elif nm in tr0.alloc_logs:
-                ckind = "logical_array"
-                crank = 1
-            elif nm in tr0.reals:
-                ckind = "real_scalar"
+                return "real_array", max(1, tr0.alloc_real_rank.get(nm, 1))
+            if nm in tr0.alloc_ints:
+                return "int_array", 1
+            if nm in tr0.alloc_logs:
+                return "logical_array", 1
+            if nm in tr0.reals:
+                return "real_scalar", 0
+            return "int_scalar", 0
+        if (
+            isinstance(v, ast.Subscript)
+            and isinstance(v.slice, ast.Constant)
+            and isinstance(v.slice.value, str)
+            and isinstance(known_key_kinds, dict)
+            and v.slice.value in known_key_kinds
+        ):
+            kc = known_key_kinds[v.slice.value]
+            if isinstance(kc, tuple):
+                ckind, crank = kc
             else:
-                ckind = "int_scalar"
-        else:
-            if (
-                isinstance(v, ast.Subscript)
-                and isinstance(v.slice, ast.Constant)
-                and isinstance(v.slice.value, str)
-                and isinstance(known_key_kinds, dict)
-                and v.slice.value in known_key_kinds
-            ):
-                kc = known_key_kinds[v.slice.value]
-                if isinstance(kc, tuple):
-                    ckind, crank = kc
-                else:
-                    ckind, crank = kc, 1
-                comps.append((cname, ckind, v, max(0, int(crank))))
+                ckind, crank = kc, 1
+            return ckind, max(0, int(crank))
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "copy"
+            and isinstance(v.func.value, ast.Name)
+        ):
+            nm = v.func.value.id
+            if nm in tr0.alloc_reals:
+                return "real_array", max(1, tr0.alloc_real_rank.get(nm, 1))
+            if nm in tr0.alloc_ints:
+                return "int_array", 1
+            if nm in tr0.alloc_logs:
+                return "logical_array", 1
+            if nm in tr0.reals:
+                return "real_scalar", 0
+            return "int_scalar", 0
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr in {"array", "asarray"}
+        ):
+            dtype_txt = ""
+            for kw in v.keywords:
+                if kw.arg == "dtype":
+                    if isinstance(kw.value, ast.Name):
+                        dtype_txt = kw.value.id.lower()
+                    elif (
+                        isinstance(kw.value, ast.Attribute)
+                        and isinstance(kw.value.value, ast.Name)
+                        and kw.value.value.id == "np"
+                    ):
+                        dtype_txt = kw.value.attr.lower()
+            if "float" in dtype_txt:
+                return "real_array", (1 if (len(v.args) >= 1 and isinstance(v.args[0], ast.List)) else max(1, tr0._rank_expr(v.args[0]) if len(v.args) >= 1 else 1))
+            if "bool" in dtype_txt:
+                return "logical_array", 1
+            if "int" in dtype_txt:
+                return "int_array", 1
+            basek = None
+            if len(v.args) >= 1 and isinstance(v.args[0], ast.Name):
+                basek = list_elem_kind.get(v.args[0].id, None)
+            if basek == "logical":
+                return "logical_array", max(1, tr0._rank_expr(v.args[0]) if len(v.args) >= 1 else 1)
+            if basek == "int":
+                return "int_array", max(1, tr0._rank_expr(v.args[0]) if len(v.args) >= 1 else 1)
+            return "real_array", max(1, tr0._rank_expr(v.args[0]) if len(v.args) >= 1 else 1)
+        ek = tr0._expr_kind(v)
+        vrank = tr0._rank_expr(v)
+        if vrank > 0:
+            if ek == "logical":
+                return "logical_array", max(1, vrank)
+            if ek == "int":
+                return "int_array", max(1, vrank)
+            return "real_array", max(1, vrank)
+        return ("real_scalar", 0) if ek == "real" else ("int_scalar", 0)
+
+    if dict_src is not None:
+        for k, v in zip(dict_src.keys, dict_src.values):
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
                 continue
-            if (
-                isinstance(v, ast.Call)
-                and isinstance(v.func, ast.Attribute)
-                and v.func.attr == "copy"
-                and isinstance(v.func.value, ast.Name)
-            ):
-                nm = v.func.value.id
-                if nm in tr0.alloc_reals:
-                    ckind = "real_array"
-                    crank = max(1, tr0.alloc_real_rank.get(nm, 1))
-                elif nm in tr0.alloc_ints:
-                    ckind = "int_array"
-                    crank = 1
-                elif nm in tr0.alloc_logs:
-                    ckind = "logical_array"
-                    crank = 1
-                elif nm in tr0.reals:
-                    ckind = "real_scalar"
-                else:
-                    ckind = "int_scalar"
-                comps.append((cname, ckind, v, crank))
+            cname = k.value
+            ckind, crank = _infer_component_kind_rank(v)
+            if ckind == "real_array" and crank <= 0:
+                crank = max(1, tr0._rank_expr(v))
+            if ckind in {"int_array", "logical_array"} and crank <= 0:
+                crank = 1
+            comps.append((cname, ckind, v, crank))
+    elif simple_ns_ctor is not None:
+        for kw in simple_ns_ctor.keywords:
+            if kw.arg is None:
                 continue
-            if (
-                isinstance(v, ast.Call)
-                and isinstance(v.func, ast.Attribute)
-                and isinstance(v.func.value, ast.Name)
-                and v.func.value.id == "np"
-                and v.func.attr in {"array", "asarray"}
-            ):
-                dtype_txt = ""
-                for kw in v.keywords:
-                    if kw.arg == "dtype":
-                        if isinstance(kw.value, ast.Name):
-                            dtype_txt = kw.value.id.lower()
-                        elif (
-                            isinstance(kw.value, ast.Attribute)
-                            and isinstance(kw.value.value, ast.Name)
-                            and kw.value.value.id == "np"
-                        ):
-                            dtype_txt = kw.value.attr.lower()
-                if "float" in dtype_txt:
-                    ckind = "real_array"
-                    if isinstance(v.args[0], ast.List):
-                        crank = 1
-                elif "bool" in dtype_txt:
-                    ckind = "logical_array"
-                    crank = 1
-                elif "int" in dtype_txt:
-                    ckind = "int_array"
-                    crank = 1
-                else:
-                    # No dtype specified: infer from list append usage when possible.
-                    basek = None
-                    if len(v.args) >= 1 and isinstance(v.args[0], ast.Name):
-                        basek = list_elem_kind.get(v.args[0].id, None)
-                    if basek == "logical":
-                        ckind = "logical_array"
-                    elif basek == "int":
-                        ckind = "int_array"
-                    else:
-                        ckind = "real_array"
-                    crank = max(1, tr0._rank_expr(v.args[0]) if len(v.args) >= 1 else 1)
-                comps.append((cname, ckind, v, crank))
-                continue
-            ek = tr0._expr_kind(v)
-            vrank = tr0._rank_expr(v)
-            if vrank > 0:
-                if ek == "logical":
-                    ckind = "logical_array"
-                elif ek == "int":
-                    ckind = "int_array"
-                else:
-                    ckind = "real_array"
-                crank = max(1, vrank)
-            else:
-                ckind = "real_scalar" if ek == "real" else ("int_scalar" if ek == "int" else "int_scalar")
+            cname = kw.arg
+            ckind, crank = _infer_component_kind_rank(kw.value)
+            if ckind == "real_array" and crank <= 0:
+                crank = max(1, tr0._rank_expr(kw.value))
+            if ckind in {"int_array", "logical_array"} and crank <= 0:
+                crank = 1
+            comps.append((cname, ckind, kw.value, crank))
+
+    # Also include keys assigned later, e.g.:
+    #   ret["responsibilities"] = r
+    known_comp_names = {cname for cname, *_ in comps}
+    for st in ast.walk(fn):
+        if not isinstance(st, ast.Assign) or len(st.targets) != 1:
+            continue
+        tgt = st.targets[0]
+        if not (isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name) and tgt.value.id == ret_name):
+            continue
+        cname = _key_from_subscript(tgt)
+        if not cname or cname in known_comp_names:
+            continue
+        ckind, crank = _infer_component_kind_rank(st.value)
         if ckind == "real_array" and crank <= 0:
-            crank = max(1, tr0._rank_expr(v))
+            crank = max(1, tr0._rank_expr(st.value))
         if ckind in {"int_array", "logical_array"} and crank <= 0:
             crank = 1
-        comps.append((cname, ckind, v, crank))
+        comps.append((cname, ckind, st.value, crank))
+        known_comp_names.add(cname)
+    # Also include later component assignments on SimpleNamespace returns:
+    #   ret.mu = ...
+    if ret_name not in {None, "__direct_return_dict__"}:
+        for st in ast.walk(fn):
+            if not isinstance(st, ast.Assign) or len(st.targets) != 1:
+                continue
+            tgt = st.targets[0]
+            if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id == ret_name):
+                continue
+            cname = tgt.attr
+            if cname in known_comp_names:
+                continue
+            ckind, crank = _infer_component_kind_rank(st.value)
+            if ckind == "real_array" and crank <= 0:
+                crank = max(1, tr0._rank_expr(st.value))
+            if ckind in {"int_array", "logical_array"} and crank <= 0:
+                crank = 1
+            comps.append((cname, ckind, st.value, crank))
+            known_comp_names.add(cname)
     if not comps:
         return None
     return {
@@ -4411,6 +5550,222 @@ def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
         "components": comps,
         "direct_return": ret_dict_node is not None,
     }
+
+
+def _is_dataclass_decorator(dec):
+    if isinstance(dec, ast.Name) and dec.id == "dataclass":
+        return True
+    if (
+        isinstance(dec, ast.Attribute)
+        and isinstance(dec.value, ast.Name)
+        and dec.value.id in {"dataclasses", "dc"}
+        and dec.attr == "dataclass"
+    ):
+        return True
+    return False
+
+
+def _infer_dataclass_component(stmt):
+    if not isinstance(stmt, ast.AnnAssign) or not isinstance(stmt.target, ast.Name):
+        return None
+    name = stmt.target.id
+    ann = ast.unparse(stmt.annotation).lower() if hasattr(ast, "unparse") else ""
+    ckind = "int_scalar"
+    crank = 0
+
+    if "ndarray" in ann:
+        crank = 1
+        if "bool" in ann or "logical" in ann:
+            ckind = "logical_array"
+        elif "int" in ann:
+            ckind = "int_array"
+        else:
+            ckind = "real_array"
+    elif "float" in ann or "real" in ann:
+        ckind = "real_scalar"
+    elif "bool" in ann or "logical" in ann:
+        ckind = "logical_scalar"
+    elif "int" in ann:
+        ckind = "int_scalar"
+    else:
+        v = stmt.value
+        if isinstance(v, ast.Constant):
+            if isinstance(v.value, bool):
+                ckind = "logical_scalar"
+            elif isinstance(v.value, float):
+                ckind = "real_scalar"
+            elif isinstance(v.value, int):
+                ckind = "int_scalar"
+        elif isinstance(v, (ast.List, ast.Tuple)):
+            crank = 1
+            if any(isinstance(e, ast.Constant) and isinstance(e.value, bool) for e in v.elts):
+                ckind = "logical_array"
+            elif any(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in v.elts):
+                ckind = "real_array"
+            else:
+                ckind = "int_array"
+
+    return (name, ckind, stmt.value, crank)
+
+
+def analyze_dataclass_types(tree):
+    out = {}
+    for st in tree.body:
+        if not isinstance(st, ast.ClassDef):
+            continue
+        if not any(_is_dataclass_decorator(d) for d in st.decorator_list):
+            continue
+        comps = []
+        for b in st.body:
+            comp = _infer_dataclass_component(b)
+            if comp is not None:
+                comps.append(comp)
+        if comps:
+            out[st.name] = comps
+    return out
+
+
+def _infer_kind_from_ann_text(ann_txt):
+    low = (ann_txt or "").lower()
+    if "ndarray" in low:
+        if "bool" in low or "logical" in low:
+            return "logical_array", 1
+        if "int" in low:
+            return "int_array", 1
+        return "real_array", 1
+    if "bool" in low or "logical" in low:
+        return "logical_scalar", 0
+    if "int" in low:
+        return "int_scalar", 0
+    if "float" in low or "real" in low:
+        return "real_scalar", 0
+    return None
+
+
+def _infer_kind_from_expr(v):
+    if isinstance(v, ast.Constant):
+        if isinstance(v.value, bool):
+            return "logical_scalar", 0
+        if isinstance(v.value, int):
+            return "int_scalar", 0
+        if isinstance(v.value, float):
+            return "real_scalar", 0
+        if isinstance(v.value, str):
+            return "char_scalar", 0
+    if isinstance(v, (ast.List, ast.Tuple)):
+        if any(isinstance(e, ast.Constant) and isinstance(e.value, bool) for e in v.elts):
+            return "logical_array", 1
+        if any(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in v.elts):
+            return "real_array", 1
+        return "int_array", 1
+    if isinstance(v, ast.BinOp):
+        if isinstance(v.op, ast.Div):
+            return "real_scalar", 0
+        lf = _infer_kind_from_expr(v.left)
+        rf = _infer_kind_from_expr(v.right)
+        if (lf and lf[0].startswith("real")) or (rf and rf[0].startswith("real")):
+            return "real_scalar", 0
+        return "int_scalar", 0
+    if isinstance(v, ast.UnaryOp):
+        return _infer_kind_from_expr(v.operand)
+    if isinstance(v, ast.Call):
+        if isinstance(v.func, ast.Name) and v.func.id in {"float"}:
+            return "real_scalar", 0
+        if isinstance(v.func, ast.Name) and v.func.id in {"int", "len"}:
+            return "int_scalar", 0
+        if isinstance(v.func, ast.Attribute):
+            if isinstance(v.func.value, ast.Name) and v.func.value.id in {"math", "np"}:
+                if v.func.attr in {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log"}:
+                    return "real_scalar", 0
+    return "real_scalar", 0
+
+
+def analyze_simple_classes(tree):
+    """
+    Returns:
+      class_specs: {ClassName: [(field, ckind, value_node_or_none, rank), ...]}
+      class_methods: [ast.FunctionDef lowered methods with renamed symbol]
+      class_method_map: {(ClassName, method): lowered_name}
+      class_ctor_fields: {ClassName: [field1, field2, ...]} inferred from __init__
+    """
+    class_specs = {}
+    class_methods = []
+    class_method_map = {}
+    class_ctor_fields = {}
+
+    for st in tree.body:
+        if not isinstance(st, ast.ClassDef):
+            continue
+        # dataclasses are handled elsewhere
+        if any(_is_dataclass_decorator(d) for d in st.decorator_list):
+            continue
+
+        init_fn = None
+        for b in st.body:
+            if isinstance(b, ast.FunctionDef) and b.name == "__init__":
+                init_fn = b
+                break
+        if init_fn is None:
+            continue
+
+        arg_ann = {}
+        for a in init_fn.args.args:
+            if a.annotation is not None and hasattr(ast, "unparse"):
+                arg_ann[a.arg] = ast.unparse(a.annotation)
+
+        comps = {}
+        ctor_order = []
+        for b in init_fn.body:
+            if (
+                isinstance(b, ast.Assign)
+                and len(b.targets) == 1
+                and isinstance(b.targets[0], ast.Attribute)
+                and isinstance(b.targets[0].value, ast.Name)
+                and b.targets[0].value.id == "self"
+            ):
+                fld = b.targets[0].attr
+                rhs = b.value
+                kk = None
+                if isinstance(rhs, ast.Name) and rhs.id in arg_ann:
+                    kk = _infer_kind_from_ann_text(arg_ann[rhs.id])
+                    if fld not in ctor_order:
+                        ctor_order.append(fld)
+                if kk is None:
+                    kk = _infer_kind_from_expr(rhs)
+                comps[fld] = (kk[0], kk[1], rhs, kk[1])
+
+            if (
+                isinstance(b, ast.AnnAssign)
+                and isinstance(b.target, ast.Attribute)
+                and isinstance(b.target.value, ast.Name)
+                and b.target.value.id == "self"
+            ):
+                fld = b.target.attr
+                ann_txt = ast.unparse(b.annotation) if hasattr(ast, "unparse") else ""
+                kk = _infer_kind_from_ann_text(ann_txt) or _infer_kind_from_expr(b.value)
+                comps[fld] = (kk[0], kk[1], b.value, kk[1])
+
+        if not comps:
+            continue
+        class_specs[st.name] = [(k, v[0], v[2], v[1]) for k, v in comps.items()]
+        class_ctor_fields[st.name] = ctor_order if ctor_order else list(comps.keys())
+
+        for b in st.body:
+            if not isinstance(b, ast.FunctionDef):
+                continue
+            if b.name == "__init__":
+                continue
+            if b.name.startswith("__") and b.name.endswith("__"):
+                # Skip dunder methods (e.g. __repr__) in the simple-class subset.
+                continue
+            lowered = copy.deepcopy(b)
+            lowered.name = f"{st.name}_{b.name}"
+            setattr(lowered, "_xp2f_class_self_type", st.name)
+            setattr(lowered, "_xp2f_class_method_original", b.name)
+            class_methods.append(lowered)
+            class_method_map[(st.name, b.name)] = lowered.name
+
+    return class_specs, class_methods, class_method_map, class_ctor_fields
 
 
 def _emit_local_function(
@@ -4427,6 +5782,8 @@ def _emit_local_function(
     dict_type_components=None,
     dict_arg_types=None,
     local_func_arg_ranks=None,
+    class_method_map=None,
+    class_ctor_fields=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     args = [a.arg for a in fn.args.args]
@@ -4478,7 +5835,7 @@ def _emit_local_function(
         o.pop()
         o.w("else")
         o.push()
-        o.w("stop \"logsumexp: unsupported axis\"")
+        o.w("error stop \"logsumexp: unsupported axis\"")
         o.pop()
         o.w("end if")
         o.w("if (.not. keepdims) then")
@@ -4557,6 +5914,8 @@ def _emit_local_function(
         tuple_return_out_kinds=tuple_return_out_kinds,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
+        class_method_map=class_method_map,
+        class_ctor_fields=class_ctor_fields,
     )
     # Scope comment emission to this procedure body; otherwise comments from
     # earlier procedures leak into the first emitted statement.
@@ -4638,6 +5997,8 @@ def _emit_local_function(
                     tr.alloc_ints.discard(nm)
                     tr.alloc_reals.discard(nm)
                     tr.alloc_logs.discard(nm)
+                    tr.chars.discard(nm)
+                    tr.strvecs.discard(nm)
     if returns and isinstance(returns[0].value, ast.Tuple):
         tuple_return = True
         for e in returns[0].value.elts:
@@ -4648,18 +6009,27 @@ def _emit_local_function(
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints - {ret_name})
     alloc_reals_set = set(tr.alloc_reals - {ret_name})
+    chars_set = set(tr.chars - {ret_name})
+    strvecs_set = set(tr.strvecs - {ret_name})
     alloc_logs_set -= set(args)
     alloc_ints_set -= set(args)
     alloc_reals_set -= set(args)
+    chars_set -= set(args)
+    strvecs_set -= set(args)
     if tuple_return:
         alloc_logs_set -= set(out_names)
         alloc_ints_set -= set(out_names)
         alloc_reals_set -= set(out_names)
+        chars_set -= set(out_names)
+        strvecs_set -= set(out_names)
     remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names))
-    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
-    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
+    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - chars_set - strvecs_set)
+    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - chars_set - strvecs_set)
+    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - chars_set - strvecs_set)
     alloc_logs = sorted(alloc_logs_set)
     alloc_ints = sorted(alloc_ints_set)
+    chars = sorted(chars_set)
+    strvecs = sorted(strvecs_set)
 
     pure_prefix = "pure " if function_is_pure(fn, known_pure_calls=known_pure_calls) else ""
     if tuple_return:
@@ -4717,6 +6087,25 @@ def _emit_local_function(
                     and _name_used(n.args[0], nm)
                 ):
                     return True
+                if isinstance(n, ast.Call):
+                    # math.sqrt(x), np.sqrt(x), sqrt(x), and similar real-valued math
+                    # intrinsics should force floating argument declaration.
+                    if (
+                        isinstance(n.func, ast.Attribute)
+                        and isinstance(n.func.value, ast.Name)
+                        and n.func.value.id in {"math", "np"}
+                        and n.func.attr in {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log", "hypot"}
+                    ):
+                        for a in n.args:
+                            if _name_used(a, nm):
+                                return True
+                    if (
+                        isinstance(n.func, ast.Name)
+                        and n.func.id in {"sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log", "hypot"}
+                    ):
+                        for a in n.args:
+                            if _name_used(a, nm):
+                                return True
         return False
 
     def _arg_array_rank(nm):
@@ -4875,6 +6264,7 @@ def _emit_local_function(
         ret_is_real = False
         ret_name_src = None
         ret_decl_full = False
+        ret_decl = ""
         if returns and isinstance(returns[0].value, ast.Name):
             ret_name_src = returns[0].value.id
         if dict_return:
@@ -4890,7 +6280,40 @@ def _emit_local_function(
         elif ret_name_src is not None and ret_name_src in tr.alloc_logs:
             ret_decl = f"logical, allocatable :: {ret_name}(:)"
             ret_decl_full = True
+        elif (
+            returns
+            and isinstance(returns[0].value, ast.Call)
+            and isinstance(returns[0].value.func, ast.Name)
+            and returns[0].value.func.id in (dict_type_components or {})
+        ):
+            ret_decl = f"type({returns[0].value.func.id})"
+        elif ret_name_src is not None and ret_name_src in tr.dict_typed_vars:
+            ret_decl = f"type({tr.dict_typed_vars[ret_name_src]})"
         else:
+            if fn.returns is not None and hasattr(ast, "unparse"):
+                rtxt = ast.unparse(fn.returns).strip()
+                rbase = rtxt.split("[", 1)[0].strip()
+                if rbase in (dict_type_components or {}):
+                    ret_decl = f"type({rbase})"
+                else:
+                    rlow = rtxt.lower()
+                    if "ndarray" in rlow:
+                        if "bool" in rlow or "logical" in rlow:
+                            ret_decl = f"logical, allocatable :: {ret_name}(:)"
+                            ret_decl_full = True
+                        elif "int" in rlow:
+                            ret_decl = f"integer, allocatable :: {ret_name}(:)"
+                            ret_decl_full = True
+                        else:
+                            ret_decl = f"real(kind=dp), allocatable :: {ret_name}(:)"
+                            ret_decl_full = True
+                    elif "float" in rlow or "real" in rlow:
+                        ret_is_real = True
+                        ret_decl = "real(kind=dp)"
+                    elif "bool" in rlow or "logical" in rlow:
+                        ret_decl = "logical"
+                    elif "int" in rlow:
+                        ret_decl = "integer"
             if fn.returns is not None and hasattr(ast, "unparse"):
                 rtxt = ast.unparse(fn.returns).lower()
                 if "float" in rtxt:
@@ -4901,7 +6324,8 @@ def _emit_local_function(
                     ret_is_real = True
             if ret_name in tr.reals or (ret_name_src is not None and ret_name_src in tr.reals):
                 ret_is_real = True
-            ret_decl = "real(kind=dp)" if ret_is_real else "integer"
+            if not ret_decl:
+                ret_decl = "real(kind=dp)" if ret_is_real else "integer"
         if ret_decl_full:
             o.w(ret_decl)
         else:
@@ -4910,6 +6334,12 @@ def _emit_local_function(
         o.w("real(kind=dp) :: " + ", ".join(reals))
     if ints:
         o.w("integer :: " + ", ".join(ints))
+    if logs:
+        o.w("logical :: " + ", ".join(logs))
+    for nm in chars:
+        o.w(f"character(len=:), allocatable :: {nm}")
+    for nm in strvecs:
+        o.w(f"type(strvec_t) :: {nm}")
     arg_set = set(args)
     local_dict_vars = sorted((nm, tn) for nm, tn in tr.dict_typed_vars.items() if nm != ret_name and nm not in arg_set)
     for nm, tn in local_dict_vars:
@@ -5028,7 +6458,7 @@ def _local_return_maps(local_funcs, params):
 
 
 def generate_flat(
-    tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None
+    tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None, dataclass_type_components=None, class_method_map=None, class_ctor_fields=None, param_types=None
 ):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
     def _infer_arg_rank_in_fn(fn, nm):
@@ -5061,6 +6491,8 @@ def generate_flat(
     dict_return_specs = {}
     dict_return_types = {}
     dict_type_components = {}
+    for tnm, comps in (dataclass_type_components or {}).items():
+        dict_type_components[tnm] = {cname: (ckind, crank) for cname, ckind, _, crank in comps}
     known_key_kinds = {}
     for fn in (local_funcs or []):
         spec = _analyze_dict_return_spec(fn, params, known_key_kinds=known_key_kinds)
@@ -5098,6 +6530,30 @@ def generate_flat(
                 tuple_return_funcs.add(fn.name)
                 break
 
+    # Pre-scan to infer additional record-like types, including SimpleNamespace usage,
+    # before emitting Fortran type definitions.
+    tr_scan = translator(
+        emit(),
+        params=params,
+        context="flat",
+        list_counts=list_counts,
+        tuple_return_funcs=tuple_return_funcs,
+        dict_return_types=dict_return_types,
+        local_return_specs=local_return_specs,
+        tuple_return_out_kinds=tuple_return_out_kinds,
+        dict_type_components=dict_type_components,
+        local_func_arg_ranks=local_func_arg_ranks,
+        class_method_map=class_method_map,
+        class_ctor_fields=class_ctor_fields,
+    )
+    tr_scan.prescan(tree.body)
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef) and st.name == "main":
+            tr_scan.prescan(st.body)
+    for fn in (local_funcs or []):
+        tr_scan.prescan(fn.body)
+    dict_type_components = dict(tr_scan.dict_type_components)
+
     o = emit()
     o.w(f"program {stem}")
     o.push()
@@ -5109,6 +6565,33 @@ def generate_flat(
     o.w("implicit none")
     o.w("integer, parameter :: dp = real64")
     emitted_types = set()
+    for tname, comps_map in sorted(dict_type_components.items()):
+        if tname in emitted_types:
+            continue
+        emitted_types.add(tname)
+        o.w(f"type :: {tname}")
+        o.push()
+        for cname, cinfo in comps_map.items():
+            ckind = cinfo[0] if isinstance(cinfo, tuple) else cinfo
+            crank = cinfo[1] if isinstance(cinfo, tuple) and len(cinfo) > 1 else 0
+            if ckind == "real_array":
+                dims = ",".join(":" for _ in range(max(1, int(crank))))
+                o.w(f"real(kind=dp), allocatable :: {cname}({dims})")
+            elif ckind == "int_array":
+                dims = ",".join(":" for _ in range(max(1, int(crank))))
+                o.w(f"integer, allocatable :: {cname}({dims})")
+            elif ckind == "logical_array":
+                dims = ",".join(":" for _ in range(max(1, int(crank))))
+                o.w(f"logical, allocatable :: {cname}({dims})")
+            elif ckind == "real_scalar":
+                o.w(f"real(kind=dp) :: {cname}")
+            elif ckind == "logical_scalar":
+                o.w(f"logical :: {cname}")
+            else:
+                o.w(f"integer :: {cname}")
+        o.pop()
+        o.w(f"end type {tname}")
+
     for fn_name in sorted(dict_return_specs):
         spec = dict_return_specs[fn_name]
         tname = spec["type_name"]
@@ -5129,13 +6612,19 @@ def generate_flat(
                 o.w(f"logical, allocatable :: {cname}({dims})")
             elif ckind == "real_scalar":
                 o.w(f"real(kind=dp) :: {cname}")
+            elif ckind == "logical_scalar":
+                o.w(f"logical :: {cname}")
             else:
                 o.w(f"integer :: {cname}")
         o.pop()
         o.w(f"end type {tname}")
 
+    ptypes = param_types or {}
     for name, val in sorted(params.items()):
-        o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
+        if ptypes.get(name) == "real":
+            o.w(f"real(kind=dp), parameter :: {name} = {val} ! {const_comment(name, tree)}")
+        else:
+            o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
 
     tr = translator(
         o,
@@ -5149,6 +6638,8 @@ def generate_flat(
         tuple_return_out_kinds=tuple_return_out_kinds,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
+        class_method_map=class_method_map,
+        class_ctor_fields=class_ctor_fields,
     )
     tr.prescan(tree.body)
     for st in tree.body:
@@ -5173,15 +6664,26 @@ def generate_flat(
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints)
     alloc_reals_set = set(tr.alloc_reals)
+    chars_set = set(tr.chars)
+    strvecs_set = set(tr.strvecs)
     ints = sorted(
-        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set
+        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - chars_set - strvecs_set
     )
-    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
+    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - chars_set - strvecs_set)
+    logs = sorted((tr.logs - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - chars_set - strvecs_set)
+    chars = sorted(chars_set - set(params.keys()))
+    strvecs = sorted(strvecs_set - set(params.keys()))
     dict_type_vars = sorted(tr.dict_typed_vars.items())
     if ints:
         o.w("integer :: " + ", ".join(ints))
     if reals:
         o.w("real(kind=dp) :: " + ", ".join(reals))
+    if logs:
+        o.w("logical :: " + ", ".join(logs))
+    for name in chars:
+        o.w(f"character(len=:), allocatable :: {name}")
+    for name in strvecs:
+        o.w(f"type(strvec_t) :: {name}")
     for vname, tname in dict_type_vars:
         o.w(f"type({tname}) :: {vname}")
     for name in sorted(alloc_logs_set):
@@ -5207,8 +6709,17 @@ def generate_flat(
         o.w("")
         for fn in local_funcs:
             arg_dict_types = {}
+            self_t = getattr(fn, "_xp2f_class_self_type", None)
+            if self_t and fn.args.args:
+                arg_dict_types[fn.args.args[0].arg] = self_t
             for a in fn.args.args:
                 anm = a.arg
+                if a.annotation is not None and hasattr(ast, "unparse"):
+                    ann_txt = ast.unparse(a.annotation).strip()
+                    ann_base = ann_txt.split("[", 1)[0].strip()
+                    if ann_base in dict_type_components:
+                        arg_dict_types[anm] = ann_base
+                        continue
                 keys = set()
                 for st in ast.walk(fn):
                     if (
@@ -5219,6 +6730,12 @@ def generate_flat(
                         and isinstance(st.slice.value, str)
                     ):
                         keys.add(st.slice.value)
+                    if (
+                        isinstance(st, ast.Attribute)
+                        and isinstance(st.value, ast.Name)
+                        and st.value.id == anm
+                    ):
+                        keys.add(st.attr)
                 if not keys:
                     continue
                 matches = []
@@ -5241,6 +6758,8 @@ def generate_flat(
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
                 local_func_arg_ranks=local_func_arg_ranks,
+                class_method_map=class_method_map,
+                class_ctor_fields=class_ctor_fields,
             )
 
     o.pop()
@@ -5248,12 +6767,13 @@ def generate_flat(
     return o.text()
 
 
-def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_counts, no_comment=False, comment_map=None):
+def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_counts, no_comment=False, comment_map=None, param_types=None):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
     o = emit()
     run_name = f"run_{stem}"
     compute_name = f"compute_{stem}"
 
+    ptypes = param_types or {}
     settings = sorted(params.keys())
     scalar_outs = detect_scalar_outputs(tree, params=params)
     node_if = top_level_if(tree)
@@ -5320,8 +6840,9 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     if not no_comment:
         o.w(f"! {procedure_comment(run_name, 'subroutine')}")
     for name in settings:
+        decl_type = "real(kind=dp)" if ptypes.get(name) == "real" else "integer"
         o.w(
-            f"integer, intent(in) :: {name}"
+            f"{decl_type}, intent(in) :: {name}"
             + (
                 f" ! {argument_comment(name, 'in')}; {const_comment(name, tree)}"
                 if not no_comment
@@ -5407,8 +6928,9 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     if not no_comment:
         o.w(f"! {procedure_comment(compute_name, 'subroutine')}")
     for name in settings:
+        decl_type = "real(kind=dp)" if ptypes.get(name) == "real" else "integer"
         o.w(
-            f"integer, intent(in) :: {name}"
+            f"{decl_type}, intent(in) :: {name}"
             + (
                 f" ! {argument_comment(name, 'in')}; {const_comment(name, tree)}"
                 if not no_comment
@@ -5473,7 +6995,10 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     o.w(f"use main_mod, only: {run_name}")
     o.w("implicit none")
     for name, val in sorted(params.items()):
-        o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
+        if ptypes.get(name) == "real":
+            o.w(f"real(kind=dp), parameter :: {name} = {val} ! {const_comment(name, tree)}")
+        else:
+            o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
     o.w("")
     if settings:
         o.w(f"call {run_name}(" + ", ".join(settings) + ")")
@@ -5596,6 +7121,23 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     src = Path(py_path).read_text(encoding="utf-8")
     tree = ast.parse(src)
     comment_map = extract_python_comments(src)
+    dataclass_specs = analyze_dataclass_types(tree)
+    class_specs, class_methods, class_method_map, class_ctor_fields = analyze_simple_classes(tree)
+    for tnm, comps in class_specs.items():
+        if tnm not in dataclass_specs:
+            dataclass_specs[tnm] = comps
+
+    # Early structural validation: duplicate top-level function names lead to
+    # ambiguous lowering and invalid Fortran output.
+    top_fn_counts = {}
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef):
+            top_fn_counts[st.name] = top_fn_counts.get(st.name, 0) + 1
+    dup_fns = sorted([nm for nm, cnt in top_fn_counts.items() if cnt > 1])
+    if dup_fns:
+        raise NotImplementedError(
+            "duplicate top-level function definitions not supported: " + ", ".join(dup_fns)
+        )
 
     exec_nodes = [
         s
@@ -5605,7 +7147,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     ]
     used_main_unwrap = False
     effective_tree = tree
-    local_funcs = []
+    local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)] + list(class_methods)
 
     # If there is no direct top-level executable code but there is a canonical
     # main guard that calls main(), transpile the main() body as program body.
@@ -5634,7 +7176,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
                         main_def = s
                         break
                 if main_def is not None:
-                    local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef) and s.name != "main"]
+                    local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef) and s.name != "main"] + list(class_methods)
                     effective_tree = ast.Module(body=list(main_def.body), type_ignores=[])
                     used_main_unwrap = True
                     exec_nodes = [
@@ -5647,7 +7189,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
                     ]
             else:
                 # Support direct executable statements inside a guarded __main__ block.
-                local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
+                local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)] + list(class_methods)
                 effective_tree = ast.Module(body=list(main_guard.body), type_ignores=[])
                 used_main_unwrap = True
                 exec_nodes = [
@@ -5665,7 +7207,39 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
             "supported guarded-main form is: if __name__ == '__main__': main()"
         )
 
-    params = find_parameters(effective_tree)
+    # Keep only reachable local functions to avoid failing on unused helpers
+    # that may contain unsupported calls.
+    builtin_helper_funcs = {"_f_size", "_f_spread", "_f_assign_array"}
+    if local_funcs:
+        local_funcs = [f for f in local_funcs if f.name not in builtin_helper_funcs]
+        class_lifted = [f for f in local_funcs if hasattr(f, "_xp2f_class_self_type")]
+        base_funcs = [f for f in local_funcs if not hasattr(f, "_xp2f_class_self_type")]
+        fn_map = {f.name: f for f in base_funcs}
+
+        def _called_local_names(nodes):
+            out = set()
+            for st in nodes:
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in fn_map:
+                        out.add(n.func.id)
+            return out
+
+        reachable = set()
+        work = list(_called_local_names(effective_tree.body))
+        while work:
+            nm = work.pop()
+            if nm in reachable:
+                continue
+            reachable.add(nm)
+            fn = fn_map.get(nm)
+            if fn is None:
+                continue
+            for callee in _called_local_names(fn.body):
+                if callee not in reachable:
+                    work.append(callee)
+        local_funcs = [f for f in base_funcs if f.name in reachable] + class_lifted
+
+    params, param_types = find_parameters(effective_tree)
     helper_scan_tree = effective_tree
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
@@ -5676,6 +7250,13 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     helper_uses, missing_helpers, pure_helpers = resolve_helper_uses(helper_paths, needed)
     if missing_helpers:
         print("warning: missing helper symbols:", ", ".join(sorted(missing_helpers)))
+    # If a helper module already provides a function, prefer that implementation
+    # over transpiling a same-named local helper from source.
+    if local_funcs and helper_uses:
+        provided_helper_symbols = set()
+        for _mod, syms in helper_uses.items():
+            provided_helper_symbols.update(syms)
+        local_funcs = [f for f in local_funcs if f.name not in provided_helper_symbols]
 
     stem = Path(py_path).stem
     if flat:
@@ -5690,13 +7271,25 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
             no_comment=no_comment,
             known_pure_calls=pure_helpers,
             comment_map=comment_map,
+            dataclass_type_components=dataclass_specs,
+            class_method_map=class_method_map,
+            class_ctor_fields=class_ctor_fields,
+            param_types=param_types,
         )
         used_flat_fallback = False
     else:
         used_flat_fallback = False
         try:
             f90 = generate_structured(
-                effective_tree, stem, helper_uses, params, needed, list_counts, no_comment=no_comment, comment_map=comment_map
+                effective_tree,
+                stem,
+                helper_uses,
+                params,
+                needed,
+                list_counts,
+                no_comment=no_comment,
+                comment_map=comment_map,
+                param_types=param_types,
             )
         except NotImplementedError:
             # Structured mode currently targets a specific top-level pattern.
@@ -5712,6 +7305,10 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
                 no_comment=no_comment,
                 known_pure_calls=pure_helpers,
                 comment_map=comment_map,
+                dataclass_type_components=dataclass_specs,
+                class_method_map=class_method_map,
+                class_ctor_fields=class_ctor_fields,
+                param_types=param_types,
             )
             used_flat_fallback = True
 
@@ -5727,14 +7324,15 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_redundant_parens_in_lines(f90_lines)
+    f90_lines = normalize_if_condition_parens(f90_lines)
+    f90_lines = promote_stop_to_error_stop(f90_lines)
     f90_lines = remove_empty_if_blocks(f90_lines)
     f90_lines = inline_shape_comments(f90_lines)
     f90_lines = ensure_space_before_inline_comments(f90_lines)
-    f90_lines = prune_unused_use_only_lines(f90_lines)
-    # First coalesce adjacent declarations without wrapping, then apply
-    # the dedicated 80-column wrapper that packs continuation lines.
+    f90_lines = prune_unused_intrinsic_use_only_lines(f90_lines)
+    # Coalesce before file-based post-passes. Delay wrapping until after
+    # xparam/xunused so their single-line declaration rewrites stay safe.
     f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
-    f90_lines = wrap_long_declaration_lines(f90_lines, max_len=80)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = add_pure_procedure_attrs_with_xpure(
         f90,
@@ -5745,6 +7343,36 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     f90 = f"! transpiled by xp2f.py from {Path(py_path).name} on {stamp}\n" + f90
     out_path.write_text(f90, encoding="utf-8")
+    # NOTE:
+    # Avoid aggressive parameter promotion here; on transpiled inputs it can
+    # incorrectly freeze loop indices / arrays as PARAMETER and break builds.
+    xunused.remove_unused_locals_in_file(
+        out_path,
+        fix_decl_unused=True,
+    )
+    # Safety repair: xunused may conservatively drop dp even when used as a
+    # kind selector in declarations. Reinsert if needed.
+    txt = out_path.read_text(encoding="utf-8")
+    low = txt.lower()
+    uses_dp_kind = ("kind=dp" in low) or ("_dp" in low)
+    has_dp_param = re.search(r"^\s*integer\s*,\s*parameter\s*::\s*dp\b", low, re.M) is not None
+    if uses_dp_kind and not has_dp_param:
+        lines = txt.splitlines()
+        inserted = False
+        for i, ln in enumerate(lines):
+            if ln.strip().lower() == "implicit none":
+                indent = re.match(r"^\s*", ln).group(0)
+                lines.insert(i + 1, f"{indent}integer, parameter :: dp = real64")
+                inserted = True
+                break
+        if inserted:
+            txt = "\n".join(lines) + ("\n" if txt.endswith("\n") else "")
+            out_path.write_text(txt, encoding="utf-8")
+    # Final formatting pass after file-based rewrites.
+    post_lines = out_path.read_text(encoding="utf-8").splitlines()
+    post_lines = coalesce_simple_declarations(post_lines, max_len=10**9)
+    post_lines = wrap_long_declaration_lines(post_lines, max_len=80)
+    out_path.write_text("\n".join(post_lines) + "\n", encoding="utf-8")
     return out_path, used_flat_fallback, used_main_unwrap
 
 
@@ -5760,6 +7388,8 @@ def main():
     ap.add_argument("--run-diff", action="store_true", help="run Python and Fortran and compare outputs")
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original Python run and transpiled Fortran run (implies --run)")
+    ap.add_argument("--tee", action="store_true", help="print transformed output (run output, or transpiled source when not running)")
+    ap.add_argument("--tee-both", action="store_true", help="print both original and transformed outputs (run output, or source when not running)")
     ap.add_argument("--comment", action="store_true", help="emit generated procedure/argument comments")
     ap.add_argument(
         "--compiler",
@@ -5777,6 +7407,13 @@ def main():
         args.time = True
     if args.time:
         args.run = True
+    if args.tee_both:
+        args.tee = True
+
+    # In run modes, print program output by default.
+    # --tee/--tee-both additionally control output echoing in non-run modes.
+    show_py_output = bool(args.run_both or args.time_both or args.tee_both)
+    show_ft_output = bool(args.run or args.tee or args.tee_both)
 
     timings = {}
     t0_total = time.perf_counter()
@@ -5797,9 +7434,9 @@ def main():
                 print(py_run.stderr.rstrip())
             return py_run.returncode
         print("Run (python): PASS")
-        if py_run.stdout.strip():
+        if show_py_output and py_run.stdout.strip():
             print(py_run.stdout.rstrip())
-        if py_run.stderr.strip():
+        if show_py_output and py_run.stderr.strip():
             print(py_run.stderr.rstrip())
 
     t0_transpile = time.perf_counter()
@@ -5816,6 +7453,20 @@ def main():
         print("note: structured mode not applicable; used flat mode fallback")
     if used_main_unwrap:
         print("note: unwrapped guarded main() body for transpilation")
+    if args.tee_both:
+        try:
+            src_text = Path(args.input_py).read_text(encoding="utf-8")
+            print(f"--- original: {args.input_py} ---")
+            print(src_text.rstrip())
+        except OSError:
+            pass
+    if args.tee:
+        try:
+            out_text = Path(out).read_text(encoding="utf-8")
+            print(f"--- transpiled: {out} ---")
+            print(out_text.rstrip())
+        except OSError:
+            pass
 
     if args.compile or args.run:
         compiler_parts = shlex.split(args.compiler)
@@ -5863,9 +7514,9 @@ def main():
                     print(rp.stderr.rstrip())
                 return rp.returncode
             print("Run: PASS")
-            if rp.stdout.strip():
+            if show_ft_output and rp.stdout.strip():
                 print(rp.stdout.rstrip())
-            if rp.stderr.strip():
+            if show_ft_output and rp.stderr.strip():
                 print(rp.stderr.rstrip())
             if args.run_diff and py_run is not None:
                 def _norm(s):
