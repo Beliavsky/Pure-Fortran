@@ -38,6 +38,8 @@ IDENT_RE = re.compile(r"\b([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 ACCESS_RE = re.compile(r"^\s*(public|private)\b(.*)$", re.IGNORECASE)
 CONTAINS_RE = re.compile(r"^\s*contains\b", re.IGNORECASE)
 CALL_STMT_RE = re.compile(r"^\s*call\s+([a-z][a-z0-9_]*)\s*(?:\((.*)\))?\s*$", re.IGNORECASE)
+TYPE_BLOCK_START_RE = re.compile(r"^\s*type\b(?!\s*\()", re.IGNORECASE)
+TYPE_BLOCK_END_RE = re.compile(r"^\s*end\s+type\b", re.IGNORECASE)
 
 
 @dataclass
@@ -159,8 +161,14 @@ def decl_read_names(stmt: str, tracked: Set[str], declared: Set[str]) -> Set[str
             return set()
         spec = m.group("spec")
         rhs = m.group("rhs")
-    _ = spec  # kept for symmetry/future use
     used: Set[str] = set()
+    # Count identifiers used in declaration specifiers, e.g.:
+    #   real(kind=dp) :: x
+    # where dp is a tracked named constant.
+    for m_id in IDENT_RE.finditer(spec.lower()):
+        n = m_id.group(1).lower()
+        if n in tracked and n not in declared:
+            used.add(n)
     for chunk in split_top_level_commas(rhs):
         text = chunk.strip()
         if not text:
@@ -372,10 +380,19 @@ def analyze_unit(unit: Unit) -> List[Issue]:
     tracked.update(unit.dummy_names)
     if unit.result_name:
         tracked.add(unit.result_name.lower())
+    type_depth = 0
 
     for ln, stmt in unit.body:
         low = stmt.lower().strip()
         if not low:
+            continue
+        if TYPE_BLOCK_END_RE.match(low):
+            type_depth = max(0, type_depth - 1)
+            continue
+        if TYPE_BLOCK_START_RE.match(low) and "::" in low:
+            type_depth += 1
+            continue
+        if type_depth > 0:
             continue
         if TYPE_DECL_RE.match(low):
             decls, param = parse_decl_entities(low)
@@ -685,13 +702,23 @@ def build_fix_actions_for_unit(
     write_lines_by_name: Dict[str, Set[int]] = {}
     removable_write_lines_by_name: Dict[str, Set[int]] = {}
     decl_line_by_name: Dict[str, int] = {}
+    is_parameter_by_name: Dict[str, bool] = {}
     tracked.update(unit.dummy_names)
     if unit.result_name:
         tracked.add(unit.result_name.lower())
+    type_depth = 0
 
     for ln, stmt in unit.body:
         low = stmt.lower().strip()
         if not low:
+            continue
+        if TYPE_BLOCK_END_RE.match(low):
+            type_depth = max(0, type_depth - 1)
+            continue
+        if TYPE_BLOCK_START_RE.match(low) and "::" in low:
+            type_depth += 1
+            continue
+        if type_depth > 0:
             continue
         if TYPE_DECL_RE.match(low):
             decls, _param = parse_decl_entities(low)
@@ -699,6 +726,7 @@ def build_fix_actions_for_unit(
             for n, init in decls.items():
                 tracked.add(n)
                 decl_line_by_name.setdefault(n, ln)
+                is_parameter_by_name[n] = _param
                 if init:
                     writes.add(n)
                     write_lines_by_name.setdefault(n, set()).add(ln)
@@ -750,6 +778,12 @@ def build_fix_actions_for_unit(
         removable = removable_write_lines_by_name.get(n, set())
         # Only remove declarations for variables whose every write can be removed safely.
         if write_lines.issubset(removable):
+            fixable_unused.add(n)
+            continue
+        # Named constants often have their only write as declaration initialization.
+        # If unused, removing the declaration entity is safe.
+        dln = decl_line_by_name.get(n, -1)
+        if is_parameter_by_name.get(n, False) and dln > 0 and write_lines == {dln}:
             fixable_unused.add(n)
     if fix_decl_unused:
         fixable_unused.update(decl_only_unused)
@@ -816,6 +850,45 @@ def apply_fix(
     target = out_path if out_path is not None else path
     target.write_text("".join(updated), encoding="utf-8", newline="")
     return changes, backup_path
+
+
+def remove_unused_locals_in_file(
+    path: Path,
+    *,
+    fix_decl_unused: bool = True,
+    max_iter: int = 50,
+) -> int:
+    """Iteratively remove conservatively-fixable unused locals in one file.
+
+    Returns total number of applied edit actions across iterations.
+    """
+    total_changes = 0
+    for _ in range(max_iter):
+        infos, any_missing = fscan.load_source_files([path])
+        if any_missing or not infos:
+            break
+        finfo = infos[0]
+        decl_actions: Dict[int, Set[str]] = {}
+        remove_assign_lines: Set[int] = set()
+        for unit in collect_units(finfo):
+            d_actions, r_lines = build_fix_actions_for_unit(unit, fix_decl_unused=fix_decl_unused)
+            for ln, names in d_actions.items():
+                decl_actions.setdefault(ln, set()).update(names)
+            remove_assign_lines.update(r_lines)
+        if not decl_actions and not remove_assign_lines:
+            break
+        changed, _backup = apply_fix(
+            path,
+            decl_actions,
+            remove_assign_lines,
+            backup=False,
+            show_diff=False,
+            out_path=None,
+        )
+        total_changes += changed
+        if changed == 0:
+            break
+    return total_changes
 
 
 def collect_module_symbols(finfo: fscan.SourceFileInfo) -> List[ModuleSymbol]:
