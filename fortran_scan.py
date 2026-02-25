@@ -1131,7 +1131,7 @@ def simplify_do_bounds_parens(lines: List[str]) -> List[str]:
     )
     for raw in lines:
         code, comment = _split_code_comment(raw.rstrip("\r\n"))
-        m = do_re.match(code.strip())
+        m = do_re.match(code)
         if m is None:
             out.append(raw)
             continue
@@ -1145,6 +1145,407 @@ def simplify_do_bounds_parens(lines: List[str]) -> List[str]:
             rebuilt = f"{m.group('indent')}do {m.group('ivar')} = {lb}, {ub}, {st}"
         eol = _line_eol(raw)
         out.append(f"{rebuilt}{comment}{eol}")
+    return out
+
+
+def _split_simple_relational(expr: str) -> Optional[Tuple[str, str, str]]:
+    """Split a simple top-level relational expression into lhs/op/rhs."""
+    ops = [">=", "<=", "==", "/=", ">", "<", ".ge.", ".le.", ".eq.", ".ne.", ".gt.", ".lt."]
+    in_single = False
+    in_double = False
+    depth = 0
+    s = expr.strip()
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")" and depth > 0:
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0:
+                rest = s[i:].lower()
+                hit = None
+                for op in ops:
+                    if rest.startswith(op):
+                        hit = op
+                        break
+                if hit is not None:
+                    lhs = s[:i].strip()
+                    rhs = s[i + len(hit) :].strip()
+                    if lhs and rhs:
+                        return lhs, hit, rhs
+                    return None
+        i += 1
+    return None
+
+
+def _has_top_level_logical_ops(expr: str) -> bool:
+    """Return True if expression has top-level logical operators."""
+    s = expr.strip().lower()
+    in_single = False
+    in_double = False
+    depth = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")" and depth > 0:
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0:
+                rest = s[i:]
+                if rest.startswith(".and.") or rest.startswith(".or.") or rest.startswith(".eqv.") or rest.startswith(".neqv."):
+                    return True
+        i += 1
+    return False
+
+
+def _negate_rel_op(op: str) -> Optional[str]:
+    m = {
+        ">=": "<",
+        "<=": ">",
+        ">": "<=",
+        "<": ">=",
+        "==": "/=",
+        "/=": "==",
+        ".ge.": ".lt.",
+        ".le.": ".gt.",
+        ".gt.": ".le.",
+        ".lt.": ".ge.",
+        ".eq.": ".ne.",
+        ".ne.": ".eq.",
+    }
+    return m.get(op.lower())
+
+
+def simplify_negated_relational_conditions_in_line(line: str) -> str:
+    """Simplify IF/DO WHILE conditions of form `.not. (a <op> b)`."""
+    code, comment = _split_code_comment(line.rstrip("\r\n"))
+    eol = _line_eol(line)
+
+    def _rewrite_condition(cond: str) -> Optional[str]:
+        c = cond.strip()
+        m_not = re.match(r"^\s*\.not\.\s*\((.+)\)\s*$", c, re.IGNORECASE)
+        if not m_not:
+            return None
+        inner = strip_redundant_outer_parens_expr(m_not.group(1).strip())
+        if _has_top_level_logical_ops(inner):
+            return None
+        rel = _split_simple_relational(inner)
+        if rel is None:
+            return None
+        lhs, op, rhs = rel
+        nop = _negate_rel_op(op)
+        if nop is None:
+            return None
+        return f"{lhs} {nop} {rhs}"
+
+    def _find_matching_paren(text: str, open_idx: int) -> int:
+        in_single = False
+        in_double = False
+        depth = 0
+        for i in range(open_idx, len(text)):
+            ch = text[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+        return -1
+
+    m_if_head = re.match(r"^\s*if\s*\(", code, re.IGNORECASE)
+    if m_if_head:
+        open_idx = code.find("(", m_if_head.start())
+        close_idx = _find_matching_paren(code, open_idx)
+        if close_idx > open_idx:
+            cond = code[open_idx + 1 : close_idx]
+            rest = code[close_idx + 1 :]
+            new_cond = _rewrite_condition(cond)
+            if new_cond is not None:
+                rebuilt = code[: open_idx + 1] + new_cond + code[close_idx:]
+                return f"{rebuilt}{comment}{eol}"
+            return f"{code}{comment}{eol}"
+
+    m_do_head = re.match(r"^\s*do\s+while\s*\(", code, re.IGNORECASE)
+    if m_do_head:
+        open_idx = code.find("(", m_do_head.start())
+        close_idx = _find_matching_paren(code, open_idx)
+        if close_idx > open_idx:
+            cond = code[open_idx + 1 : close_idx]
+            new_cond = _rewrite_condition(cond)
+            if new_cond is not None:
+                rebuilt = code[: open_idx + 1] + new_cond + code[close_idx:]
+                return f"{rebuilt}{comment}{eol}"
+            return f"{code}{comment}{eol}"
+
+    return f"{code}{comment}{eol}"
+
+
+def simplify_negated_relational_conditions_in_lines(lines: List[str]) -> List[str]:
+    """Apply `.not.(relational)` simplification across source lines."""
+    return [simplify_negated_relational_conditions_in_line(ln) for ln in lines]
+
+
+def rewrite_list_directed_print_reals(
+    lines: List[str],
+    *,
+    real_fmt: str = "f0.6",
+    unknown_fmt: str = "g0",
+) -> List[str]:
+    """Rewrite `print *, ...` to explicit `write` format descriptors.
+
+    The pass is conservative and type-hinted by simple declarations seen in file:
+    - known integer entities -> `i0`
+    - known logical entities -> `l1`
+    - known real entities -> `real_fmt` (default `f0.6`)
+    - quoted string literals -> `a`
+    - unknown expressions -> `unknown_fmt` (default `g0`)
+    """
+    int_names: Set[str] = set()
+    real_names: Set[str] = set()
+    logical_names: Set[str] = set()
+    int_comp_names: Set[str] = set()
+    real_comp_names: Set[str] = set()
+    logical_comp_names: Set[str] = set()
+
+    decl_head_re = re.compile(
+        r"^\s*(?P<head>integer|real(?:\s*\([^)]*\))?|double\s+precision|logical)\b",
+        re.IGNORECASE,
+    )
+    print_re = re.compile(r"^(?P<indent>\s*)print\s*\*\s*(?:,\s*(?P<args>.+))?$", re.IGNORECASE)
+    str_lit_re = re.compile(r"^\s*(?:'([^']|'')*'|\"([^\"]|\"\")*\")\s*$")
+    int_lit_re = re.compile(r"^\s*[+-]?\d+\s*$")
+    real_lit_re = re.compile(r"^\s*[+-]?(?:\d+\.\d*|\d*\.\d+|\d+[deDE][+-]?\d+)(?:_[a-z][a-z0-9_]*)?\s*$")
+    log_lit_re = re.compile(r"^\s*\.(?:true|false)\.\s*$", re.IGNORECASE)
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = _split_code_comment(raw.rstrip("\r\n"))
+        eol = _line_eol(raw)
+        code_s = code.strip()
+
+        m_decl = decl_head_re.match(code_s)
+        if m_decl:
+            names = parse_declared_names_from_decl(code_s)
+            head = m_decl.group("head").lower()
+            if head.startswith("integer"):
+                int_names.update(names)
+                int_comp_names.update(names)
+            elif head.startswith("logical"):
+                logical_names.update(names)
+                logical_comp_names.update(names)
+            else:
+                real_names.update(names)
+                real_comp_names.update(names)
+            out.append(raw)
+            continue
+
+        m_pr = print_re.match(code)
+        if m_pr is None:
+            out.append(raw)
+            continue
+
+        args_txt = (m_pr.group("args") or "").strip()
+        if not args_txt:
+            out.append(raw)
+            continue
+        items = _split_top_level_commas(args_txt)
+        if not items:
+            out.append(raw)
+            continue
+
+        fmts: List[str] = []
+        for it in items:
+            t = it.strip()
+            if not t:
+                continue
+            if str_lit_re.match(t):
+                fmts.append("a")
+                continue
+            if log_lit_re.match(t):
+                fmts.append("l1")
+                continue
+            if int_lit_re.match(t):
+                fmts.append("i0")
+                continue
+            if real_lit_re.match(t):
+                fmts.append(real_fmt)
+                continue
+            base = base_identifier(t)
+            if base is not None:
+                if base in int_names:
+                    fmts.append("i0")
+                    continue
+                if base in logical_names:
+                    fmts.append("l1")
+                    continue
+                if base in real_names:
+                    fmts.append(real_fmt)
+                    continue
+            # Derived-type component fallback: use final component name.
+            comp_hits = re.findall(r"%\s*([a-z][a-z0-9_]*)", t, re.IGNORECASE)
+            if comp_hits:
+                comp = comp_hits[-1].lower()
+                if comp in int_comp_names:
+                    fmts.append("i0")
+                    continue
+                if comp in logical_comp_names:
+                    fmts.append("l1")
+                    continue
+                if comp in real_comp_names:
+                    fmts.append(real_fmt)
+                    continue
+            fmts.append(unknown_fmt)
+
+        if len(fmts) != len(items):
+            out.append(raw)
+            continue
+        fmt = ", ".join(fmts)
+        rebuilt = f'{m_pr.group("indent")}write(*,"({fmt})") {", ".join(it.strip() for it in items)}'
+        out.append(f"{rebuilt}{comment}{eol}")
+
+    return out
+
+
+def _split_format_items(fmt_body: str) -> List[str]:
+    items: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(fmt_body)
+    while i < n:
+        ch = fmt_body[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                t = "".join(cur).strip()
+                if t:
+                    items.append(t)
+                cur = []
+                i += 1
+                continue
+        cur.append(ch)
+        i += 1
+    t = "".join(cur).strip()
+    if t:
+        items.append(t)
+    return items
+
+
+def _compact_format_items(items: List[str]) -> List[str]:
+    out: List[str] = []
+    i = 0
+    n = len(items)
+    simple_desc_re = re.compile(r"^[A-Za-z][A-Za-z0-9.]*$")
+
+    while i < n:
+        best_len = 0
+        best_rep = 1
+        max_len = (n - i) // 2
+        for blen in range(max_len, 0, -1):
+            base = items[i : i + blen]
+            rep = 1
+            while i + (rep + 1) * blen <= n and items[i + rep * blen : i + (rep + 1) * blen] == base:
+                rep += 1
+            if rep >= 2:
+                best_len = blen
+                best_rep = rep
+                break
+
+        if best_rep >= 2 and best_len >= 1:
+            block = items[i : i + best_len]
+            if best_len == 1 and simple_desc_re.match(block[0]):
+                out.append(f"{best_rep}{block[0]}")
+            else:
+                out.append(f"{best_rep}({', '.join(block)})")
+            i += best_rep * best_len
+            continue
+
+        out.append(items[i])
+        i += 1
+
+    return out
+
+
+def compact_format_descriptor_string(fmt_body: str) -> str:
+    """Compact repeated edit descriptors in a format list.
+
+    Example:
+    `a, a, f0.6, a, f0.6, a` -> `2a, 2(f0.6, a)`
+    """
+    items = _split_format_items(fmt_body)
+    if len(items) <= 1:
+        return fmt_body.strip()
+    compacted = _compact_format_items(items)
+    return ", ".join(compacted)
+
+
+def compact_repeated_edit_descriptors(lines: List[str]) -> List[str]:
+    """Rewrite WRITE/READ/PRINT format strings using repeat descriptors when possible."""
+    fmt_lit_pat = re.compile(r"(['\"])\(([^'\"]*)\)\1")
+
+    def _rewrite_code(code: str) -> str:
+        def _fmt_sub(m: re.Match[str]) -> str:
+            q, body = m.group(1), m.group(2)
+            new_body = compact_format_descriptor_string(body)
+            return f"{q}({new_body}){q}"
+
+        return fmt_lit_pat.sub(_fmt_sub, code)
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = _split_code_comment(raw.rstrip("\r\n"))
+        eol = _line_eol(raw)
+        if re.search(r"(?i)\b(?:write|read|print)\b", code):
+            code = _rewrite_code(code)
+        out.append(f"{code}{comment}{eol}")
     return out
 
 
@@ -1443,6 +1844,344 @@ def _remove_redundant_int_casts_in_stmt(stmt: str, int_names: Set[str]) -> str:
     return "".join(out_parts)
 
 
+def _simplify_size_expr_in_stmt(stmt: str, array_names: Set[str]) -> str:
+    """Simplify `size(expr)` to `size(array)` for safe elementwise-power cases."""
+
+    def _find_matching_paren(text: str, open_idx: int) -> int:
+        depth = 0
+        in_single = False
+        in_double = False
+        i = open_idx
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+            i += 1
+        return -1
+
+    i = 0
+    out_parts: List[str] = []
+    n = len(stmt)
+    while i < n:
+        m = re.search(r"\bsize\b", stmt[i:], re.IGNORECASE)
+        if m is None:
+            out_parts.append(stmt[i:])
+            break
+        abs_start = i + m.start()
+        abs_end = i + m.end()
+        out_parts.append(stmt[i:abs_start])
+        k = abs_end
+        while k < n and stmt[k].isspace():
+            k += 1
+        if k >= n or stmt[k] != "(":
+            out_parts.append(stmt[abs_start:abs_end])
+            i = abs_end
+            continue
+        close_idx = _find_matching_paren(stmt, k)
+        if close_idx < 0:
+            out_parts.append(stmt[abs_start:])
+            break
+        inner = stmt[k + 1 : close_idx]
+        inner_new = _simplify_size_expr_in_stmt(inner, array_names).strip()
+        inner_s = strip_redundant_outer_parens_expr(inner_new)
+        mpow = re.fullmatch(r"([a-z_]\w*)\s*\*\*\s*[+-]?\d+", inner_s, re.IGNORECASE)
+        if mpow is not None:
+            nm = mpow.group(1).lower()
+            if nm in array_names:
+                out_parts.append(f"size({nm})")
+            else:
+                out_parts.append(f"size({inner_new})")
+        else:
+            out_parts.append(f"size({inner_new})")
+        i = close_idx + 1
+    return "".join(out_parts)
+
+
+def simplify_size_expressions(lines: List[str]) -> List[str]:
+    """Simplify `size(expr)` where `expr` is an elementwise power of one array.
+
+    Example: `size(d**3)` -> `size(d)` when `d` is declared as an array in the unit.
+    """
+    out = list(lines)
+    unit_start_re = re.compile(
+        r"^\s*(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    declish_re = re.compile(
+        r"^\s*(?:implicit\b|use\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
+        re.IGNORECASE,
+    )
+    i = 0
+    while i < len(out):
+        if not unit_start_re.match(out[i].strip()):
+            i += 1
+            continue
+        u_start = i
+        j = i + 1
+        while j < len(out) and not unit_end_re.match(out[j].strip()):
+            j += 1
+        u_end = j
+
+        k = u_start + 1
+        while k < u_end and (not out[k].strip() or out[k].lstrip().startswith("!")):
+            k += 1
+        while k < u_end:
+            s = out[k].strip()
+            if not s or s.startswith("!") or declish_re.match(s):
+                k += 1
+                continue
+            break
+        exec_start = k
+
+        array_names: Set[str] = set()
+        for di in range(u_start + 1, exec_start):
+            code, _comment = _split_code_comment(out[di].rstrip("\r\n"))
+            if "::" not in code:
+                continue
+            lhs, rhs = code.split("::", 1)
+            lhs_low = lhs.lower()
+            lhs_has_dimension = "dimension" in lhs_low
+            for ent in _split_top_level_commas(rhs):
+                mname = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
+                if not mname:
+                    continue
+                nm = mname.group(1).lower()
+                if lhs_has_dimension or re.match(r"^\s*[a-z_]\w*\s*\(", ent, re.IGNORECASE):
+                    array_names.add(nm)
+
+        if array_names:
+            for li in range(exec_start, u_end):
+                raw = out[li]
+                eol = _line_eol(raw) or "\n"
+                code, comment = _split_code_comment(raw.rstrip("\r\n"))
+                new_code = _simplify_size_expr_in_stmt(code, array_names)
+                out[li] = f"{new_code}{comment}{eol}"
+
+        i = u_end + 1
+    return out
+
+
+def _rhs_preserves_array_size_of(rhs: str, arr: str, array_names: Set[str]) -> bool:
+    """Conservative test: rhs is elementwise expression preserving size(arr)."""
+    s = strip_redundant_outer_parens_expr(rhs.strip())
+    a = re.escape(arr)
+    # arr
+    if re.fullmatch(rf"{a}", s, re.IGNORECASE):
+        return True
+    # arr ** k
+    if re.fullmatch(rf"{a}\s*\*\*\s*[+\-]?\d+", s, re.IGNORECASE):
+        return True
+    # arr op scalar or scalar op arr
+    m1 = re.fullmatch(rf"{a}\s*([+\-*/])\s*(.+)", s, re.IGNORECASE)
+    m2 = re.fullmatch(rf"(.+)\s*([+\-*/])\s*{a}", s, re.IGNORECASE)
+    for m in (m1, m2):
+        if m is None:
+            continue
+        other = (m.group(2) if m is m1 else m.group(1)).strip()
+        bad = False
+        for tok in re.finditer(r"\b([a-z_]\w*)\b", other, re.IGNORECASE):
+            nm = tok.group(1).lower()
+            if nm in array_names and nm != arr.lower():
+                bad = True
+                break
+        if not bad:
+            return True
+    return False
+
+
+def propagate_array_size_aliases(lines: List[str]) -> List[str]:
+    """Propagate `size(lhs)` to base array when `lhs` keeps same shape as base.
+
+    Example:
+    - `d = x - m`  -> marks `d` as same-sized as `x`
+    - later `size(d)` -> `size(x)`
+    """
+    out = list(lines)
+    unit_start_re = re.compile(
+        r"^\s*(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    declish_re = re.compile(
+        r"^\s*(?:implicit\b|use\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
+        re.IGNORECASE,
+    )
+    asn_re = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+)$", re.IGNORECASE)
+    i = 0
+    while i < len(out):
+        if not unit_start_re.match(out[i].strip()):
+            i += 1
+            continue
+        u_start = i
+        j = i + 1
+        while j < len(out) and not unit_end_re.match(out[j].strip()):
+            j += 1
+        u_end = j
+
+        k = u_start + 1
+        while k < u_end and (not out[k].strip() or out[k].lstrip().startswith("!")):
+            k += 1
+        while k < u_end:
+            s = out[k].strip()
+            if not s or s.startswith("!") or declish_re.match(s):
+                k += 1
+                continue
+            break
+        exec_start = k
+
+        array_names: Set[str] = set()
+        for di in range(u_start + 1, exec_start):
+            code, _comment = _split_code_comment(out[di].rstrip("\r\n"))
+            if "::" not in code:
+                continue
+            lhs, rhs = code.split("::", 1)
+            lhs_low = lhs.lower()
+            lhs_has_dimension = "dimension" in lhs_low
+            for ent in _split_top_level_commas(rhs):
+                mname = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
+                if not mname:
+                    continue
+                nm = mname.group(1).lower()
+                if lhs_has_dimension or re.match(r"^\s*[a-z_]\w*\s*\(", ent, re.IGNORECASE):
+                    array_names.add(nm)
+
+        alias: Dict[str, str] = {}
+        for li in range(exec_start, u_end):
+            raw = out[li]
+            eol = _line_eol(raw) or "\n"
+            code, comment = _split_code_comment(raw.rstrip("\r\n"))
+            s = code.strip()
+            if not s:
+                continue
+
+            # Rewrite size(lhs_alias) in current statement.
+            for lhs_nm, base_nm in list(alias.items()):
+                size_pat = re.compile(rf"\bsize\s*\(\s*{re.escape(lhs_nm)}\s*\)", re.IGNORECASE)
+                code = size_pat.sub(f"size({base_nm})", code)
+
+            # Update aliases with simple whole-array assignment.
+            m_as = asn_re.match(code.strip())
+            if m_as:
+                lhs = m_as.group(1).lower()
+                rhs = m_as.group(2).strip()
+                alias.pop(lhs, None)
+                if lhs in array_names:
+                    for arr in array_names:
+                        base = alias.get(arr, arr)
+                        if _rhs_preserves_array_size_of(rhs, arr, array_names):
+                            alias[lhs] = base
+                            break
+
+            out[li] = f"{code}{comment}{eol}"
+
+        i = u_end + 1
+    return out
+
+
+def propagate_cached_size_values(lines: List[str]) -> List[str]:
+    """Propagate cached `n = size(x)` into later `size(x)` uses conservatively.
+
+    Rewrites `size(x)` to `n` only until a potential mutation/escape of `x`:
+    - assignment to `x` (including indexed/component forms),
+    - `allocate(...x...)` / `deallocate(...x...)` / `move_alloc(..., x)`,
+    - `call ...(...x...)`.
+    """
+    out = list(lines)
+    unit_start_re = re.compile(
+        r"^\s*(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    declish_re = re.compile(
+        r"^\s*(?:implicit\b|use\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
+        re.IGNORECASE,
+    )
+    asn_re = re.compile(r"^\s*([a-z_]\w*(?:\([^)]*\))?(?:%[a-z_]\w*(?:\([^)]*\))?)*)\s*=\s*(.+)$", re.IGNORECASE)
+    cache_re = re.compile(r"^\s*([a-z_]\w*)\s*=\s*size\s*\(\s*([a-z_]\w*)\s*\)\s*$", re.IGNORECASE)
+    i = 0
+    while i < len(out):
+        if not unit_start_re.match(out[i].strip()):
+            i += 1
+            continue
+        u_start = i
+        j = i + 1
+        while j < len(out) and not unit_end_re.match(out[j].strip()):
+            j += 1
+        u_end = j
+
+        k = u_start + 1
+        while k < u_end and (not out[k].strip() or out[k].lstrip().startswith("!")):
+            k += 1
+        while k < u_end:
+            s = out[k].strip()
+            if not s or s.startswith("!") or declish_re.match(s):
+                k += 1
+                continue
+            break
+        exec_start = k
+
+        idx = exec_start
+        while idx < u_end:
+            raw = out[idx]
+            eol = _line_eol(raw) or "\n"
+            code, comment = _split_code_comment(raw.rstrip("\r\n"))
+            m_cache = cache_re.match(code.strip())
+            if not m_cache:
+                idx += 1
+                continue
+            nvar = m_cache.group(1).lower()
+            xvar = m_cache.group(2).lower()
+            size_pat = re.compile(rf"\bsize\s*\(\s*{re.escape(xvar)}\s*\)", re.IGNORECASE)
+
+            j2 = idx + 1
+            while j2 < u_end:
+                raw2 = out[j2]
+                eol2 = _line_eol(raw2) or "\n"
+                code2, comment2 = _split_code_comment(raw2.rstrip("\r\n"))
+                low2 = code2.lower()
+
+                # Barrier: direct calls with xvar, potential mutation/alias.
+                if re.search(r"\bcall\b", low2) and re.search(rf"\b{re.escape(xvar)}\b", low2):
+                    break
+                # Barrier: allocation/deallocation/move_alloc mentions xvar.
+                if (
+                    (("allocate(" in low2) or ("allocate (" in low2) or ("deallocate(" in low2) or ("deallocate (" in low2))
+                    and re.search(rf"\b{re.escape(xvar)}\b", low2)
+                ):
+                    break
+                if "move_alloc" in low2 and re.search(rf"\b{re.escape(xvar)}\b", low2):
+                    break
+                # Barrier: assignment to xvar (possibly indexed/componented).
+                m_as = asn_re.match(code2.strip())
+                if m_as:
+                    lhs = m_as.group(1).strip().lower()
+                    lhs_base = re.split(r"[%(\s]", lhs, maxsplit=1)[0]
+                    if lhs_base == xvar:
+                        break
+                    if lhs_base == nvar:
+                        break
+
+                if size_pat.search(code2):
+                    new_code2 = size_pat.sub(nvar, code2)
+                    out[j2] = f"{new_code2}{comment2}{eol2}"
+
+                j2 += 1
+            idx += 1
+
+        i = u_end + 1
+    return out
+
+
 def remove_redundant_int_casts(lines: List[str]) -> List[str]:
     """Remove unnecessary int(...) casts based on local integer declarations."""
     out = list(lines)
@@ -1571,6 +2310,156 @@ def remove_redundant_real_casts(lines: List[str]) -> List[str]:
                     return m.group(0)
 
                 new_code = cast_re.sub(_repl, code)
+                out[li] = f"{new_code}{comment}{eol}"
+
+        i = u_end + 1
+    return out
+
+
+def _expr_is_real_like(expr: str, real_names: Set[str]) -> bool:
+    """Conservative real-typed heuristic for local expression fragments."""
+    s = expr.strip()
+    if not s:
+        return False
+    if re.search(r"\b\d+\.\d*(?:[de][+\-]?\d+)?(?:_dp)?\b", s, re.IGNORECASE):
+        return True
+    if re.search(r"\b\d+[de][+\-]?\d+(?:_dp)?\b", s, re.IGNORECASE):
+        return True
+    m = re.match(r"^[a-z_]\w*(?:\s*\([^)]*\))?$", s, re.IGNORECASE)
+    if m:
+        base = re.match(r"^([a-z_]\w*)", s, re.IGNORECASE)
+        if base and base.group(1).lower() in real_names:
+            return True
+    # Common real-valued intrinsic calls / constructors.
+    if re.search(
+        r"\b(?:real|sqrt|log|exp|sin|cos|tan|asin|acos|atan|minval|maxval|sum|mean|dot_product)\s*\(",
+        s,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def simplify_real_int_casts_in_mixed_expr(lines: List[str]) -> List[str]:
+    """Drop `real(int_expr, kind=dp|real64)` where mixed arithmetic already promotes.
+
+    Safe conservative cases:
+    - `REAL_TERM op real(INT_EXPR, kind=dp|real64)` -> `REAL_TERM op INT_EXPR`
+    - `real(INT_EXPR, kind=dp|real64) op REAL_TERM` -> `INT_EXPR op REAL_TERM`
+    with `op` in `+ - * /`, `INT_EXPR` provably integer, and opposite term
+    provably real-like.
+    """
+    out = list(lines)
+    unit_start_re = re.compile(
+        r"^\s*(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    declish_re = re.compile(
+        r"^\s*(?:implicit\b|use\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
+        re.IGNORECASE,
+    )
+    i = 0
+    while i < len(out):
+        if not unit_start_re.match(out[i].strip()):
+            i += 1
+            continue
+        u_start = i
+        j = i + 1
+        while j < len(out) and not unit_end_re.match(out[j].strip()):
+            j += 1
+        u_end = j
+
+        k = u_start + 1
+        while k < u_end and (not out[k].strip() or out[k].lstrip().startswith("!")):
+            k += 1
+        while k < u_end:
+            s = out[k].strip()
+            if not s or s.startswith("!") or declish_re.match(s):
+                k += 1
+                continue
+            break
+        exec_start = k
+
+        int_names: Set[str] = set()
+        real_names: Set[str] = set()
+        for di in range(u_start + 1, exec_start):
+            code, _comment = _split_code_comment(out[di].rstrip("\r\n"))
+            if "::" not in code:
+                continue
+            lhs, rhs = code.split("::", 1)
+            lhs_low = lhs.lower()
+            if re.match(r"^\s*integer\b", lhs_low):
+                for ent in _split_top_level_commas(rhs):
+                    m = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
+                    if m:
+                        int_names.add(m.group(1).lower())
+            elif re.match(r"^\s*real\b", lhs_low):
+                for ent in _split_top_level_commas(rhs):
+                    m = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
+                    if m:
+                        real_names.add(m.group(1).lower())
+
+        if int_names:
+            cast_pat = (
+                r"real\s*\(\s*(?P<inner>.+?)\s*,\s*kind\s*=\s*(?:dp|real64)\s*\)"
+            )
+            div_rhs_pat = re.compile(
+                rf"(?P<lhs>.+?)\s*/\s*{cast_pat}",
+                re.IGNORECASE,
+            )
+            div_lhs_pat = re.compile(
+                rf"{cast_pat}\s*/\s*(?P<rhs>.+)",
+                re.IGNORECASE,
+            )
+            lhs_pat = re.compile(
+                rf"(?P<lhs>[a-z_]\w*(?:\s*\([^)]*\))?)\s*(?P<op>[+\-*/])\s*{cast_pat}",
+                re.IGNORECASE,
+            )
+            rhs_pat = re.compile(
+                rf"{cast_pat}\s*(?P<op>[+\-*/])\s*(?P<rhs>[a-z_]\w*(?:\s*\([^)]*\))?)",
+                re.IGNORECASE,
+            )
+            for li in range(exec_start, u_end):
+                raw = out[li]
+                eol = _line_eol(raw) or "\n"
+                code, comment = _split_code_comment(raw.rstrip("\r\n"))
+
+                def _repl_lhs(m: re.Match[str]) -> str:
+                    lhs = m.group("lhs")
+                    op = m.group("op")
+                    inner = m.group("inner").strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(lhs, real_names):
+                        return f"{lhs} {op} {inner}"
+                    return m.group(0)
+
+                def _repl_rhs(m: re.Match[str]) -> str:
+                    rhs = m.group("rhs")
+                    op = m.group("op")
+                    inner = m.group("inner").strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(rhs, real_names):
+                        return f"{inner} {op} {rhs}"
+                    return m.group(0)
+
+                def _repl_div_rhs(m: re.Match[str]) -> str:
+                    lhs = m.group("lhs").strip()
+                    inner = m.group("inner").strip()
+                    lhs_expr = lhs.rsplit("=", 1)[-1].strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(lhs_expr, real_names):
+                        return f"{lhs} / {inner}"
+                    return m.group(0)
+
+                def _repl_div_lhs(m: re.Match[str]) -> str:
+                    rhs = m.group("rhs").strip()
+                    inner = m.group("inner").strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(rhs, real_names):
+                        return f"{inner} / {rhs}"
+                    return m.group(0)
+
+                new_code = div_rhs_pat.sub(_repl_div_rhs, code)
+                new_code = div_lhs_pat.sub(_repl_div_lhs, new_code)
+                new_code = lhs_pat.sub(_repl_lhs, new_code)
+                new_code = rhs_pat.sub(_repl_rhs, new_code)
                 out[li] = f"{new_code}{comment}{eol}"
 
         i = u_end + 1
@@ -1839,6 +2728,93 @@ def wrap_long_declaration_lines(lines: List[str], max_len: int = 80) -> List[str
     return out
 
 
+def _is_comment_or_preproc_body(body: str) -> bool:
+    """True for comment/preprocessor-only physical lines."""
+    s = body.lstrip()
+    if not s:
+        return False
+    return s.startswith("!") or s.startswith("#")
+
+
+def _break_candidates_for_wrap(body: str, start: int, end: int) -> List[int]:
+    """Safe split points outside quoted strings."""
+    out: List[int] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < len(body) and body[i + 1] == "'":
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < len(body) and body[i + 1] == '"':
+                i += 2
+                continue
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double and start <= i <= end:
+            if ch.isspace() or ch in ",+-*/)=]":
+                out.append(i)
+        i += 1
+    return out
+
+
+def wrap_long_fortran_line(body: str, max_len: int = 80) -> Optional[List[str]]:
+    """Wrap one long free-form Fortran line with `&` continuation.
+
+    Returns `None` when no conservative wrap point is found.
+    """
+    if len(body) <= max_len:
+        return [body]
+    if _is_comment_or_preproc_body(body):
+        return None
+
+    indent = re.match(r"^\s*", body).group(0)
+    cont_indent = indent + "   "
+    lines: List[str] = []
+    cur = body
+    first = True
+
+    while len(cur) > max_len:
+        prefix = indent if first else (cont_indent + "& ")
+        min_split = len(prefix) + 8
+        max_split = max_len - 2  # reserve for trailing " &"
+        if max_split <= min_split:
+            return None
+        cands = _break_candidates_for_wrap(cur, min_split, max_split)
+        if not cands:
+            return None
+        cut = cands[-1]
+        left = cur[:cut].rstrip()
+        right = cur[cut:].lstrip()
+        if not left or not right:
+            return None
+        lines.append(f"{left} &")
+        cur = f"{cont_indent}& {right}"
+        first = False
+
+    lines.append(cur)
+    return lines
+
+
+def wrap_long_fortran_lines(lines: List[str], max_len: int = 80) -> List[str]:
+    """Wrap long free-form Fortran lines; keep unwrappable lines unchanged."""
+    out: List[str] = []
+    for line in lines:
+        wrapped = wrap_long_fortran_line(line, max_len=max_len)
+        if wrapped is None:
+            out.append(line)
+        else:
+            out.extend(wrapped)
+    return out
+
+
 def remove_empty_if_blocks(lines: List[str]) -> List[str]:
     """Remove conservative empty IF blocks:
 
@@ -1898,6 +2874,339 @@ def remove_empty_if_blocks(lines: List[str]) -> List[str]:
         i += 1
 
     return out
+
+
+def _split_code_comment(line: str) -> Tuple[str, str]:
+    """Split a Fortran source line into code and trailing comment."""
+    if line.startswith("\ufeff"):
+        line = line[1:]
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "!" and not in_single and not in_double:
+            return line[:i], line[i:]
+    return line, ""
+
+
+def _strip_outer_parens(s: str) -> str:
+    """Strip one or more layers of redundant outer parentheses."""
+    t = s.strip()
+    while t.startswith("(") and t.endswith(")"):
+        depth = 0
+        ok = True
+        in_single = False
+        in_double = False
+        for idx, ch in enumerate(t):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and idx != len(t) - 1:
+                        ok = False
+                        break
+        if ok and depth == 0:
+            t = t[1:-1].strip()
+        else:
+            break
+    return t
+
+
+def _tokenize_const_logical_expr(expr: str) -> Optional[List[str]]:
+    """Tokenize a logical expression containing only literal logical tokens."""
+    s = expr.strip().lower()
+    tokens: List[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "()":
+            tokens.append(ch)
+            i += 1
+            continue
+        if s.startswith(".true.", i):
+            tokens.append(".true.")
+            i += 6
+            continue
+        if s.startswith(".false.", i):
+            tokens.append(".false.")
+            i += 7
+            continue
+        if s.startswith(".not.", i):
+            tokens.append(".not.")
+            i += 5
+            continue
+        if s.startswith(".and.", i):
+            tokens.append(".and.")
+            i += 5
+            continue
+        if s.startswith(".or.", i):
+            tokens.append(".or.")
+            i += 4
+            continue
+        if s.startswith(".eqv.", i):
+            tokens.append(".eqv.")
+            i += 5
+            continue
+        if s.startswith(".neqv.", i):
+            tokens.append(".neqv.")
+            i += 6
+            continue
+        return None
+    return tokens
+
+
+def _eval_const_logical_expr(expr: str, *, aggressive: bool) -> Optional[bool]:
+    """Evaluate logical expressions that are compile-time constants."""
+    s = _strip_outer_parens(expr)
+    if not aggressive:
+        # Conservative default: only literal true/false with optional .not. chain.
+        t = re.sub(r"\s+", "", s.lower())
+        t = t.replace("(", "").replace(")", "")
+        not_count = 0
+        while t.startswith(".not."):
+            not_count += 1
+            t = t[5:]
+        if t not in (".true.", ".false."):
+            return None
+        base = (t == ".true.")
+        return (not base) if (not_count % 2 == 1) else base
+
+    tokens = _tokenize_const_logical_expr(s)
+    if tokens is None:
+        return None
+    pos = 0
+
+    def parse_primary() -> Optional[bool]:
+        nonlocal pos
+        if pos >= len(tokens):
+            return None
+        tk = tokens[pos]
+        if tk == ".true.":
+            pos += 1
+            return True
+        if tk == ".false.":
+            pos += 1
+            return False
+        if tk == "(":
+            pos += 1
+            val = parse_or()
+            if val is None or pos >= len(tokens) or tokens[pos] != ")":
+                return None
+            pos += 1
+            return val
+        return None
+
+    def parse_not() -> Optional[bool]:
+        nonlocal pos
+        if pos < len(tokens) and tokens[pos] == ".not.":
+            pos += 1
+            rhs = parse_not()
+            return (None if rhs is None else (not rhs))
+        return parse_primary()
+
+    def parse_and() -> Optional[bool]:
+        nonlocal pos
+        left = parse_not()
+        if left is None:
+            return None
+        while pos < len(tokens) and tokens[pos] == ".and.":
+            pos += 1
+            right = parse_not()
+            if right is None:
+                return None
+            left = left and right
+        return left
+
+    def parse_or() -> Optional[bool]:
+        nonlocal pos
+        left = parse_and()
+        if left is None:
+            return None
+        while pos < len(tokens) and tokens[pos] in (".or.", ".eqv.", ".neqv."):
+            op = tokens[pos]
+            pos += 1
+            right = parse_and()
+            if right is None:
+                return None
+            if op == ".or.":
+                left = left or right
+            elif op == ".eqv.":
+                left = (left == right)
+            else:
+                left = (left != right)
+        return left
+
+    val = parse_or()
+    if val is None or pos != len(tokens):
+        return None
+    return val
+
+
+def simplify_constant_if_blocks(lines: List[str], *, aggressive: bool = False) -> List[str]:
+    """Fold IF constructs whose conditions are compile-time logical constants.
+
+    Conservative default (`aggressive=False`) simplifies only literal-constant
+    conditions like `.true.`, `.false.`, and optional `.not.` chains.
+    Aggressive mode also folds constant logical expressions over
+    `.true./.false.` with `.not./.and./.or./.eqv./.neqv.` and parentheses.
+    """
+    if_then_re = re.compile(r"^(?P<indent>\s*)if\s*\((?P<cond>.*)\)\s*then\s*$", re.IGNORECASE)
+    elseif_re = re.compile(r"^\s*else\s*if\s*\((?P<cond>.*)\)\s*then\s*$", re.IGNORECASE)
+    else_re = re.compile(r"^\s*else\s*$", re.IGNORECASE)
+    end_if_re = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
+    one_if_re = re.compile(r"^(?P<indent>\s*)if\s*\((?P<cond>[^)]*)\)\s*(?P<stmt>.+?)\s*$", re.IGNORECASE)
+
+    def _deindent_branch(branch_lines: List[str], if_indent: str) -> List[str]:
+        """De-indent selected folded branch by one block level."""
+        if not branch_lines:
+            return branch_lines
+        nonblank = [ln for ln in branch_lines if ln.strip()]
+        if not nonblank:
+            return branch_lines
+
+        min_extra: Optional[int] = None
+        for ln in nonblank:
+            m = re.match(r"^(\s*)", ln)
+            lead = m.group(1) if m else ""
+            if not lead.startswith(if_indent):
+                continue
+            extra = len(lead) - len(if_indent)
+            if extra <= 0:
+                continue
+            if min_extra is None or extra < min_extra:
+                min_extra = extra
+        if not min_extra:
+            return branch_lines
+
+        out_b: List[str] = []
+        for ln in branch_lines:
+            if not ln.strip():
+                out_b.append(ln)
+                continue
+            m = re.match(r"^(\s*)", ln)
+            lead = m.group(1) if m else ""
+            if lead.startswith(if_indent) and len(lead) >= len(if_indent) + min_extra:
+                new_lead = if_indent + lead[len(if_indent) + min_extra :]
+                out_b.append(new_lead + ln[len(lead) :])
+            else:
+                out_b.append(ln)
+        return out_b
+
+    def _recurse(seg: List[str]) -> List[str]:
+        out: List[str] = []
+        i = 0
+        while i < len(seg):
+            code_i, cmt_i = _split_code_comment(seg[i])
+            stmt_i = code_i.strip()
+            m_block = if_then_re.match(code_i)
+            if m_block:
+                depth = 1
+                j = i + 1
+                branches: List[Tuple[str, Optional[str], int, int]] = []
+                branch_kind = "if"
+                branch_cond: Optional[str] = m_block.group("cond")
+                branch_start = i + 1
+                end_idx = -1
+                while j < len(seg):
+                    code_j = strip_comment(seg[j]).strip()
+                    if if_then_re.match(code_j):
+                        depth += 1
+                        j += 1
+                        continue
+                    if end_if_re.match(code_j):
+                        depth -= 1
+                        if depth == 0:
+                            branches.append((branch_kind, branch_cond, branch_start, j))
+                            end_idx = j
+                            break
+                        j += 1
+                        continue
+                    if depth == 1:
+                        m_elseif = elseif_re.match(code_j)
+                        if m_elseif:
+                            branches.append((branch_kind, branch_cond, branch_start, j))
+                            branch_kind = "elseif"
+                            branch_cond = m_elseif.group("cond")
+                            branch_start = j + 1
+                            j += 1
+                            continue
+                        if else_re.match(code_j):
+                            branches.append((branch_kind, branch_cond, branch_start, j))
+                            branch_kind = "else"
+                            branch_cond = None
+                            branch_start = j + 1
+                            j += 1
+                            continue
+                    j += 1
+
+                if end_idx < 0:
+                    out.append(seg[i])
+                    i += 1
+                    continue
+
+                evals: List[Tuple[str, Optional[bool], int, int]] = []
+                can_fold = True
+                for kind, cond, bstart, bend in branches:
+                    if kind == "else":
+                        evals.append((kind, None, bstart, bend))
+                        continue
+                    cval = _eval_const_logical_expr(cond or "", aggressive=aggressive)
+                    if cval is None:
+                        can_fold = False
+                        break
+                    evals.append((kind, cval, bstart, bend))
+                if not can_fold:
+                    out.append(seg[i])
+                    i += 1
+                    continue
+
+                chosen: Optional[Tuple[int, int]] = None
+                for kind, cval, bstart, bend in evals:
+                    if kind == "else":
+                        chosen = (bstart, bend)
+                        break
+                    if cval:
+                        chosen = (bstart, bend)
+                        break
+                if chosen is not None:
+                    selected = _recurse(seg[chosen[0] : chosen[1]])
+                    selected = _deindent_branch(selected, m_block.group("indent"))
+                    out.extend(selected)
+                i = end_idx + 1
+                continue
+
+            m_one = one_if_re.match(code_i)
+            if m_one:
+                stmt_rhs = m_one.group("stmt").strip()
+                if stmt_rhs.lower() != "then":
+                    cval = _eval_const_logical_expr(m_one.group("cond"), aggressive=aggressive)
+                    if cval is True:
+                        rebuilt = f"{m_one.group('indent')}{stmt_rhs}"
+                        if cmt_i:
+                            rebuilt = f"{rebuilt} {cmt_i.strip()}"
+                        out.append(rebuilt)
+                        i += 1
+                        continue
+                    if cval is False:
+                        i += 1
+                        continue
+
+            out.append(seg[i])
+            i += 1
+        return out
+
+    return _recurse(lines)
 
 
 def demote_fixed_size_single_allocatables(lines: List[str]) -> List[str]:
@@ -3527,3 +4836,11 @@ def build_compile_closure(requested_files: List[SourceFileInfo]) -> Tuple[List[P
     needed_infos = [by_path[p] for p in needed_paths if p in by_path]
     ordered_infos, _ = order_files_least_dependent(needed_infos)
     return [f.path for f in ordered_infos], unresolved
+
+
+def normalize_numeric_leading_zeros_text(text: str) -> str:
+    """Normalize numeric tokens like `.5`/`-.5` to `0.5`/`-0.5` in text output."""
+    out = re.sub(r"(?<![\w.])-\.(\d+(?:[eE][+-]?\d+)?)", r"-0.\1", text)
+    out = re.sub(r"(?<![\w.])\+\.(\d+(?:[eE][+-]?\d+)?)", r"+0.\1", out)
+    out = re.sub(r"(?<![\w.+-])\.(\d+(?:[eE][+-]?\d+)?)", r"0.\1", out)
+    return out
