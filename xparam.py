@@ -1048,6 +1048,39 @@ def analyze_file(path: Path, allow_alloc_promotion: bool) -> Tuple[List[Candidat
     return candidates, exclusions
 
 
+def promote_parameter_candidates_in_file(
+    path: Path,
+    *,
+    allow_alloc_promotion: bool = True,
+    aggressive: bool = True,
+    annotate: bool = False,
+    max_iter: int = 100,
+    create_backup: bool = False,
+) -> Tuple[int, int]:
+    """Promote xparam candidates in one file until convergence.
+
+    Returns `(applied, skipped)` counts across all iterations.
+    """
+    total_applied = 0
+    total_skipped = 0
+    for _ in range(max_iter):
+        iter_candidates, _iter_exclusions = analyze_file(path, allow_alloc_promotion=allow_alloc_promotion)
+        if not iter_candidates:
+            break
+        applied, skipped, _backup = apply_fixes_for_file(
+            path,
+            iter_candidates,
+            aggressive=aggressive,
+            annotate=annotate,
+            create_backup=create_backup,
+        )
+        total_applied += applied
+        total_skipped += len(skipped)
+        if applied == 0:
+            break
+    return total_applied, total_skipped
+
+
 def main() -> int:
     """Run candidate constant analysis on selected Fortran files."""
     parser = argparse.ArgumentParser(
