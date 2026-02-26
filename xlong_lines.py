@@ -111,37 +111,7 @@ def wrap_long_line(body: str, max_len: int) -> Optional[List[str]]:
 
     Returns None when no conservative wrap point is found.
     """
-    if len(body) <= max_len:
-        return [body]
-    if is_comment_or_preproc(body):
-        return None
-
-    indent = re.match(r"^\s*", body).group(0)
-    cont_indent = indent + "   "
-    lines: List[str] = []
-    cur = body
-    first = True
-
-    while len(cur) > max_len:
-        prefix = indent if first else (cont_indent + "& ")
-        min_split = len(prefix) + 8
-        max_split = max_len - 2  # reserve for trailing " &"
-        if max_split <= min_split:
-            return None
-        cands = break_candidates(cur, min_split, max_split)
-        if not cands:
-            return None
-        cut = cands[-1]
-        left = cur[:cut].rstrip()
-        right = cur[cut:].lstrip()
-        if not left or not right:
-            return None
-        lines.append(f"{left} &")
-        cur = f"{cont_indent}& {right}"
-        first = False
-
-    lines.append(cur)
-    return lines
+    return fscan.wrap_long_fortran_line(body, max_len=max_len)
 
 
 def analyze_file(path: Path, max_len: int) -> List[Finding]:
