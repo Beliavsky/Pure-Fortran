@@ -49,6 +49,7 @@ Main programs:
 - `xf2c.py` - practical Fortran-to-C transpiler for a supported free-form Fortran subset, with build/run and per-file modes.
 - `xlegal.py` - lightweight Fortran legality validator (statement/form checks, implicit-none/declaration sanity, duplicate checks).
 - `xfix.py` - conservative auto-fixer for common structural issues (for example end-name mismatches, duplicate defs/decls, simple paren fixes).
+- `xerror_loc.py` - annotate `error stop` messages with file/line (and optional scope), with optional condition-value expansion for IF-guarded stops.
 - `xset_array.py` - advisory checker for replacing consecutive scalar array-element assignments with one array assignment.
 - `xarray.py` - advisory checker for simple loops replaceable by array operations (`sum/product/count` and elementwise forms).
 - `xto_loop.py` - advisory checker/fixer that reverses selected array operations to explicit loops (for benchmarking/audit round-trips).
@@ -941,6 +942,30 @@ Notes:
 - Repairs selected end-statement name mismatches and simple unambiguous parenthesis issues.
 - Can remove duplicate procedure definitions (keeping the last) and duplicate declarations (keeping the first), with reporting.
 - Complements `xlegal.py` by applying safe automated corrections where possible.
+
+### `xerror_loc.py`
+
+Rewriter for `error stop` diagnostics:
+
+- Appends source location tags to literal `error stop "..."` messages.
+- Optional `--condition-values` mode rewrites valid IF-guarded error-stop forms to include values from the condition.
+- Location tags can include scope context (module/procedure) and line, for example `file.f90::module m::function f::line 42`.
+
+Typical commands:
+
+```bash
+python xerror_loc.py foo.f90
+python xerror_loc.py foo.f90 --fix
+python xerror_loc.py foo.f90 --condition-values --fix
+python xerror_loc.py foo.f90 --out transformed.f90 --run
+python xerror_loc.py foo.f90 --run-both --tee-both
+```
+
+Notes:
+
+- Uses shared line-wrapping logic (`fortran_scan.py`) with `--max-len` (default 80).
+- Conservative by default: skips unsupported/non-literal `error stop` forms and suspicious invalid IF patterns.
+- Supports compile/run and source preview flows via `--run`, `--run-both`, `--tee`, and `--tee-both`.
 
 ### 29) `xbounds.py`
 
