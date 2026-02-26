@@ -4526,7 +4526,15 @@ def iter_fortran_statements(lines: Iterable[str]) -> List[Tuple[int, str]]:
     return out
 
 
-def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
+def indent_fortran_blocks(
+    text: str,
+    *,
+    indent_step: int = 3,
+    indent_proc: bool = False,
+    indent_module: bool = False,
+    indent_program: bool = False,
+    indent_contains: bool = False,
+) -> str:
     """Indent Fortran control blocks (do/if/select/case/block) consistently.
 
     This is a lightweight, line-based indenter intended for generated code.
@@ -4569,6 +4577,45 @@ def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
             return False
         return "::" in c and not re.match(r"^\s*end\s+type\b", c, re.IGNORECASE)
 
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:[a-z][a-z0-9_]*(?:\s*\([^)]*\))?)\s+)?(function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    module_start_re = re.compile(r"^\s*module\s+[a-z][a-z0-9_]*\b", re.IGNORECASE)
+    module_proc_re = re.compile(r"^\s*module\s+procedure\b", re.IGNORECASE)
+    program_start_re = re.compile(r"^\s*program\b", re.IGNORECASE)
+    end_module_re = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
+    end_program_re = re.compile(r"^\s*end\s+program\b", re.IGNORECASE)
+    end_proc_re = re.compile(r"^\s*end\s+(function|subroutine)\b", re.IGNORECASE)
+    contains_re = re.compile(r"^\s*contains\b", re.IGNORECASE)
+
+    unit_stack: List[dict] = []
+
+    def _unit_kind_start(code_line: str) -> Optional[str]:
+        c = code_line.strip()
+        if not c:
+            return None
+        if re.match(r"^\s*end\b", c, re.IGNORECASE):
+            return None
+        if module_proc_re.match(c):
+            return None
+        if module_start_re.match(c):
+            return "module"
+        if program_start_re.match(c):
+            return "program"
+        m = unit_start_re.match(c)
+        if m:
+            return m.group(1).lower()
+        return None
+
+    def _unit_end_matches(code_line: str, kind: str) -> bool:
+        c = code_line.strip()
+        if kind == "module":
+            return bool(end_module_re.match(c))
+        if kind == "program":
+            return bool(end_program_re.match(c))
+        return bool(end_proc_re.match(c))
+
     for raw in lines:
         stripped = raw.strip()
         if not stripped:
@@ -4576,6 +4623,13 @@ def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
             continue
 
         code = strip_comment(raw).strip()
+        if code and unit_stack and _unit_end_matches(code, unit_stack[-1]["kind"]):
+            if unit_stack[-1].get("contains_active", False):
+                level = max(0, level - 1)
+            if unit_stack[-1].get("unit_indent", False):
+                level = max(0, level - 1)
+            unit_stack.pop()
+
         if code and dedent_before.match(code):
             level = max(0, level - 1)
 
@@ -4584,6 +4638,25 @@ def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
         if code and _is_derived_type_start(code):
             level += 1
             continue
+
+        if code and contains_re.match(code) and unit_stack:
+            if indent_contains and not unit_stack[-1].get("contains_active", False):
+                unit_stack[-1]["contains_active"] = True
+                level += 1
+            continue
+
+        if code:
+            k = _unit_kind_start(code)
+            if k is not None:
+                indent_unit = (
+                    (k == "module" and indent_module)
+                    or (k == "program" and indent_program)
+                    or (k in {"function", "subroutine"} and indent_proc)
+                )
+                unit_stack.append({"kind": k, "unit_indent": bool(indent_unit), "contains_active": False})
+                if indent_unit:
+                    level += 1
+                continue
 
         if code and indent_after.match(code):
             # Exclude one-line IF from opening a new block unless it ends with THEN.
