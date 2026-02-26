@@ -2602,7 +2602,85 @@ def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[st
                     tail = "" if is_last else ", &"
                     out.append(f"{indent}   & {nm}{tail}{eol}")
         i = j
-    return out
+    def _consume_statement(src: List[str], start: int) -> Tuple[int, str, bool, str, List[str]]:
+        """Consume one free-form statement with continuation lines."""
+        k = start
+        parts: List[str] = []
+        raw_chunk: List[str] = []
+        has_inline_comment = False
+        eol = "\n"
+        first = True
+        while k < len(src):
+            raw = src[k]
+            raw_chunk.append(raw)
+            eol_k = _line_eol(raw)
+            if eol_k:
+                eol = eol_k
+            body = raw.rstrip("\r\n")
+            code_k, comment_k = _split_code_comment(body)
+            if comment_k.strip() and code_k.strip():
+                has_inline_comment = True
+            seg = code_k.rstrip()
+            if not first:
+                lead = seg.lstrip()
+                if lead.startswith("&"):
+                    seg = lead[1:].lstrip()
+            first = False
+            cont = seg.endswith("&")
+            if cont:
+                seg = seg[:-1].rstrip()
+            if seg:
+                parts.append(seg)
+            k += 1
+            if not cont:
+                break
+        return k, " ".join(parts).strip(), has_inline_comment, eol, raw_chunk
+
+    def _coalesce_visibility_statements(src: List[str]) -> List[str]:
+        out_vis: List[str] = []
+        i_vis = 0
+        vis_re = re.compile(r"^(\s*)(public|private)\s*::\s*(.+)$", re.IGNORECASE)
+        while i_vis < len(src):
+            j1, stmt1, cmt1, _eol1, raw1 = _consume_statement(src, i_vis)
+            m1 = vis_re.match(stmt1)
+            if not m1 or cmt1:
+                out_vis.extend(raw1)
+                i_vis = j1
+                continue
+
+            indent = m1.group(1)
+            vis_kw = m1.group(2).lower()
+            names: List[str] = []
+            names.extend(_split_top_level_commas(m1.group(3).strip()))
+            group_end = j1
+            eol = _eol1
+            n_stmts = 1
+
+            while group_end < len(src):
+                j2, stmt2, cmt2, eol2, raw2 = _consume_statement(src, group_end)
+                m2 = vis_re.match(stmt2)
+                if not m2 or cmt2 or m2.group(1) != indent or m2.group(2).lower() != vis_kw:
+                    break
+                names.extend(_split_top_level_commas(m2.group(3).strip()))
+                eol = eol2
+                n_stmts += 1
+                group_end = j2
+
+            if n_stmts == 1:
+                out_vis.extend(raw1)
+                i_vis = j1
+                continue
+
+            merged = f"{indent}{vis_kw} :: {', '.join(names)}"
+            if len(merged) <= max_len:
+                out_vis.append(f"{merged}{eol}")
+            else:
+                wrapped_vis = wrap_long_declaration_lines([f"{merged}{eol}"], max_len=max_len)
+                out_vis.extend(wrapped_vis)
+            i_vis = group_end
+        return out_vis
+
+    return _coalesce_visibility_statements(out)
 
 
 def wrap_long_declaration_lines(lines: List[str], max_len: int = 80) -> List[str]:
@@ -2765,6 +2843,39 @@ def _break_candidates_for_wrap(body: str, start: int, end: int) -> List[int]:
     return out
 
 
+def _preferred_named_arg_break(body: str, start: int, end: int) -> Optional[int]:
+    """Prefer wrapping after a comma before a `name = value` argument."""
+    in_single = False
+    in_double = False
+    best: Optional[int] = None
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < n and body[i + 1] == "'":
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < n and body[i + 1] == '"':
+                i += 2
+                continue
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double and ch == "," and start <= i < end:
+            j = i + 1
+            while j < n and body[j].isspace():
+                j += 1
+            if re.match(r"[a-z][a-z0-9_]*\s*=", body[j:], re.IGNORECASE):
+                best = i + 1  # keep comma on the left line
+        i += 1
+    return best
+
+
 def wrap_long_fortran_line(body: str, max_len: int = 80) -> Optional[List[str]]:
     """Wrap one long free-form Fortran line with `&` continuation.
 
@@ -2790,7 +2901,9 @@ def wrap_long_fortran_line(body: str, max_len: int = 80) -> Optional[List[str]]:
         cands = _break_candidates_for_wrap(cur, min_split, max_split)
         if not cands:
             return None
-        cut = cands[-1]
+        cut = _preferred_named_arg_break(cur, min_split, max_split)
+        if cut is None:
+            cut = cands[-1]
         left = cur[:cut].rstrip()
         right = cur[cut:].lstrip()
         if not left or not right:
@@ -3964,7 +4077,7 @@ def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
 
     dedent_before = re.compile(
         r"^\s*(?:"
-        r"end\s+(?:do|if|select|block|associate|where)"
+        r"end\s+(?:do|if|select|block|associate|where|type)"
         r"|else(?:\s+if\b.*\bthen)?"
         r"|case\b(?:\s+default|\s*\()?"
         r")\b",
@@ -3981,6 +4094,17 @@ def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
         r")",
         re.IGNORECASE,
     )
+    type_start_re = re.compile(r"^\s*type\b(?!\s*\()", re.IGNORECASE)
+
+    def _is_derived_type_start(code_line: str) -> bool:
+        c = code_line.strip()
+        if not c or not type_start_re.match(c):
+            return False
+        if re.match(r"^\s*type\s+is\s*\(", c, re.IGNORECASE):
+            return False
+        if re.match(r"^\s*type\s*\(", c, re.IGNORECASE):
+            return False
+        return "::" in c and not re.match(r"^\s*end\s+type\b", c, re.IGNORECASE)
 
     for raw in lines:
         stripped = raw.strip()
@@ -3993,6 +4117,10 @@ def indent_fortran_blocks(text: str, *, indent_step: int = 3) -> str:
             level = max(0, level - 1)
 
         out.append(f"{step * level}{stripped}")
+
+        if code and _is_derived_type_start(code):
+            level += 1
+            continue
 
         if code and indent_after.match(code):
             # Exclude one-line IF from opening a new block unless it ends with THEN.
@@ -4844,3 +4972,312 @@ def normalize_numeric_leading_zeros_text(text: str) -> str:
     out = re.sub(r"(?<![\w.])\+\.(\d+(?:[eE][+-]?\d+)?)", r"+0.\1", out)
     out = re.sub(r"(?<![\w.+-])\.(\d+(?:[eE][+-]?\d+)?)", r"0.\1", out)
     return out
+
+
+@dataclass
+class ProcedureInterface:
+    name: str
+    args: List[str]
+    optional_args: Set[str]
+
+
+def _split_top_level_commas_expr(text: str) -> List[str]:
+    parts: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                i += 1
+                continue
+        cur.append(ch)
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _is_literal_expr_for_named_arg(arg: str) -> bool:
+    t = arg.strip()
+    if re.match(r"^[+-]?\d+[a-zA-Z0-9_]*$", t):
+        return True
+    if re.match(r"^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+[eEdD][+-]?\d+)(?:_[A-Za-z]\w*)?$", t):
+        return True
+    if re.match(r"^\.(?:true|false)\.$", t, re.IGNORECASE):
+        return True
+    if re.match(r"^(?:'([^']|'')*'|\"([^\"]|\"\")*\")$", t):
+        return True
+    return False
+
+
+def _collect_declared_dummy_names(stmt: str) -> List[str]:
+    try:
+        ents = parse_declared_entities(stmt)
+        out: List[str] = []
+        for e in ents:
+            if e.name:
+                out.append(e.name.lower())
+        return out
+    except Exception:
+        return []
+
+
+def collect_procedure_interfaces_from_lines(lines: List[str]) -> Dict[str, ProcedureInterface]:
+    """Collect available explicit interfaces from procedure definitions in source."""
+    out: Dict[str, ProcedureInterface] = {}
+    proc_stack: List[Tuple[str, List[str], Set[str]]] = []
+    proc_start_re = re.compile(
+        r"^\s*(?:pure\s+|elemental\s+|recursive\s+|impure\s+|module\s+|pure\s+module\s+|elemental\s+module\s+|recursive\s+module\s+)*"
+        r"(?:subroutine|(?:[a-z][a-z0-9_]*(?:\s*\([^)]*\))?\s+)?function)\s+([a-z][a-z0-9_]*)\s*\(([^)]*)\)",
+        re.IGNORECASE,
+    )
+    end_proc_re = re.compile(r"^\s*end\s*(?:subroutine|function)?\b", re.IGNORECASE)
+
+    for _lineno, stmt in iter_fortran_statements(lines):
+        low = stmt.strip().lower()
+        m = proc_start_re.match(low)
+        if m:
+            name = m.group(1).lower()
+            arg_text = m.group(2).strip()
+            args = [a.strip().lower() for a in arg_text.split(",") if a.strip()]
+            proc_stack.append((name, args, set()))
+            continue
+        if proc_stack:
+            name, args, optional_args = proc_stack[-1]
+            if "::" in low and "optional" in low:
+                for nm in _collect_declared_dummy_names(stmt):
+                    if nm in args:
+                        optional_args.add(nm)
+                proc_stack[-1] = (name, args, optional_args)
+            if end_proc_re.match(low):
+                out[name] = ProcedureInterface(name=name, args=args, optional_args=set(optional_args))
+                proc_stack.pop()
+    return out
+
+
+def _find_call_like_segments(code: str) -> List[Tuple[int, int, str, str]]:
+    """Find `name(args)` segments, returning (start,end,name,args)."""
+    out: List[Tuple[int, int, str, str]] = []
+    i = 0
+    n = len(code)
+    in_single = False
+    in_double = False
+    while i < n:
+        ch = code[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double:
+            i += 1
+            continue
+        if ch.isalpha():
+            j = i + 1
+            while j < n and (code[j].isalnum() or code[j] == "_"):
+                j += 1
+            name = code[i:j]
+            k = j
+            while k < n and code[k].isspace():
+                k += 1
+            if k < n and code[k] == "(":
+                depth = 0
+                p = k
+                while p < n:
+                    cp = code[p]
+                    if cp == "(":
+                        depth += 1
+                    elif cp == ")":
+                        depth -= 1
+                        if depth == 0:
+                            args = code[k + 1 : p]
+                            out.append((i, p + 1, name, args))
+                            i = p + 1
+                            break
+                    p += 1
+                else:
+                    i = k + 1
+                    continue
+                continue
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def rewrite_named_arguments_in_statement(
+    code: str,
+    interfaces: Dict[str, ProcedureInterface],
+    *,
+    max_positional: int = 3,
+) -> Tuple[str, bool, Set[str]]:
+    """Rewrite call arguments to named form when literals/optional/long positional lists.
+
+    Returns `(rewritten_code, changed, unavailable_procedures_seen)`.
+    """
+    unknown: Set[str] = set()
+    m_call_head = re.match(r"^\s*call\s+([a-z][a-z0-9_]*)\s*\(", code, re.IGNORECASE)
+    call_head_name = m_call_head.group(1).lower() if m_call_head else None
+    intrinsic_ignore = {
+        "abs", "acos", "aimag", "aint", "all", "anint", "any", "asin", "atan", "atan2",
+        "ceiling", "cmplx", "conjg", "cos", "cosh", "count", "cpu_time", "dble", "digits",
+        "dot_product", "epsilon", "exp", "floor", "huge", "iachar", "ichar", "index", "int",
+        "kind", "len", "log", "log10", "matmul", "max", "maxval", "merge", "min", "minval",
+        "mod", "nint", "pack", "present", "product", "real", "reshape", "scan", "selected_int_kind",
+        "selected_real_kind", "shape", "sign", "sin", "sinh", "size", "spacing", "spread", "sqrt",
+        "sum", "tan", "tanh", "tiny", "trim", "ubound", "lbound",
+    }
+    segments = _find_call_like_segments(code)
+    if not segments:
+        return code, False, unknown
+
+    pieces: List[str] = []
+    last = 0
+    changed = False
+
+    for start, end, name_raw, arg_text in segments:
+        name = name_raw.lower()
+        iface = interfaces.get(name)
+        if iface is None:
+            # Avoid obvious declarations/casts.
+            if not re.match(r"^(real|integer|logical|character|type|kind|len)$", name, re.IGNORECASE):
+                if call_head_name == name and name not in intrinsic_ignore:
+                    unknown.add(name)
+            pieces.append(code[last:end])
+            last = end
+            continue
+        args_in = _split_top_level_commas_expr(arg_text)
+        if not args_in:
+            pieces.append(code[last:end])
+            last = end
+            continue
+        unnamed_count = sum(1 for a in args_in if "=" not in a)
+        unnamed_idx = 0
+        out_args: List[str] = []
+        ok = True
+        for a in args_in:
+            t = a.strip()
+            if "=" in t:
+                out_args.append(t)
+                continue
+            if unnamed_idx >= len(iface.args):
+                ok = False
+                break
+            dummy = iface.args[unnamed_idx]
+            unnamed_idx += 1
+            need_named = (
+                _is_literal_expr_for_named_arg(t)
+                or dummy in iface.optional_args
+                or (unnamed_count > max_positional and unnamed_idx > max_positional)
+            )
+            if need_named:
+                out_args.append(f"{dummy}={t}")
+                changed = True
+            else:
+                out_args.append(t)
+        if not ok:
+            pieces.append(code[last:end])
+            last = end
+            continue
+        new_call = f"{name_raw}(" + ", ".join(out_args) + ")"
+        pieces.append(code[last:start])
+        pieces.append(new_call)
+        last = end
+
+    pieces.append(code[last:])
+    new_code = "".join(pieces)
+    return new_code, (changed or new_code != code), unknown
+
+
+def rewrite_named_arguments_in_lines(
+    lines: List[str],
+    *,
+    max_positional: int = 3,
+) -> Tuple[List[str], int, Set[str]]:
+    """Rewrite named arguments across source lines using available local interfaces."""
+    interfaces = collect_procedure_interfaces_from_lines(lines)
+
+    def _split_code_comment_local(line: str) -> Tuple[str, str]:
+        in_single = False
+        in_double = False
+        for i, ch in enumerate(line):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                continue
+            if ch == "!" and not in_single and not in_double:
+                return line[:i], line[i:]
+        return line, ""
+
+    def _is_nonexec_statement_local(code: str) -> bool:
+        t = code.strip().lower()
+        if not t:
+            return True
+        if t.startswith(("call ", "if ", "do ", "select ", "where ", "forall ", "block", "print ", "write(", "read(")):
+            return False
+        heads = (
+            "program ",
+            "module ",
+            "use ",
+            "implicit ",
+            "integer",
+            "real",
+            "logical",
+            "character",
+            "type ",
+            "contains",
+            "interface",
+            "end ",
+            "subroutine ",
+            "function ",
+            "pure ",
+            "elemental ",
+            "recursive ",
+        )
+        return t.startswith(heads)
+
+    out_lines: List[str] = []
+    n_changes = 0
+    unavailable: Set[str] = set()
+    for raw in lines:
+        eol = _line_eol(raw)
+        line = raw.rstrip("\r\n")
+        code, comment = _split_code_comment_local(line)
+        if "&" in code or _is_nonexec_statement_local(code):
+            out_lines.append(raw)
+            continue
+        new_code, changed, unknown = rewrite_named_arguments_in_statement(
+            code, interfaces, max_positional=max_positional
+        )
+        if changed:
+            n_changes += 1
+        unavailable.update(unknown)
+        out_lines.append(f"{new_code}{comment}{eol}")
+    return out_lines, n_changes, unavailable
