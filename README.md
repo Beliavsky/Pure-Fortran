@@ -47,9 +47,17 @@ Main programs:
 - `xc2f.py` - practical C-to-Fortran transpiler for a supported C subset, with Fortran-oriented cleanup/post-processing passes.
 - `xc2f_batch_test.py` - batch harness to smoke-test `xc2f.py` across many C files with compile/run reporting.
 - `xf2c.py` - practical Fortran-to-C transpiler for a supported free-form Fortran subset, with build/run and per-file modes.
+- `xp2f.py` - practical Python-to-Fortran transpiler for a supported Python subset, with helper-module integration and run/compare options.
+- `xp2f_batch.py` - batch harness to run `xp2f.py` over multiple Python sources/globs with summary reporting.
+- `xf2p.py` - practical Fortran-to-Python transpiler for a supported free-form Fortran subset, with compile/run comparison modes.
+- `xr2f.py` - practical R-to-Fortran transpiler for a supported R subset, with helper-module integration and run/compare options.
+- `xoct2f.py` - practical Octave/MATLAB-to-Fortran transpiler for a supported subset.
 - `xlegal.py` - lightweight Fortran legality validator (statement/form checks, implicit-none/declaration sanity, duplicate checks).
 - `xfix.py` - conservative auto-fixer for common structural issues (for example end-name mismatches, duplicate defs/decls, simple paren fixes).
 - `xerror_loc.py` - annotate `error stop` messages with file/line (and optional scope), with optional condition-value expansion for IF-guarded stops.
+- `xcombine_decl.py` - coalesce adjacent compatible declarations and contiguous `public`/`private` lists.
+- `xindent.py` - Fortran indentation and long-line wrapping utility with configurable indentation controls.
+- `xnamed_arg.py` - rewrite procedure calls to use named arguments under conservative rules.
 - `xset_array.py` - advisory checker for replacing consecutive scalar array-element assignments with one array assignment.
 - `xarray.py` - advisory checker for simple loops replaceable by array operations (`sum/product/count` and elementwise forms).
 - `xto_loop.py` - advisory checker/fixer that reverses selected array operations to explicit loops (for benchmarking/audit round-trips).
@@ -909,6 +917,88 @@ Notes:
 - Includes options for compile-only and run comparisons (`--compile`, `--compile-c`, `--compile-both`, `--run-both`).
 - Emits C helpers for selected Fortran intrinsics/patterns where needed.
 
+### `xp2f.py`
+
+Practical transpiler from a supported Python subset to free-form Fortran.
+
+Typical commands:
+
+```bash
+python xp2f.py foo.py
+python xp2f.py foo.py python.f90 --compile
+python xp2f.py foo.py python.f90 --run-both --time-both
+```
+
+Notes:
+
+- Supports helper-module inputs (for example `python.f90`) and optional auto-helper resolution.
+- Includes compile/run workflows and output-diff/timing modes for validation.
+
+### `xp2f_batch.py`
+
+Batch harness for running `xp2f.py` over many Python files/globs.
+
+Typical commands:
+
+```bash
+python xp2f_batch.py "xfit_mix*.py" --helpers python.f90 --time-both
+python xp2f_batch.py src\\*.py --helpers python.f90 --verbose
+```
+
+Notes:
+
+- Expands globs, runs cases independently, and prints per-file PASS/FAIL summary.
+- Useful for smoke/regression sweeps of transpiler coverage.
+
+### `xf2p.py`
+
+Practical transpiler from supported free-form Fortran to Python.
+
+Typical commands:
+
+```bash
+python xf2p.py foo.f90
+python xf2p.py foo.f90 --run-both
+python xf2p.py mod.f90 main.f90 --mode-program --run
+```
+
+Notes:
+
+- Supports per-file and multi-file program modes.
+- Includes run/compile comparison workflows and timing/diff options.
+
+### `xr2f.py`
+
+Practical transpiler from a supported R subset to free-form Fortran.
+
+Typical commands:
+
+```bash
+python xr2f.py foo.r
+python xr2f.py foo.r r.f90 --run-both
+python xr2f.py foo.r r.f90 --time-both
+```
+
+Notes:
+
+- Supports helper-module inputs (for example `r.f90`) for runtime/stat/RNG helpers.
+- Includes conservative rewrites and run/compare workflows.
+
+### `xoct2f.py`
+
+Transpiler from a supported Octave/MATLAB-like subset to free-form Fortran.
+
+Typical commands:
+
+```bash
+python xoct2f.py foo.m
+python xoct2f.py foo.m --run-both
+```
+
+Notes:
+
+- Intended for practical numeric-script subsets; unsupported constructs are reported conservatively.
+
 ### `xlegal.py`
 
 Validator for free-form Fortran source legality using lightweight static checks.
@@ -942,6 +1032,45 @@ Notes:
 - Repairs selected end-statement name mismatches and simple unambiguous parenthesis issues.
 - Can remove duplicate procedure definitions (keeping the last) and duplicate declarations (keeping the first), with reporting.
 - Complements `xlegal.py` by applying safe automated corrections where possible.
+
+### `xcombine_decl.py`
+
+Coalesce adjacent compatible declarations and contiguous `public`/`private` lists.
+
+Typical commands:
+
+```bash
+python xcombine_decl.py foo.f90
+python xcombine_decl.py foo.f90 --fix
+python xcombine_decl.py src\\*.f90 --fix --max-len 80
+```
+
+### `xindent.py`
+
+Indent Fortran sources and wrap long lines with shared formatting rules.
+
+Typical commands:
+
+```bash
+python xindent.py foo.f90 --fix
+python xindent.py foo.f90 --fix --indent 3 --indent-proc --indent-module
+```
+
+Notes:
+
+- Supports indentation toggles for procedures/modules/programs/contains sections.
+
+### `xnamed_arg.py`
+
+Rewrite procedure calls to use named arguments for literals/optional dummies and late positional arguments.
+
+Typical commands:
+
+```bash
+python xnamed_arg.py foo.f90
+python xnamed_arg.py foo.f90 --fix
+python xnamed_arg.py code1.f90 code2.f90 --fix --max-positional 3
+```
 
 ### `xerror_loc.py`
 
