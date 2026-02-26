@@ -1336,6 +1336,7 @@ def rewrite_list_directed_print_reals(
     int_names: Set[str] = set()
     real_names: Set[str] = set()
     logical_names: Set[str] = set()
+    array_names: Set[str] = set()
     int_comp_names: Set[str] = set()
     real_comp_names: Set[str] = set()
     logical_comp_names: Set[str] = set()
@@ -1359,6 +1360,7 @@ def rewrite_list_directed_print_reals(
         m_decl = decl_head_re.match(code_s)
         if m_decl:
             names = parse_declared_names_from_decl(code_s)
+            ents = parse_declared_entities(code_s)
             head = m_decl.group("head").lower()
             if head.startswith("integer"):
                 int_names.update(names)
@@ -1369,6 +1371,9 @@ def rewrite_list_directed_print_reals(
             else:
                 real_names.update(names)
                 real_comp_names.update(names)
+            for nm, is_arr in ents:
+                if is_arr:
+                    array_names.add(nm)
             out.append(raw)
             continue
 
@@ -1432,7 +1437,55 @@ def rewrite_list_directed_print_reals(
         if len(fmts) != len(items):
             out.append(raw)
             continue
-        fmt = ", ".join(fmts)
+
+        def _is_likely_array_expr(text: str) -> bool:
+            t = text.strip()
+            if not t:
+                return False
+            if t.startswith("[") and t.endswith("]"):
+                return True
+            # Array section / slicing form.
+            if re.search(r"\([^()]*:[^()]*\)", t):
+                return True
+            b = base_identifier(t)
+            if b is not None and b in array_names:
+                return True
+            # real(array_expr, kind=...) style.
+            m_real = re.match(r"^real\s*\((.+)\)$", t, re.IGNORECASE)
+            if m_real:
+                parts = _split_top_level_commas(m_real.group(1))
+                if parts:
+                    return _is_likely_array_expr(parts[0])
+            # Known helper calls returning vectors.
+            m_call = re.match(r"^([a-z][a-z0-9_]*)\s*\(", t, re.IGNORECASE)
+            if m_call:
+                return m_call.group(1).lower() in {
+                    "r_seq_int",
+                    "r_seq_len",
+                    "r_seq_int_by",
+                    "r_seq_int_length",
+                    "r_seq_real_by",
+                    "r_seq_real_length",
+                    "r_rep_int",
+                    "r_rep_real",
+                    "runif_vec",
+                    "rnorm_vec",
+                    "numeric",
+                    "pack",
+                }
+            # Vector-returning calls inside arithmetic expressions.
+            if re.search(
+                r"\b(?:r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length|r_seq_real_by|r_seq_real_length|r_rep_int|r_rep_real|runif_vec|rnorm_vec|numeric|pack)\s*\(",
+                t,
+                re.IGNORECASE,
+            ):
+                return True
+            return False
+
+        if len(items) == 1 and _is_likely_array_expr(items[0]):
+            fmt = "*(g0,1x)"
+        else:
+            fmt = ", ".join(fmts)
         rebuilt = f'{m_pr.group("indent")}write(*,"({fmt})") {", ".join(it.strip() for it in items)}'
         out.append(f"{rebuilt}{comment}{eol}")
 
@@ -3003,6 +3056,416 @@ def _split_code_comment(line: str) -> Tuple[str, str]:
         elif ch == "!" and not in_single and not in_double:
             return line[:i], line[i:]
     return line, ""
+
+
+def _line_scope_context_map(lines: List[str]) -> Dict[int, str]:
+    """Return map of 1-based line number to simple scope context text."""
+    out: Dict[int, str] = {}
+    module_name: Optional[str] = None
+    proc_stack: List[Tuple[str, str]] = []
+
+    mod_start_re = re.compile(r"^\s*module\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+    mod_end_re = re.compile(r"^\s*end\s*module\b", re.IGNORECASE)
+    proc_end_re = re.compile(r"^\s*end\s*(function|subroutine)\b", re.IGNORECASE)
+
+    for lineno, raw in enumerate(lines, start=1):
+        code = strip_comment(raw).strip()
+        low = code.lower()
+
+        # End statements first.
+        if proc_end_re.match(low):
+            if proc_stack:
+                proc_stack.pop()
+        elif mod_end_re.match(low):
+            module_name = None
+
+        parts: List[str] = []
+        if module_name:
+            parts.append(f"module {module_name}")
+        if proc_stack:
+            k, nm = proc_stack[-1]
+            parts.append(f"{k} {nm}")
+        out[lineno] = "::".join(parts)
+
+        # Start statements apply from the next line onward.
+        m_mod = mod_start_re.match(code)
+        if m_mod and not re.match(r"^\s*module\s+procedure\b", low):
+            module_name = m_mod.group(1).lower()
+            continue
+        m_proc = PROC_START_RE.match(code)
+        if m_proc:
+            proc_stack.append((m_proc.group("kind").lower(), m_proc.group("name").lower()))
+
+    return out
+
+
+def normalize_location_tag_separators(lines: List[str]) -> List[str]:
+    """Normalize scoped location tags by collapsing spaces around '::'."""
+    out: List[str] = []
+    bracket_re = re.compile(r"\[[^\]\n]*\]")
+    for line in lines:
+        def _fix(m: re.Match[str]) -> str:
+            txt = m.group(0)
+            inner = txt[1:-1]
+            inner = re.sub(r"\s*::\s*", "::", inner)
+            return f"[{inner}]"
+
+        out.append(bracket_re.sub(_fix, line))
+    return out
+
+
+def append_error_stop_locations(
+    lines: List[str],
+    *,
+    file_label: Optional[str] = None,
+) -> Tuple[List[str], int]:
+    """Append ``[file:line]`` to literal ``error stop`` messages.
+
+    Only rewrites conservative forms where ``error stop`` is followed by a
+    single quoted literal (double or single quotes) on the same line.
+    """
+    out: List[str] = []
+    changed = 0
+    err_re = re.compile(r"\berror\s+stop\b", re.IGNORECASE)
+    tagged_re = re.compile(r"\[[^][]*(?::\d+|::line\s+\d+)\]\s*$", re.IGNORECASE)
+    label = file_label if file_label else "<input>"
+    scope_map = _line_scope_context_map(lines)
+
+    def _loc_for_line(n: int) -> str:
+        ctx = scope_map.get(n, "")
+        if ctx:
+            return f"{label}::{ctx}::line {n}"
+        return f"{label}::line {n}"
+
+    for lineno, raw in enumerate(lines, start=1):
+        eol = ""
+        body = raw
+        if body.endswith("\r\n"):
+            body = body[:-2]
+            eol = "\r\n"
+        elif body.endswith("\n"):
+            body = body[:-1]
+            eol = "\n"
+
+        code, comment = _split_code_comment(body)
+        m = err_re.search(code)
+        if not m:
+            out.append(raw)
+            continue
+        i = m.end()
+        while i < len(code) and code[i].isspace():
+            i += 1
+        if i >= len(code) or code[i] not in ("'", '"'):
+            out.append(raw)
+            continue
+
+        quote = code[i]
+        j = i + 1
+        while j < len(code):
+            if code[j] == quote:
+                if j + 1 < len(code) and code[j + 1] == quote:
+                    j += 2
+                    continue
+                break
+            j += 1
+        if j >= len(code) or code[j] != quote:
+            out.append(raw)
+            continue
+        if code[j + 1 :].strip():
+            out.append(raw)
+            continue
+
+        msg = code[i + 1 : j]
+        if tagged_re.search(msg):
+            out.append(raw)
+            continue
+
+        msg = f"{msg} [{_loc_for_line(lineno)}]"
+        new_code = code[: i + 1] + msg + quote + code[j + 1 :]
+        out.append(new_code + comment + eol)
+        changed += 1
+
+    return out, changed
+
+
+def rewrite_error_stop_blocks_with_condition_values(
+    lines: List[str],
+    *,
+    file_label: Optional[str] = None,
+    msg_len: int = 1000,
+) -> Tuple[List[str], int]:
+    """Rewrite ``if (...) then`` + literal ``error stop`` to include values.
+
+    Conservative rewrite only when the IF block has exactly one executable
+    statement and it is ``error stop "<literal>"`` (no ELSE branch).
+    """
+    out: List[str] = []
+    changed = 0
+    i = 0
+    label = file_label if file_label else "<input>"
+    if_re = re.compile(r"^(\s*)if\s*\((.*)\)\s*then\s*$", re.IGNORECASE)
+    if_then_re = re.compile(r"^\s*if\s*\(.*\)\s*then\s*$", re.IGNORECASE)
+    else_re = re.compile(r"^\s*else(\s+if\b.*)?\s*$", re.IGNORECASE)
+    end_if_re = re.compile(r"^\s*end\s*if\b", re.IGNORECASE)
+    err_re = re.compile(r"\berror\s+stop\b", re.IGNORECASE)
+    kw_exclude = {
+        "if",
+        "then",
+        "and",
+        "or",
+        "not",
+        "eqv",
+        "neqv",
+        "true",
+        "false",
+        "present",
+        "allocated",
+        "associated",
+        "size",
+        "all",
+        "any",
+        "count",
+        "int",
+        "real",
+        "logical",
+        "abs",
+        "max",
+        "min",
+        "mod",
+    }
+    scope_map = _line_scope_context_map(lines)
+
+    def _loc_for_line(n: int) -> str:
+        ctx = scope_map.get(n, "")
+        if ctx:
+            return f"{label}::{ctx}::line {n}"
+        return f"{label}::line {n}"
+
+    def _quote_dq(s: str) -> str:
+        return s.replace('"', '""')
+
+    def _parse_one_line_if(code_line: str) -> Optional[Tuple[str, str, str]]:
+        m_if0 = re.match(r"^(\s*)if\s*\(", code_line, re.IGNORECASE)
+        if not m_if0:
+            return None
+        indent = m_if0.group(1)
+        if " then" in code_line.lower():
+            return None
+        lpar = code_line.find("(", m_if0.start())
+        if lpar < 0:
+            return None
+        depth = 0
+        rpar = -1
+        for pos in range(lpar, len(code_line)):
+            ch = code_line[pos]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    rpar = pos
+                    break
+        if rpar < 0:
+            return None
+        cond = code_line[lpar + 1 : rpar].strip()
+        tail = code_line[rpar + 1 :].strip()
+        if not cond or not tail:
+            return None
+        return indent, cond, tail
+
+    def _extract_vars(cond: str) -> List[str]:
+        found: List[str] = []
+        seen: Set[str] = set()
+        low = cond.lower()
+        protected_spans: List[Tuple[int, int]] = []
+
+        # Prefer reporting SIZE(arg) explicitly when present.
+        for m_sz in re.finditer(r"\bsize\s*\(\s*([a-z][a-z0-9_]*)\s*\)", low):
+            token = f"size({m_sz.group(1)})"
+            if token not in seen:
+                seen.add(token)
+                found.append(token)
+            protected_spans.append((m_sz.start(), m_sz.end()))
+
+        def _in_protected(pos: int) -> bool:
+            for a, b in protected_spans:
+                if a <= pos < b:
+                    return True
+            return False
+
+        for m in re.finditer(r"\b([a-z][a-z0-9_]*)\b", low):
+            if _in_protected(m.start()):
+                continue
+            name = m.group(1)
+            if name in kw_exclude:
+                continue
+            k = m.end()
+            while k < len(low) and low[k].isspace():
+                k += 1
+            if k < len(low) and low[k] == "(":
+                continue
+            if name not in seen:
+                seen.add(name)
+                found.append(name)
+        return found
+
+    while i < len(lines):
+        raw = lines[i]
+        code_i = strip_comment(raw).strip()
+        parsed_inline = _parse_one_line_if(strip_comment(raw).rstrip())
+        if parsed_inline is not None:
+            indent, cond, tail_stmt = parsed_inline
+            m_err = err_re.search(tail_stmt)
+            if m_err:
+                p = m_err.end()
+                while p < len(tail_stmt) and tail_stmt[p].isspace():
+                    p += 1
+                if p < len(tail_stmt) and tail_stmt[p] in ("'", '"'):
+                    q = tail_stmt[p]
+                    r = p + 1
+                    while r < len(tail_stmt):
+                        if tail_stmt[r] == q:
+                            if r + 1 < len(tail_stmt) and tail_stmt[r + 1] == q:
+                                r += 2
+                                continue
+                            break
+                        r += 1
+                    if r < len(tail_stmt) and tail_stmt[r] == q and not tail_stmt[r + 1 :].strip():
+                        # Conservative mode: if the next significant source line
+                        # is END IF, treat source as structurally invalid and skip.
+                        nxt = i + 1
+                        while nxt < len(lines) and not strip_comment(lines[nxt]).strip():
+                            nxt += 1
+                        if nxt < len(lines):
+                            nxt_code = strip_comment(lines[nxt]).strip().lower()
+                            if end_if_re.match(nxt_code):
+                                out.append(raw)
+                                i += 1
+                                continue
+
+                        eol = "\n"
+                        if raw.endswith("\r\n"):
+                            eol = "\r\n"
+                        elif raw.endswith("\n"):
+                            eol = "\n"
+                        i3 = indent + " " * 3
+                        i6 = indent + " " * 6
+                        vars_in_cond = _extract_vars(cond)
+                        msg_base = f"{cond} [{_loc_for_line(i + 1)}]"
+                        fmt = "(a" + ",a,g0" * len(vars_in_cond) + ")"
+                        args: List[str] = [f"\"{_quote_dq(msg_base)}\""]
+                        for idx, name in enumerate(vars_in_cond):
+                            sep = ": " if idx == 0 else ", "
+                            args.append(f"\"{_quote_dq(sep + name + ' = ')}\"")
+                            args.append(name)
+                        arg_text = ", ".join(args)
+
+                        out.append(f"{indent}if ({cond}) then{eol}")
+                        out.append(f"{i3}block{eol}")
+                        out.append(f"{i6}character(len={msg_len}) :: msg{eol}")
+                        out.append(f"{i6}write(msg, \"{fmt}\") {arg_text}{eol}")
+                        out.append(f"{i6}error stop trim(msg){eol}")
+                        out.append(f"{i3}end block{eol}")
+                        out.append(f"{indent}end if{eol}")
+                        changed += 1
+                        i += 1
+                        continue
+
+        m_if = if_re.match(code_i)
+        if not m_if:
+            out.append(raw)
+            i += 1
+            continue
+
+        depth = 1
+        j = i + 1
+        has_else = False
+        end_idx = -1
+        while j < len(lines):
+            code_j = strip_comment(lines[j]).strip()
+            if if_then_re.match(code_j):
+                depth += 1
+                j += 1
+                continue
+            if end_if_re.match(code_j):
+                depth -= 1
+                if depth == 0:
+                    end_idx = j
+                    break
+                j += 1
+                continue
+            if depth == 1 and else_re.match(code_j):
+                has_else = True
+            j += 1
+        if end_idx < 0 or has_else:
+            out.append(raw)
+            i += 1
+            continue
+
+        body_idxs = list(range(i + 1, end_idx))
+        exec_idxs = [k for k in body_idxs if strip_comment(lines[k]).strip()]
+        if len(exec_idxs) != 1:
+            out.append(raw)
+            i += 1
+            continue
+        err_idx = exec_idxs[0]
+        err_code = strip_comment(lines[err_idx]).strip()
+        m_err = err_re.search(err_code)
+        if not m_err:
+            out.append(raw)
+            i += 1
+            continue
+        p = m_err.end()
+        while p < len(err_code) and err_code[p].isspace():
+            p += 1
+        if p >= len(err_code) or err_code[p] not in ("'", '"'):
+            out.append(raw)
+            i += 1
+            continue
+        q = err_code[p]
+        r = p + 1
+        while r < len(err_code):
+            if err_code[r] == q:
+                if r + 1 < len(err_code) and err_code[r + 1] == q:
+                    r += 2
+                    continue
+                break
+            r += 1
+        if r >= len(err_code) or err_code[r] != q or err_code[r + 1 :].strip():
+            out.append(raw)
+            i += 1
+            continue
+
+        cond = m_if.group(2).strip()
+        vars_in_cond = _extract_vars(cond)
+        indent = m_if.group(1)
+        eol = "\n"
+        if raw.endswith("\r\n"):
+            eol = "\r\n"
+        elif raw.endswith("\n"):
+            eol = "\n"
+        i3 = indent + " " * 3
+        i6 = indent + " " * 6
+        msg_base = f"{cond} [{_loc_for_line(err_idx + 1)}]"
+        fmt = "(a" + ",a,g0" * len(vars_in_cond) + ")"
+        args: List[str] = [f"\"{_quote_dq(msg_base)}\""]
+        for idx, name in enumerate(vars_in_cond):
+            sep = ": " if idx == 0 else ", "
+            args.append(f"\"{_quote_dq(sep + name + ' = ')}\"")
+            args.append(name)
+        arg_text = ", ".join(args)
+
+        out.append(raw)
+        out.append(f"{i3}block{eol}")
+        out.append(f"{i6}character(len={msg_len}) :: msg{eol}")
+        out.append(f"{i6}write(msg, \"{fmt}\") {arg_text}{eol}")
+        out.append(f"{i6}error stop trim(msg){eol}")
+        out.append(f"{i3}end block{eol}")
+        out.append(lines[end_idx])
+        changed += 1
+        i = end_idx + 1
+
+    return out, changed
 
 
 def _strip_outer_parens(s: str) -> str:
