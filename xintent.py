@@ -308,6 +308,18 @@ def add_intent_attr(line: str, intent: str) -> Tuple[str, bool]:
     return new_code + comment, True
 
 
+def strip_intent_attr_from_decl_lhs(lhs: str) -> str:
+    """Remove INTENT(...) attribute from declaration LHS attribute list."""
+    out = re.sub(
+        r"(?i),\s*intent\s*\(\s*(?:in\s*out|inout|in|out)\s*\)\s*",
+        "",
+        lhs,
+    )
+    out = re.sub(r",\s*,", ", ", out)
+    out = re.sub(r",\s*$", "", out)
+    return out.rstrip()
+
+
 def split_decl_entities(rhs: str) -> List[str]:
     """Split declaration RHS entities on top-level commas."""
     parts: List[str] = []
@@ -1146,8 +1158,10 @@ def rewrite_decl_line_with_intents(line: str, intents_by_name: Dict[str, str]) -
         rhs = m_no.group("rhs")
 
     lhs_low = lhs.lower()
-    if "intent(" in lhs_low or re.search(r"\bvalue\b", lhs_low):
+    if re.search(r"\bvalue\b", lhs_low):
         return [line], False
+    existing_intent = parse_decl_intent(lhs_low)
+    lhs_no_intent = strip_intent_attr_from_decl_lhs(lhs) if existing_intent is not None else lhs
 
     entities = split_decl_entities(rhs)
     if not entities:
@@ -1170,14 +1184,15 @@ def rewrite_decl_line_with_intents(line: str, intents_by_name: Dict[str, str]) -
         return [line], False
 
     out_lines: List[str] = []
-    base_lhs = lhs.rstrip()
+    base_lhs = lhs_no_intent.rstrip()
 
     for ent, intent in targeted:
         intent_text = "in out" if intent == "inout" else intent
         out_lines.append(f"{base_lhs}, intent({intent_text}) :: {ent}\n")
 
     if remaining:
-        out_lines.append(f"{base_lhs} :: {', '.join(remaining)}")
+        # Preserve original declaration attributes for untouched entities.
+        out_lines.append(f"{lhs.rstrip()} :: {', '.join(remaining)}")
         if comment:
             out_lines[-1] = out_lines[-1] + comment
         out_lines[-1] += "\n"
@@ -1195,6 +1210,7 @@ def analyze_intent_suggestions(
     interproc: bool = False,
     nonvariable_actual_formals: Optional[Dict[str, Set[str]]] = None,
     observed_actual_formals: Optional[Dict[str, Set[str]]] = None,
+    tighten_existing: bool = False,
 ) -> List[IntentSuggestion]:
     """Suggest dummy arguments that can be marked with the target intent."""
     out: List[IntentSuggestion] = []
@@ -1215,8 +1231,8 @@ def analyze_intent_suggestions(
         dummy_is_character: Dict[str, bool] = {d: False for d in proc.dummy_names}
 
         # dummy -> declaration metadata
-        decl: Dict[str, Tuple[int, bool, bool, bool]] = {}
-        # line, has_intent_or_value, has_alloc_ptr, fixable
+        decl: Dict[str, Tuple[int, bool, bool, bool, Optional[str]]] = {}
+        # line, has_intent_or_value, has_alloc_ptr, fixable, existing_intent
 
         for ln, code in body_stmts:
             low = code.lower().strip()
@@ -1229,12 +1245,13 @@ def analyze_intent_suggestions(
             arr_flags = parse_declared_array_flags(low)
             local_names.update(declared)
             has_external = re.search(r"\bexternal\b", low) is not None
-            has_intent_or_value = ("intent(" in low) or (re.search(r"\bvalue\b", low) is not None) or has_external
+            existing_intent = parse_decl_intent(low)
+            has_intent_or_value = (existing_intent is not None) or (re.search(r"\bvalue\b", low) is not None) or has_external
             has_alloc_ptr = ("allocatable" in low) or (re.search(r"\bpointer\b", low) is not None)
             is_character_decl = re.search(r"^\s*character\b", low) is not None
             for d in proc.dummy_names:
                 if d in declared and d not in decl:
-                    decl[d] = (ln, has_intent_or_value, has_alloc_ptr, True)
+                    decl[d] = (ln, has_intent_or_value, has_alloc_ptr, True, existing_intent)
                 if d in declared and is_character_decl:
                     dummy_is_character[d] = True
                 if d in arr_flags and arr_flags[d]:
@@ -1460,8 +1477,18 @@ def analyze_intent_suggestions(
             meta = decl.get(d)
             if meta is None:
                 continue
-            decl_line, has_intent_or_value, has_alloc_ptr, fixable = meta
-            if has_intent_or_value or has_alloc_ptr:
+            decl_line, has_intent_or_value, has_alloc_ptr, fixable, existing_intent = meta
+            if has_alloc_ptr:
+                continue
+            if has_intent_or_value:
+                if not tighten_existing:
+                    continue
+                # For tightening, only consider narrowing existing OUT/INOUT to IN.
+                if target_intent != "in":
+                    continue
+                if existing_intent not in {"out", "inout"}:
+                    continue
+            if existing_intent == target_intent:
                 continue
             if target_intent == "in":
                 base_intent = infer_intent_from_access(
@@ -1983,6 +2010,11 @@ def main() -> int:
         help="Suggest/apply INTENT(IN OUT)",
     )
     parser.add_argument(
+        "--tighten-existing",
+        action="store_true",
+        help="Also suggest narrowing existing INTENT(OUT/INOUT) to INTENT(IN) when proven read-only",
+    )
+    parser.add_argument(
         "--iterate",
         action="store_true",
         help="With --fix, repeat analyze/fix passes until no more changes",
@@ -2116,6 +2148,7 @@ def main() -> int:
                 interproc=args.interproc,
                 nonvariable_actual_formals=nonvariable_actual_formals,
                 observed_actual_formals=observed_actual_formals,
+                tighten_existing=args.tighten_existing,
             )
             suggestions_out: List[IntentSuggestion] = []
             if args.suggest_intent_out:
@@ -2136,6 +2169,7 @@ def main() -> int:
                     interproc=args.interproc,
                     nonvariable_actual_formals=nonvariable_actual_formals,
                     observed_actual_formals=observed_actual_formals,
+                    tighten_existing=args.tighten_existing,
                 )
             suggestions = dedupe_suggestions(suggestions_in + suggestions_out + suggestions_inout)
             if args.verbose:
