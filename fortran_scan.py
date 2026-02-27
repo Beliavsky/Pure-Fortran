@@ -3118,6 +3118,7 @@ def append_error_stop_locations(
     lines: List[str],
     *,
     file_label: Optional[str] = None,
+    include_line_number: bool = True,
 ) -> Tuple[List[str], int]:
     """Append ``[file:line]`` to literal ``error stop`` messages.
 
@@ -3134,8 +3135,12 @@ def append_error_stop_locations(
     def _loc_for_line(n: int) -> str:
         ctx = scope_map.get(n, "")
         if ctx:
-            return f"{label}::{ctx}::line {n}"
-        return f"{label}::line {n}"
+            if include_line_number:
+                return f"{label}::{ctx}::line {n}"
+            return f"{label}::{ctx}"
+        if include_line_number:
+            return f"{label}::line {n}"
+        return label
 
     for lineno, raw in enumerate(lines, start=1):
         eol = ""
@@ -3193,11 +3198,13 @@ def rewrite_error_stop_blocks_with_condition_values(
     *,
     file_label: Optional[str] = None,
     msg_len: int = 1000,
+    include_line_number: bool = True,
+    specific: bool = False,
 ) -> Tuple[List[str], int]:
     """Rewrite ``if (...) then`` + literal ``error stop`` to include values.
 
     Conservative rewrite only when the IF block has exactly one executable
-    statement and it is ``error stop "<literal>"`` (no ELSE branch).
+    statement and it is ``error stop`` or ``error stop "<literal>"`` (no ELSE branch).
     """
     out: List[str] = []
     changed = 0
@@ -3238,11 +3245,57 @@ def rewrite_error_stop_blocks_with_condition_values(
     def _loc_for_line(n: int) -> str:
         ctx = scope_map.get(n, "")
         if ctx:
-            return f"{label}::{ctx}::line {n}"
-        return f"{label}::line {n}"
+            if include_line_number:
+                return f"{label}::{ctx}::line {n}"
+            return f"{label}::{ctx}"
+        if include_line_number:
+            return f"{label}::line {n}"
+        return label
 
     def _quote_dq(s: str) -> str:
         return s.replace('"', '""')
+
+    def _split_top_level_or(expr: str) -> Optional[List[str]]:
+        s = expr
+        low = expr.lower()
+        parts: List[str] = []
+        start = 0
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(low):
+            ch = low[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")" and depth > 0:
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0 and low.startswith(".or.", i):
+                parts.append(s[start:i].strip())
+                i += 4
+                start = i
+                continue
+            i += 1
+        tail = s[start:].strip()
+        if tail:
+            parts.append(tail)
+        parts = [p for p in parts if p]
+        return parts if len(parts) > 1 else None
 
     def _parse_one_line_if(code_line: str) -> Optional[Tuple[str, str, str]]:
         m_if0 = re.match(r"^(\s*)if\s*\(", code_line, re.IGNORECASE)
@@ -3279,9 +3332,10 @@ def rewrite_error_stop_blocks_with_condition_values(
         low = cond.lower()
         protected_spans: List[Tuple[int, int]] = []
 
-        # Prefer reporting SIZE(arg) explicitly when present.
-        for m_sz in re.finditer(r"\bsize\s*\(\s*([a-z][a-z0-9_]*)\s*\)", low):
-            token = f"size({m_sz.group(1)})"
+        # Prefer reporting SIZE(...) explicitly when present.
+        for m_sz in re.finditer(r"\bsize\s*\(\s*([^)]+?)\s*\)", low):
+            arg = re.sub(r"\s+", "", m_sz.group(1))
+            token = f"size({arg})"
             if token not in seen:
                 seen.add(token)
                 found.append(token)
@@ -3309,10 +3363,64 @@ def rewrite_error_stop_blocks_with_condition_values(
                 found.append(name)
         return found
 
+    def _msg_write_stmt(indent: str, cond_expr: str, loc_line: int, eol: str) -> str:
+        vars_in_cond = _extract_vars(cond_expr)
+        msg_base = f"{cond_expr} [{_loc_for_line(loc_line)}]"
+        fmt = "(a" + ",a,g0" * len(vars_in_cond) + ")"
+        args: List[str] = [f"\"{_quote_dq(msg_base)}\""]
+        for idx, name in enumerate(vars_in_cond):
+            sep = ": " if idx == 0 else ", "
+            args.append(f"\"{_quote_dq(sep + name + ' = ')}\"")
+            args.append(name)
+        arg_text = ", ".join(args)
+        return f"{indent}write(msg, \"{fmt}\") {arg_text}{eol}"
+
+    def _emit_specific_or_message(
+        out_lines: List[str],
+        *,
+        indent_if: str,
+        indent_body: str,
+        cond_expr: str,
+        loc_line: int,
+        eol: str,
+    ) -> None:
+        clauses = _split_top_level_or(cond_expr) if specific else None
+        if not clauses:
+            out_lines.append(_msg_write_stmt(indent_body, cond_expr, loc_line, eol))
+            return
+        first = clauses[0]
+        deeper = indent_body + " " * 3
+        out_lines.append(f"{indent_if}if ({first}) then{eol}")
+        out_lines.append(_msg_write_stmt(deeper, first, loc_line, eol))
+        for cl in clauses[1:]:
+            out_lines.append(f"{indent_if}else if ({cl}) then{eol}")
+            out_lines.append(_msg_write_stmt(deeper, cl, loc_line, eol))
+        out_lines.append(f"{indent_if}else{eol}")
+        out_lines.append(_msg_write_stmt(deeper, cond_expr, loc_line, eol))
+        out_lines.append(f"{indent_if}end if{eol}")
+
     while i < len(lines):
         raw = lines[i]
         code_i = strip_comment(raw).strip()
-        parsed_inline = _parse_one_line_if(strip_comment(raw).rstrip())
+        stmt_src = strip_comment(raw).rstrip()
+        end_inline_idx = i
+        if stmt_src.endswith("&"):
+            parts: List[str] = [stmt_src[:-1].rstrip()]
+            k = i + 1
+            while k < len(lines):
+                nxt_raw = strip_comment(lines[k]).rstrip()
+                nxt = nxt_raw.lstrip()
+                if nxt.startswith("&"):
+                    nxt = nxt[1:].lstrip()
+                if nxt.endswith("&"):
+                    parts.append(nxt[:-1].rstrip())
+                    k += 1
+                    continue
+                parts.append(nxt)
+                end_inline_idx = k
+                break
+            stmt_src = " ".join(p for p in parts if p)
+        parsed_inline = _parse_one_line_if(stmt_src)
         if parsed_inline is not None:
             indent, cond, tail_stmt = parsed_inline
             m_err = err_re.search(tail_stmt)
@@ -3320,7 +3428,10 @@ def rewrite_error_stop_blocks_with_condition_values(
                 p = m_err.end()
                 while p < len(tail_stmt) and tail_stmt[p].isspace():
                     p += 1
-                if p < len(tail_stmt) and tail_stmt[p] in ("'", '"'):
+                inline_supported = False
+                if p >= len(tail_stmt):
+                    inline_supported = True
+                elif tail_stmt[p] in ("'", '"'):
                     q = tail_stmt[p]
                     r = p + 1
                     while r < len(tail_stmt):
@@ -3331,45 +3442,44 @@ def rewrite_error_stop_blocks_with_condition_values(
                             break
                         r += 1
                     if r < len(tail_stmt) and tail_stmt[r] == q and not tail_stmt[r + 1 :].strip():
-                        # Conservative mode: if the next significant source line
-                        # is END IF, treat source as structurally invalid and skip.
-                        nxt = i + 1
-                        while nxt < len(lines) and not strip_comment(lines[nxt]).strip():
-                            nxt += 1
-                        if nxt < len(lines):
-                            nxt_code = strip_comment(lines[nxt]).strip().lower()
-                            if end_if_re.match(nxt_code):
-                                out.append(raw)
-                                i += 1
-                                continue
+                        inline_supported = True
+                if inline_supported:
+                    # Conservative mode: if the next significant source line
+                    # is END IF, treat source as structurally invalid and skip.
+                    nxt = end_inline_idx + 1
+                    while nxt < len(lines) and not strip_comment(lines[nxt]).strip():
+                        nxt += 1
+                    if nxt < len(lines):
+                        nxt_code = strip_comment(lines[nxt]).strip().lower()
+                        if end_if_re.match(nxt_code):
+                            out.extend(lines[i : end_inline_idx + 1])
+                            i = end_inline_idx + 1
+                            continue
 
+                    eol = "\n"
+                    if raw.endswith("\r\n"):
+                        eol = "\r\n"
+                    elif raw.endswith("\n"):
                         eol = "\n"
-                        if raw.endswith("\r\n"):
-                            eol = "\r\n"
-                        elif raw.endswith("\n"):
-                            eol = "\n"
-                        i3 = indent + " " * 3
-                        i6 = indent + " " * 6
-                        vars_in_cond = _extract_vars(cond)
-                        msg_base = f"{cond} [{_loc_for_line(i + 1)}]"
-                        fmt = "(a" + ",a,g0" * len(vars_in_cond) + ")"
-                        args: List[str] = [f"\"{_quote_dq(msg_base)}\""]
-                        for idx, name in enumerate(vars_in_cond):
-                            sep = ": " if idx == 0 else ", "
-                            args.append(f"\"{_quote_dq(sep + name + ' = ')}\"")
-                            args.append(name)
-                        arg_text = ", ".join(args)
-
-                        out.append(f"{indent}if ({cond}) then{eol}")
-                        out.append(f"{i3}block{eol}")
-                        out.append(f"{i6}character(len={msg_len}) :: msg{eol}")
-                        out.append(f"{i6}write(msg, \"{fmt}\") {arg_text}{eol}")
-                        out.append(f"{i6}error stop trim(msg){eol}")
-                        out.append(f"{i3}end block{eol}")
-                        out.append(f"{indent}end if{eol}")
-                        changed += 1
-                        i += 1
-                        continue
+                    i3 = indent + " " * 3
+                    i6 = indent + " " * 6
+                    out.append(f"{indent}if ({cond}) then{eol}")
+                    out.append(f"{i3}block{eol}")
+                    out.append(f"{i6}character(len={msg_len}) :: msg{eol}")
+                    _emit_specific_or_message(
+                        out,
+                        indent_if=i6,
+                        indent_body=i6,
+                        cond_expr=cond,
+                        loc_line=i + 1,
+                        eol=eol,
+                    )
+                    out.append(f"{i6}error stop trim(msg){eol}")
+                    out.append(f"{i3}end block{eol}")
+                    out.append(f"{indent}end if{eol}")
+                    changed += 1
+                    i = end_inline_idx + 1
+                    continue
 
         m_if = if_re.match(code_i)
         if not m_if:
@@ -3418,26 +3528,27 @@ def rewrite_error_stop_blocks_with_condition_values(
         p = m_err.end()
         while p < len(err_code) and err_code[p].isspace():
             p += 1
-        if p >= len(err_code) or err_code[p] not in ("'", '"'):
-            out.append(raw)
-            i += 1
-            continue
-        q = err_code[p]
-        r = p + 1
-        while r < len(err_code):
-            if err_code[r] == q:
-                if r + 1 < len(err_code) and err_code[r + 1] == q:
-                    r += 2
-                    continue
-                break
-            r += 1
-        if r >= len(err_code) or err_code[r] != q or err_code[r + 1 :].strip():
+        block_supported = False
+        if p >= len(err_code):
+            block_supported = True
+        elif err_code[p] in ("'", '"'):
+            q = err_code[p]
+            r = p + 1
+            while r < len(err_code):
+                if err_code[r] == q:
+                    if r + 1 < len(err_code) and err_code[r + 1] == q:
+                        r += 2
+                        continue
+                    break
+                r += 1
+            if r < len(err_code) and err_code[r] == q and not err_code[r + 1 :].strip():
+                block_supported = True
+        if not block_supported:
             out.append(raw)
             i += 1
             continue
 
         cond = m_if.group(2).strip()
-        vars_in_cond = _extract_vars(cond)
         indent = m_if.group(1)
         eol = "\n"
         if raw.endswith("\r\n"):
@@ -3446,19 +3557,17 @@ def rewrite_error_stop_blocks_with_condition_values(
             eol = "\n"
         i3 = indent + " " * 3
         i6 = indent + " " * 6
-        msg_base = f"{cond} [{_loc_for_line(err_idx + 1)}]"
-        fmt = "(a" + ",a,g0" * len(vars_in_cond) + ")"
-        args: List[str] = [f"\"{_quote_dq(msg_base)}\""]
-        for idx, name in enumerate(vars_in_cond):
-            sep = ": " if idx == 0 else ", "
-            args.append(f"\"{_quote_dq(sep + name + ' = ')}\"")
-            args.append(name)
-        arg_text = ", ".join(args)
-
         out.append(raw)
         out.append(f"{i3}block{eol}")
         out.append(f"{i6}character(len={msg_len}) :: msg{eol}")
-        out.append(f"{i6}write(msg, \"{fmt}\") {arg_text}{eol}")
+        _emit_specific_or_message(
+            out,
+            indent_if=i6,
+            indent_body=i6,
+            cond_expr=cond,
+            loc_line=err_idx + 1,
+            eol=eol,
+        )
         out.append(f"{i6}error stop trim(msg){eol}")
         out.append(f"{i3}end block{eol}")
         out.append(lines[end_idx])

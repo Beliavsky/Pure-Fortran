@@ -70,6 +70,12 @@ def main() -> int:
         help="Rewrite IF+ERROR STOP blocks to include condition variable values in the message",
     )
     ap.add_argument("--max-len", type=int, default=80, help="Maximum line length after wrapping (default: 80)")
+    ap.add_argument("--no-line-number", action="store_true", help="Do not append line numbers in location tags")
+    ap.add_argument(
+        "--specific",
+        action="store_true",
+        help="With --condition-values, for top-level .or. conditions report the first failing clause",
+    )
     ap.add_argument("--run", action="store_true", help="Compile and run transformed Fortran sources")
     ap.add_argument(
         "--run-both",
@@ -82,6 +88,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.tee_both:
         args.tee = True
+    if args.specific:
+        args.condition_values = True
 
     if args.out is not None and args.out_dir is not None:
         print("--out and --out-dir are mutually exclusive.")
@@ -122,9 +130,16 @@ def main() -> int:
         label_name = args.out.name if (args.out is not None and len(paths) == 1) else p.name
         if args.condition_values:
             new_lines, cond_rewrites = fscan.rewrite_error_stop_blocks_with_condition_values(
-                new_lines, file_label=label_name
+                new_lines,
+                file_label=label_name,
+                include_line_number=(not args.no_line_number),
+                specific=args.specific,
             )
-        new_lines, rewrites = fscan.append_error_stop_locations(new_lines, file_label=label_name)
+        new_lines, rewrites = fscan.append_error_stop_locations(
+            new_lines,
+            file_label=label_name,
+            include_line_number=(not args.no_line_number),
+        )
         code_lines = [ln.rstrip("\r\n") for ln in new_lines]
         code_lines = fscan.wrap_long_declaration_lines(code_lines, max_len=args.max_len)
         code_lines = fscan.wrap_long_fortran_lines(code_lines, max_len=args.max_len)
