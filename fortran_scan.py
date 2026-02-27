@@ -3297,6 +3297,62 @@ def rewrite_error_stop_blocks_with_condition_values(
         parts = [p for p in parts if p]
         return parts if len(parts) > 1 else None
 
+    def _split_top_level_commas_expr(expr: str) -> List[str]:
+        s = expr
+        parts: List[str] = []
+        start = 0
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch in "([":  # include array constructors
+                depth += 1
+                i += 1
+                continue
+            if ch in ")]" and depth > 0:
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0 and ch == ",":
+                parts.append(s[start:i].strip())
+                i += 1
+                start = i
+                continue
+            i += 1
+        tail = s[start:].strip()
+        if tail:
+            parts.append(tail)
+        return [p for p in parts if p]
+
+    def _split_specific_clauses(cond_expr: str) -> Optional[List[str]]:
+        """Return clauses for specific mode, supporting OR chains and ANY([...])."""
+        clauses = _split_top_level_or(cond_expr)
+        if clauses:
+            return clauses
+        m_any = re.match(
+            r"^\s*any\s*\(\s*\[(.*)\]\s*\)\s*$",
+            cond_expr,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not m_any:
+            return None
+        inside = m_any.group(1).strip()
+        arr_clauses = _split_top_level_commas_expr(inside)
+        return arr_clauses if len(arr_clauses) > 1 else None
+
     def _parse_one_line_if(code_line: str) -> Optional[Tuple[str, str, str]]:
         m_if0 = re.match(r"^(\s*)if\s*\(", code_line, re.IGNORECASE)
         if not m_if0:
@@ -3363,11 +3419,21 @@ def rewrite_error_stop_blocks_with_condition_values(
                 found.append(name)
         return found
 
-    def _msg_write_stmt(indent: str, cond_expr: str, loc_line: int, eol: str) -> str:
+    def _msg_write_stmt(
+        indent: str,
+        cond_expr: str,
+        loc_line: int,
+        eol: str,
+        *,
+        loc_ref: str = "",
+    ) -> str:
         vars_in_cond = _extract_vars(cond_expr)
-        msg_base = f"{cond_expr} [{_loc_for_line(loc_line)}]"
+        if loc_ref:
+            msg_base_expr = f"\"{_quote_dq(cond_expr)} \" // {loc_ref}"
+        else:
+            msg_base_expr = f"\"{_quote_dq(cond_expr)} [{_loc_for_line(loc_line)}]\""
         fmt = "(a" + ",a,g0" * len(vars_in_cond) + ")"
-        args: List[str] = [f"\"{_quote_dq(msg_base)}\""]
+        args: List[str] = [msg_base_expr]
         for idx, name in enumerate(vars_in_cond):
             sep = ": " if idx == 0 else ", "
             args.append(f"\"{_quote_dq(sep + name + ' = ')}\"")
@@ -3383,20 +3449,22 @@ def rewrite_error_stop_blocks_with_condition_values(
         cond_expr: str,
         loc_line: int,
         eol: str,
+        loc_ref: str = "",
     ) -> None:
-        clauses = _split_top_level_or(cond_expr) if specific else None
+        clauses = _split_specific_clauses(cond_expr) if specific else None
         if not clauses:
-            out_lines.append(_msg_write_stmt(indent_body, cond_expr, loc_line, eol))
+            out_lines.append(_msg_write_stmt(indent_body, cond_expr, loc_line, eol, loc_ref=loc_ref))
             return
         first = clauses[0]
         deeper = indent_body + " " * 3
         out_lines.append(f"{indent_if}if ({first}) then{eol}")
-        out_lines.append(_msg_write_stmt(deeper, first, loc_line, eol))
-        for cl in clauses[1:]:
-            out_lines.append(f"{indent_if}else if ({cl}) then{eol}")
-            out_lines.append(_msg_write_stmt(deeper, cl, loc_line, eol))
-        out_lines.append(f"{indent_if}else{eol}")
-        out_lines.append(_msg_write_stmt(deeper, cond_expr, loc_line, eol))
+        out_lines.append(_msg_write_stmt(deeper, first, loc_line, eol, loc_ref=loc_ref))
+        if len(clauses) >= 2:
+            for cl in clauses[1:-1]:
+                out_lines.append(f"{indent_if}else if ({cl}) then{eol}")
+                out_lines.append(_msg_write_stmt(deeper, cl, loc_line, eol, loc_ref=loc_ref))
+            out_lines.append(f"{indent_if}else{eol}")
+            out_lines.append(_msg_write_stmt(deeper, clauses[-1], loc_line, eol, loc_ref=loc_ref))
         out_lines.append(f"{indent_if}end if{eol}")
 
     while i < len(lines):
@@ -3466,6 +3534,7 @@ def rewrite_error_stop_blocks_with_condition_values(
                     out.append(f"{indent}if ({cond}) then{eol}")
                     out.append(f"{i3}block{eol}")
                     out.append(f"{i6}character(len={msg_len}) :: msg{eol}")
+                    out.append(f"{i6}character(len=*), parameter :: loc = \"[{_quote_dq(_loc_for_line(i + 1))}]\"{eol}")
                     _emit_specific_or_message(
                         out,
                         indent_if=i6,
@@ -3473,6 +3542,7 @@ def rewrite_error_stop_blocks_with_condition_values(
                         cond_expr=cond,
                         loc_line=i + 1,
                         eol=eol,
+                        loc_ref="loc",
                     )
                     out.append(f"{i6}error stop trim(msg){eol}")
                     out.append(f"{i3}end block{eol}")
@@ -3560,6 +3630,7 @@ def rewrite_error_stop_blocks_with_condition_values(
         out.append(raw)
         out.append(f"{i3}block{eol}")
         out.append(f"{i6}character(len={msg_len}) :: msg{eol}")
+        out.append(f"{i6}character(len=*), parameter :: loc = \"[{_quote_dq(_loc_for_line(err_idx + 1))}]\"{eol}")
         _emit_specific_or_message(
             out,
             indent_if=i6,
@@ -3567,6 +3638,7 @@ def rewrite_error_stop_blocks_with_condition_values(
             cond_expr=cond,
             loc_line=err_idx + 1,
             eol=eol,
+            loc_ref="loc",
         )
         out.append(f"{i6}error stop trim(msg){eol}")
         out.append(f"{i3}end block{eol}")
