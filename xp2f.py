@@ -2004,10 +2004,12 @@ class translator(ast.NodeVisitor):
         self.complexes = set()
         self.logs = set()
         self.alloc_logs = set()
+        self.alloc_complexes = set()
         self.alloc_ints = set()
         self.alloc_reals = set()
         self.alloc_chars = set()
         self.alloc_real_rank = {}
+        self.alloc_complex_rank = {}
         self.alloc_int_rank = {}
         self.alloc_log_rank = {}
         self.alloc_char_rank = {}
@@ -2213,7 +2215,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.logs:
             return
-        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals or name in self.alloc_chars:
+        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals or name in self.alloc_complexes or name in self.alloc_chars:
             return
         self.complexes.add(name)
         self.ints.discard(name)
@@ -2252,6 +2254,8 @@ class translator(ast.NodeVisitor):
         self.alloc_log_rank.pop(name, None)
         self.alloc_reals.discard(name)
         self.alloc_real_rank.pop(name, None)
+        self.alloc_complexes.discard(name)
+        self.alloc_complex_rank.pop(name, None)
         self.alloc_chars.discard(name)
         self.alloc_char_rank.pop(name, None)
 
@@ -2274,6 +2278,32 @@ class translator(ast.NodeVisitor):
         self.alloc_log_rank.pop(name, None)
         self.alloc_ints.discard(name)
         self.alloc_int_rank.pop(name, None)
+        self.alloc_complexes.discard(name)
+        self.alloc_complex_rank.pop(name, None)
+        self.alloc_chars.discard(name)
+        self.alloc_char_rank.pop(name, None)
+
+    def _mark_alloc_complex(self, name, rank=1):
+        if name == "_":
+            return
+        if name in self.reserved_names:
+            return
+        if name in self.params:
+            return
+        self.alloc_complexes.add(name)
+        if rank is None or rank < 1:
+            rank = 1
+        self.alloc_complex_rank[name] = max(rank, self.alloc_complex_rank.get(name, 1))
+        self.ints.discard(name)
+        self.reals.discard(name)
+        self.complexes.discard(name)
+        self.logs.discard(name)
+        self.alloc_logs.discard(name)
+        self.alloc_log_rank.pop(name, None)
+        self.alloc_ints.discard(name)
+        self.alloc_int_rank.pop(name, None)
+        self.alloc_reals.discard(name)
+        self.alloc_real_rank.pop(name, None)
         self.alloc_chars.discard(name)
         self.alloc_char_rank.pop(name, None)
 
@@ -2296,6 +2326,8 @@ class translator(ast.NodeVisitor):
         self.alloc_int_rank.pop(name, None)
         self.alloc_reals.discard(name)
         self.alloc_real_rank.pop(name, None)
+        self.alloc_complexes.discard(name)
+        self.alloc_complex_rank.pop(name, None)
         self.alloc_chars.discard(name)
         self.alloc_char_rank.pop(name, None)
 
@@ -2318,6 +2350,8 @@ class translator(ast.NodeVisitor):
         self.alloc_int_rank.pop(name, None)
         self.alloc_reals.discard(name)
         self.alloc_real_rank.pop(name, None)
+        self.alloc_complexes.discard(name)
+        self.alloc_complex_rank.pop(name, None)
         self.alloc_logs.discard(name)
         self.alloc_log_rank.pop(name, None)
 
@@ -2374,6 +2408,8 @@ class translator(ast.NodeVisitor):
                 return "logical"
             if nm in self.alloc_reals:
                 return "real"
+            if nm in self.alloc_complexes:
+                return "complex"
             if nm in self.alloc_ints:
                 return "int"
             if nm in self.alloc_logs:
@@ -2525,6 +2561,8 @@ class translator(ast.NodeVisitor):
                     return "int"
                 if nm in self.alloc_reals:
                     return "real"
+                if nm in self.alloc_complexes:
+                    return "complex"
                 if nm in self.alloc_chars:
                     return "char"
             return None
@@ -2594,6 +2632,14 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"complex64", "complex128", "csingle", "cdouble"}
+                and len(node.args) >= 1
+            ):
+                return "complex"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "polyval"
                 and len(node.args) >= 2
             ):
@@ -2626,6 +2672,8 @@ class translator(ast.NodeVisitor):
                             dtype_txt = kw.value.attr.lower()
                 if "float" in dtype_txt:
                     return "real"
+                if "complex" in dtype_txt:
+                    return "complex"
                 if "int" in dtype_txt:
                     return "int"
                 if "bool" in dtype_txt:
@@ -2653,6 +2701,23 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if "int" in dtype_txt:
                     return "int"
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"abs", "absolute"}
+                and len(node.args) >= 1
+            ):
+                ak = self._expr_kind(node.args[0])
+                return "real" if ak == "complex" else ak
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"conj", "conjugate"}
+                and len(node.args) >= 1
+            ):
                 return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -2691,6 +2756,8 @@ class translator(ast.NodeVisitor):
                 dtype_txt = self._np_dtype_text(node)
                 if "float" in dtype_txt:
                     return "real"
+                if "complex" in dtype_txt:
+                    return "complex"
                 if "int" in dtype_txt:
                     return "int"
                 if "bool" in dtype_txt:
@@ -3381,6 +3448,8 @@ class translator(ast.NodeVisitor):
                 return 2
             if nm in self.alloc_reals:
                 return self.alloc_real_rank.get(nm, 1)
+            if nm in self.alloc_complexes:
+                return self.alloc_complex_rank.get(nm, 1)
             if nm in self.alloc_ints:
                 return self.alloc_int_rank.get(nm, 1)
             if nm in self.alloc_logs:
@@ -4000,6 +4069,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Name):
             if node.id in self.alloc_reals:
                 return self.alloc_real_rank.get(node.id, 1)
+            if node.id in self.alloc_complexes:
+                return self.alloc_complex_rank.get(node.id, 1)
             if node.id in self.alloc_ints:
                 return self.alloc_int_rank.get(node.id, 1)
             if node.id in self.alloc_logs:
@@ -4078,6 +4149,9 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported binop")
             a0 = self.expr(node.left)
             b0 = self.expr(node.right)
+            if op is ast.MatMult:
+                # Fortran MATMUL already handles rank-1/rank-2 combinations.
+                return f"matmul({a0}, {b0})"
             a = a0
             b = b0
             # Limited NumPy-style broadcasting:
@@ -4145,8 +4219,6 @@ class translator(ast.NodeVisitor):
                     a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
                 else:
                     a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
-            if op is ast.MatMult:
-                return f"matmul({a}, {b})"
             if op is ast.Mod:
                 return f"mod({a}, {b})"
             if op is ast.LShift:
@@ -4611,6 +4683,8 @@ class translator(ast.NodeVisitor):
                 a0 = self.expr(node.args[0])
                 if "float" in dtype_txt:
                     return f"real({a0}, kind=dp)"
+                if "complex" in dtype_txt:
+                    return f"cmplx({a0}, kind=dp)"
                 if "int" in dtype_txt:
                     return f"int({a0})"
                 return a0
@@ -4630,6 +4704,17 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
                 and isinstance(node.args[0], ast.List)
             ):
+                dtype_txt = ""
+                for kw in node.keywords:
+                    if kw.arg == "dtype":
+                        if isinstance(kw.value, ast.Name):
+                            dtype_txt = kw.value.id.lower()
+                        elif (
+                            isinstance(kw.value, ast.Attribute)
+                            and isinstance(kw.value.value, ast.Name)
+                            and kw.value.value.id == "np"
+                        ):
+                            dtype_txt = kw.value.attr.lower()
                 elts = node.args[0].elts
                 if elts and all(isinstance(e, ast.List) for e in elts):
                     nrow = len(elts)
@@ -4640,8 +4725,14 @@ class translator(ast.NodeVisitor):
                     for r in elts:
                         flat_nodes.extend(r.elts)
                     vals = ", ".join(self.expr(e) for e in flat_nodes)
-                    return f"transpose(reshape([{vals}], [{ncol}, {nrow}]))"
+                    if "complex" in dtype_txt:
+                        vals = f"cmplx([{vals}], kind=dp)"
+                    else:
+                        vals = f"[{vals}]"
+                    return f"transpose(reshape({vals}, [{ncol}, {nrow}]))"
                 vals = ", ".join(self.expr(e) for e in elts)
+                if "complex" in dtype_txt:
+                    return f"cmplx([{vals}], kind=dp)"
                 return f"[{vals}]"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -4667,6 +4758,8 @@ class translator(ast.NodeVisitor):
                             dtype_txt = kw.value.attr.lower()
                 if "float" in dtype_txt:
                     return f"real({src}(1:{cnt}), kind=dp)"
+                if "complex" in dtype_txt:
+                    return f"cmplx({src}(1:{cnt}), kind=dp)"
                 if "int" in dtype_txt:
                     return f"int({src}(1:{cnt}))"
                 return f"{src}(1:{cnt})"
@@ -4693,6 +4786,8 @@ class translator(ast.NodeVisitor):
                             dtype_txt = kw.value.attr.lower()
                 if "float" in dtype_txt:
                     return f"real({a0}, kind=dp)"
+                if "complex" in dtype_txt:
+                    return f"cmplx({a0}, kind=dp)"
                 if "int" in dtype_txt:
                     return f"int({a0})"
                 if "bool" in dtype_txt:
@@ -4766,6 +4861,30 @@ class translator(ast.NodeVisitor):
                 if keepdims:
                     return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
                 return reduced
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"complex64", "complex128", "csingle", "cdouble"}
+                and len(node.args) >= 1
+            ):
+                return f"cmplx({self.expr(node.args[0])}, kind=dp)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"conj", "conjugate"}
+                and len(node.args) == 1
+            ):
+                return f"conjg({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"abs", "absolute"}
+                and len(node.args) == 1
+            ):
+                return f"abs({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -6246,6 +6365,8 @@ class translator(ast.NodeVisitor):
                     nm = self._aliased_name(node.value.id)
                     if nm in self.alloc_ints or nm in self.ints:
                         return fstr("int")
+                    if nm in self.alloc_complexes or nm in self.complexes:
+                        return fstr("complex")
                     if nm in self.alloc_reals or nm in self.reals:
                         return fstr("float")
                     if nm in self.alloc_logs or nm in self.logs:
@@ -6603,6 +6724,8 @@ class translator(ast.NodeVisitor):
                     if self._rank_expr(v) > 0:
                         if k == "real":
                             self._mark_alloc_real(t.id, rank=rk)
+                        elif k == "complex":
+                            self._mark_alloc_complex(t.id, rank=rk)
                         elif k == "logical":
                             self._mark_alloc_log(t.id, rank=rk)
                         elif k == "int":
@@ -6671,8 +6794,7 @@ class translator(ast.NodeVisitor):
                         if k == "real":
                             self._mark_alloc_real(t.id, rank=rk)
                         elif k == "complex":
-                            # Complex array allocation not yet modeled separately; keep real alloc fallback.
-                            self._mark_alloc_real(t.id, rank=rk)
+                            self._mark_alloc_complex(t.id, rank=rk)
                         elif k == "logical":
                             self._mark_alloc_log(t.id, rank=rk)
                         elif k == "int":
@@ -6696,6 +6818,7 @@ class translator(ast.NodeVisitor):
                         t.id not in self.dict_typed_vars
                         and t.id not in self.alloc_ints
                         and t.id not in self.alloc_reals
+                        and t.id not in self.alloc_complexes
                         and t.id not in self.alloc_logs
                         and t.id not in self.alloc_chars
                         and t.id not in self.logs
@@ -6767,6 +6890,7 @@ class translator(ast.NodeVisitor):
                     and t.id not in self.dict_typed_vars
                     and t.id not in self.alloc_ints
                     and t.id not in self.alloc_reals
+                    and t.id not in self.alloc_complexes
                     and t.id not in self.alloc_logs
                     and t.id not in self.ints
                     and t.id not in self.reals
@@ -6842,6 +6966,8 @@ class translator(ast.NodeVisitor):
                     if dtype_txt:
                         if "float" in dtype_txt:
                             self._mark_alloc_real(t.id, rank=rank_hint)
+                        elif "complex" in dtype_txt:
+                            self._mark_alloc_complex(t.id, rank=rank_hint)
                         elif "bool" in dtype_txt:
                             self._mark_alloc_log(t.id, rank=rank_hint)
                         else:
@@ -7030,6 +7156,8 @@ class translator(ast.NodeVisitor):
                     k = self._expr_kind(v)
                     if k == "real":
                         self._mark_alloc_real(t.id, rank=rk)
+                    elif k == "complex":
+                        self._mark_alloc_complex(t.id, rank=rk)
                     elif k == "logical":
                         self._mark_alloc_log(t.id)
                     else:
@@ -7063,6 +7191,8 @@ class translator(ast.NodeVisitor):
                     if dtype_txt:
                         if "float" in dtype_txt:
                             self._mark_alloc_real(t.id, rank=rank_hint)
+                        elif "complex" in dtype_txt:
+                            self._mark_alloc_complex(t.id, rank=rank_hint)
                         elif "bool" in dtype_txt:
                             self._mark_alloc_log(t.id, rank=rank_hint)
                         else:
@@ -7074,9 +7204,12 @@ class translator(ast.NodeVisitor):
                                 flat_elts.extend(e.elts)
                             else:
                                 flat_elts.append(e)
+                        has_complex = any(isinstance(e, ast.Constant) and isinstance(e.value, complex) for e in flat_elts)
                         has_float = any(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in flat_elts)
                         has_bool = any(is_bool_const(e) for e in flat_elts)
-                        if has_float:
+                        if has_complex:
+                            self._mark_alloc_complex(t.id, rank=rank_hint)
+                        elif has_float:
                             self._mark_alloc_real(t.id, rank=rank_hint)
                         elif has_bool:
                             self._mark_alloc_log(t.id, rank=rank_hint)
@@ -7108,6 +7241,8 @@ class translator(ast.NodeVisitor):
                                 dtype_txt = kw.value.attr.lower()
                     if "float" in dtype_txt:
                         self._mark_alloc_real(t.id)
+                    elif "complex" in dtype_txt:
+                        self._mark_alloc_complex(t.id)
                     elif "bool" in dtype_txt:
                         self._mark_alloc_log(t.id)
                     else:
@@ -7136,15 +7271,20 @@ class translator(ast.NodeVisitor):
                                 dtype_txt = kw.value.attr.lower()
                     if "float" in dtype_txt:
                         self._mark_alloc_real(t.id)
+                    elif "complex" in dtype_txt:
+                        self._mark_alloc_complex(t.id)
                     elif "int" in dtype_txt:
                         self._mark_alloc_int(t.id)
                     elif "bool" in dtype_txt:
                         self._mark_alloc_log(t.id)
                     else:
                         if isinstance(v.args[0], ast.List):
+                            has_complex = any(isinstance(e, ast.Constant) and isinstance(e.value, complex) for e in v.args[0].elts)
                             has_float = any(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in v.args[0].elts)
                             has_bool = any(is_bool_const(e) for e in v.args[0].elts)
-                            if has_float:
+                            if has_complex:
+                                self._mark_alloc_complex(t.id)
+                            elif has_float:
                                 self._mark_alloc_real(t.id)
                             elif has_bool:
                                 self._mark_alloc_log(t.id)
@@ -7154,6 +7294,8 @@ class translator(ast.NodeVisitor):
                             k0 = self._expr_kind(v.args[0])
                             if k0 == "real":
                                 self._mark_alloc_real(t.id)
+                            elif k0 == "complex":
+                                self._mark_alloc_complex(t.id)
                             else:
                                 self._mark_alloc_int(t.id)
 
@@ -9879,24 +10021,28 @@ def _emit_local_function(
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints - {ret_name})
     alloc_reals_set = set(tr.alloc_reals - {ret_name})
+    alloc_complexes_set = set(tr.alloc_complexes - {ret_name})
     alloc_chars_set = set(tr.alloc_chars - {ret_name})
     alloc_logs_set -= set(args)
     alloc_ints_set -= set(args)
     alloc_reals_set -= set(args)
+    alloc_complexes_set -= set(args)
     alloc_chars_set -= set(args)
     if tuple_return:
         alloc_logs_set -= set(out_names)
         alloc_ints_set -= set(out_names)
         alloc_reals_set -= set(out_names)
+        alloc_complexes_set -= set(out_names)
         alloc_chars_set -= set(out_names)
     remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names))
-    complexes = sorted((tr.complexes - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
-    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
-    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
-    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
-    chars = sorted((getattr(tr, "chars", set()) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
+    complexes = sorted((tr.complexes - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
+    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    chars = sorted((getattr(tr, "chars", set()) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     alloc_logs = sorted(alloc_logs_set)
     alloc_ints = sorted(alloc_ints_set)
+    alloc_complexes = sorted(alloc_complexes_set)
     alloc_chars = sorted(alloc_chars_set)
 
     is_pure_fn = function_is_pure(fn, known_pure_calls=known_pure_calls)
@@ -10027,6 +10173,12 @@ def _emit_local_function(
                 arg_decl = f"logical, intent({intent_txt}) :: {arg}({dims})"
             else:
                 arg_decl = f"logical, intent({intent_txt}) :: {arg}(:)"
+        elif arg in tr.alloc_complexes:
+            if arr_rank > 0:
+                dims = ",".join(":" for _ in range(arr_rank))
+                arg_decl = f"complex(kind=dp), intent({intent_txt}) :: {arg}({dims})"
+            else:
+                arg_decl = f"complex(kind=dp), intent({intent_txt}) :: {arg}(:)"
         elif arg in tr.alloc_chars:
             if arr_rank > 0:
                 dims = ",".join(":" for _ in range(arr_rank))
@@ -10087,6 +10239,10 @@ def _emit_local_function(
                 rr = max(1, tr.alloc_log_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
+            elif nm in tr.alloc_complexes:
+                rr = max(1, tr.alloc_complex_rank.get(nm, 1))
+                dims = ",".join(":" for _ in range(rr))
+                o.w(f"complex(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_chars:
                 rr = max(1, tr.alloc_char_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
@@ -10107,6 +10263,11 @@ def _emit_local_function(
             rr = max(1, tr.alloc_real_rank.get(ret_name_src, 1))
             dims = ",".join(":" for _ in range(rr))
             ret_decl = f"real(kind=dp), allocatable :: {ret_name}({dims})"
+            ret_decl_full = True
+        elif ret_name_src is not None and ret_name_src in tr.alloc_complexes:
+            rr = max(1, tr.alloc_complex_rank.get(ret_name_src, 1))
+            dims = ",".join(":" for _ in range(rr))
+            ret_decl = f"complex(kind=dp), allocatable :: {ret_name}({dims})"
             ret_decl_full = True
         elif ret_name_src is not None and ret_name_src in tr.alloc_ints:
             ret_decl = f"integer, allocatable :: {ret_name}(:)"
@@ -10159,6 +10320,10 @@ def _emit_local_function(
         rr = max(1, tr.alloc_real_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"real(kind=dp), allocatable :: {nm}({dims})")
+    for nm in alloc_complexes:
+        rr = max(1, tr.alloc_complex_rank.get(nm, 1))
+        dims = ",".join(":" for _ in range(rr))
+        o.w(f"complex(kind=dp), allocatable :: {nm}({dims})")
     for nm in alloc_chars:
         rr = max(1, tr.alloc_char_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
@@ -10488,14 +10653,15 @@ def generate_flat(
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints)
     alloc_reals_set = set(tr.alloc_reals)
+    alloc_complexes_set = set(tr.alloc_complexes)
     alloc_chars_set = set(tr.alloc_chars)
     complexes_set = set(tr.complexes)
     ints = sorted(
-        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - complexes_set
+        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set
     )
-    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - complexes_set)
-    complexes = sorted((complexes_set - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
-    logs = sorted((tr.logs - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - complexes_set)
+    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
+    complexes = sorted((complexes_set - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
+    logs = sorted((tr.logs - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
     dict_type_vars = sorted(tr.dict_typed_vars.items())
     if ints:
         o.w("integer :: " + ", ".join(ints))
@@ -10521,6 +10687,10 @@ def generate_flat(
         rr = max(1, tr.alloc_real_rank.get(name, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"real(kind=dp), allocatable :: {name}({dims})")
+    for name in sorted(alloc_complexes_set):
+        rr = max(1, tr.alloc_complex_rank.get(name, 1))
+        dims = ",".join(":" for _ in range(rr))
+        o.w(f"complex(kind=dp), allocatable :: {name}({dims})")
     for name in sorted(alloc_chars_set):
         rr = max(1, tr.alloc_char_rank.get(name, 1))
         dims = ",".join(":" for _ in range(rr))
