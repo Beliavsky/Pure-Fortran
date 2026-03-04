@@ -2427,6 +2427,8 @@ class translator(ast.NodeVisitor):
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
                 return 1
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
+                return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "transpose":
                 if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
                     return max(1, len(node.args[0].elts))
@@ -4787,6 +4789,82 @@ class translator(ast.NodeVisitor):
             full0 = isinstance(a0, ast.Slice) and a0.lower is None and a0.upper is None and a0.step is None
             full1 = isinstance(a1, ast.Slice) and a1.lower is None and a1.upper is None and a1.step is None
             if (full0 and is_none(a1)) or (is_none(a0) and full1):
+                return
+
+        # Pairwise 2D fancy indexing read:
+        #   y = a[rows, cols]
+        # NumPy semantics are elementwise pairs, not cartesian product.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Subscript)
+            and isinstance(v.slice, ast.Tuple)
+            and len(v.slice.elts) == 2
+            and self._rank_expr(v.value) == 2
+        ):
+            i0n, i1n = v.slice.elts
+            if (
+                (not isinstance(i0n, ast.Slice))
+                and (not isinstance(i1n, ast.Slice))
+                and (not is_none(i0n))
+                and (not is_none(i1n))
+                and self._rank_expr(i0n) > 0
+                and self._rank_expr(i1n) > 0
+            ):
+                base = self.expr(v.value)
+                i0 = self.expr(i0n)
+                i1 = self.expr(i1n)
+                self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+                self.o.w(f"allocate({t.id}(1:min(size({i0}), size({i1}))))")
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: i_pw")
+                self.o.w(f"do i_pw = 1, size({t.id})")
+                self.o.push()
+                self.o.w(f"{t.id}(i_pw) = {base}({i0}(i_pw) + 1, {i1}(i_pw) + 1)")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # Pairwise 2D fancy indexing write:
+        #   a[rows, cols] = rhs
+        if (
+            isinstance(t, ast.Subscript)
+            and isinstance(t.slice, ast.Tuple)
+            and len(t.slice.elts) == 2
+            and self._rank_expr(t.value) == 2
+        ):
+            i0n, i1n = t.slice.elts
+            if (
+                (not isinstance(i0n, ast.Slice))
+                and (not isinstance(i1n, ast.Slice))
+                and (not is_none(i0n))
+                and (not is_none(i1n))
+                and self._rank_expr(i0n) > 0
+                and self._rank_expr(i1n) > 0
+            ):
+                base = self.expr(t.value)
+                i0 = self.expr(i0n)
+                i1 = self.expr(i1n)
+                rhs = self.expr(v)
+                rhs_rank = self._rank_expr(v)
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: i_pw, n_pw")
+                self.o.w(f"n_pw = min(size({i0}), size({i1}))")
+                if rhs_rank > 0:
+                    self.o.w(f"n_pw = min(n_pw, size({rhs}))")
+                self.o.w("do i_pw = 1, n_pw")
+                self.o.push()
+                if rhs_rank > 0:
+                    self.o.w(f"{base}({i0}(i_pw) + 1, {i1}(i_pw) + 1) = {rhs}(i_pw)")
+                else:
+                    self.o.w(f"{base}({i0}(i_pw) + 1, {i1}(i_pw) + 1) = {rhs}")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
                 return
 
         # Targeted safe lowering for common NumPy-broadcast EM patterns.
