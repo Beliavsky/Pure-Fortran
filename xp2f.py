@@ -1037,6 +1037,32 @@ def build_list_count_map(tree):
     return {k: out[k] for k in keep}
 
 
+def collect_vectorize_aliases(tree, local_funcs=None):
+    """Collect simple aliases like `vf = np.vectorize(f)` for known local functions."""
+    aliases = {}
+    local_names = {fn.name for fn in (local_funcs or [])}
+    for node in getattr(tree, "body", []):
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "np"
+            and node.value.func.attr == "vectorize"
+            and len(node.value.args) >= 1
+            and isinstance(node.value.args[0], ast.Name)
+        ):
+            continue
+        alias = node.targets[0].id
+        target = node.value.args[0].id
+        if local_names and target not in local_names:
+            continue
+        aliases[alias] = target
+    return aliases
+
+
 def detect_scalar_outputs(tree, params):
     # scalars appearing in f-strings in prints in the else-branch
     outs = set()
@@ -1860,6 +1886,7 @@ class emit:
 
 class translator(ast.NodeVisitor):
     global_synthetic_slices = {}
+    global_vectorize_aliases = {}
 
     def __init__(
         self,
@@ -1908,8 +1935,29 @@ class translator(ast.NodeVisitor):
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
         self.dict_var_components = {}
         self.synthetic_slices = dict(translator.global_synthetic_slices)
+        self.vectorize_aliases = dict(translator.global_vectorize_aliases)
         self.var_type_first_seen = {}
         self.reserved_names = {"dp"}
+
+    @staticmethod
+    def _is_np_vectorize_call(node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "np"
+            and node.func.attr == "vectorize"
+        )
+
+    @staticmethod
+    def _vectorize_target_name(node):
+        if (
+            translator._is_np_vectorize_call(node)
+            and len(node.args) >= 1
+            and isinstance(node.args[0], ast.Name)
+        ):
+            return node.args[0].id
+        return None
 
     @staticmethod
     def _kind_family(k):
@@ -2318,6 +2366,19 @@ class translator(ast.NodeVisitor):
                     return "char"
             return None
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
+                tgt = self.vectorize_aliases[node.func.id]
+                if tgt in self.local_return_specs:
+                    spec = self.local_return_specs[tgt]
+                    if spec in {"real", "alloc_real"}:
+                        return "real"
+                    if spec in {"int", "alloc_int"}:
+                        return "int"
+                    if spec in {"logical", "alloc_log"}:
+                        return "logical"
+                if len(node.args) >= 1:
+                    return self._expr_kind(node.args[0])
+                return None
             if isinstance(node.func, ast.Name) and node.func.id in {
                 "cumsum",
                 "cumprod",
@@ -3215,6 +3276,10 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Attribute) and node.attr == "T":
             return self._rank_expr(node.value)
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
+                if len(node.args) >= 1:
+                    return self._rank_expr(node.args[0])
+                return 0
             if isinstance(node.func, ast.Name) and node.func.id in {
                 "cumsum",
                 "cumprod",
@@ -4100,6 +4165,14 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("ListComp currently supports only single-generator form")
 
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
+                args_nodes = list(node.args)
+                for kw in getattr(node, "keywords", []):
+                    if kw.arg is None:
+                        raise NotImplementedError("**kwargs not supported")
+                    args_nodes.append(kw.value)
+                args = ", ".join(self.expr(a) for a in args_nodes)
+                return f"{self.vectorize_aliases[node.func.id]}({args})"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
                 return self.expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist" and len(node.args) == 0:
@@ -5963,6 +6036,16 @@ class translator(ast.NodeVisitor):
             if isinstance(node, ast.Assign):
                 if (
                     len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                ):
+                    vec_target = self._vectorize_target_name(node.value)
+                    if vec_target is not None:
+                        alias = node.targets[0].id
+                        self.vectorize_aliases[alias] = vec_target
+                        translator.global_vectorize_aliases[alias] = vec_target
+                        continue
+                if (
+                    len(node.targets) == 1
                     and isinstance(node.targets[0], (ast.Tuple, ast.List))
                     and isinstance(node.value, ast.Call)
                     and isinstance(node.value.func, ast.Name)
@@ -6995,6 +7078,12 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("multiple assignment not supported")
         t = node.targets[0]
         v = node.value
+        if isinstance(t, ast.Name):
+            vec_target = self._vectorize_target_name(v)
+            if vec_target is not None:
+                self.vectorize_aliases[t.id] = vec_target
+                translator.global_vectorize_aliases[t.id] = vec_target
+                return
         if isinstance(t, ast.Name) and t.id in self.reserved_names:
             # keep translator-owned kind parameters stable
             return
@@ -9227,6 +9316,7 @@ def _emit_local_function(
     dict_type_components=None,
     dict_arg_types=None,
     local_func_arg_ranks=None,
+    elemental_funcs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     args = [a.arg for a in fn.args.args]
@@ -9361,6 +9451,7 @@ def _emit_local_function(
     # Scope comment emission to this procedure body; otherwise comments from
     # earlier procedures leak into the first emitted statement.
     tr._last_comment_line = getattr(fn, "lineno", 0)
+    is_elemental_fn = fn.name in set(elemental_funcs or set())
     for anm, tnm in (dict_arg_types or {}).items():
         tr.dict_typed_vars[anm] = tnm
         tr.dict_var_components[anm] = list((dict_type_components or {}).get(tnm, {}).keys())
@@ -9397,6 +9488,8 @@ def _emit_local_function(
     dict_arg_names = set((dict_arg_types or {}).keys())
     for a in fn.args.args:
         if a.arg in dict_arg_names:
+            continue
+        if is_elemental_fn:
             continue
         rr = _pre_arg_rank(a.arg)
         if local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
@@ -9472,7 +9565,11 @@ def _emit_local_function(
     alloc_ints = sorted(alloc_ints_set)
     alloc_chars = sorted(alloc_chars_set)
 
-    pure_prefix = "pure " if function_is_pure(fn, known_pure_calls=known_pure_calls) else ""
+    is_pure_fn = function_is_pure(fn, known_pure_calls=known_pure_calls)
+    if is_elemental_fn and not tuple_return:
+        pure_prefix = "pure elemental " if is_pure_fn else "impure elemental "
+    else:
+        pure_prefix = "pure " if is_pure_fn else ""
     if tuple_return:
         sig = args + out_names
         o.w(f"{pure_prefix}subroutine {fn.name}(" + ", ".join(sig) + ")")
@@ -9570,7 +9667,7 @@ def _emit_local_function(
     # Keep internal rank metadata for dummy array arguments consistent with
     # the declared argument rank used below.
     for _arg in args:
-        _rr = _arg_array_rank(_arg)
+        _rr = 0 if is_elemental_fn else _arg_array_rank(_arg)
         if _arg in tr.alloc_reals and _rr > 0:
             tr.alloc_real_rank[_arg] = _rr
 
@@ -9580,7 +9677,7 @@ def _emit_local_function(
         ann_is_int = ("int" in ann) and ("float" not in ann) and ("bool" not in ann)
         ann_is_float = "float" in ann
         ann_is_bool = "bool" in ann or "logical" in ann
-        arr_rank = _arg_array_rank(arg)
+        arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
         if arg in (dict_arg_types or {}):
             tnm = (dict_arg_types or {})[arg]
             arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg}"
@@ -9890,10 +9987,15 @@ def generate_flat(
         tr_seed.prescan(tree.body)
         for st in tree.body:
             for n in ast.walk(st):
-                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in call_rank_hints):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
                     continue
-                rr = call_rank_hints[n.func.id]
-                rk = call_kind_hints[n.func.id]
+                callee = n.func.id
+                if callee in translator.global_vectorize_aliases:
+                    callee = translator.global_vectorize_aliases[callee]
+                if callee not in call_rank_hints:
+                    continue
+                rr = call_rank_hints[callee]
+                rk = call_kind_hints[callee]
                 for i, a in enumerate(n.args):
                     if i >= len(rr):
                         break
@@ -10072,6 +10174,7 @@ def generate_flat(
         tr.visit(stmt)
 
     if local_funcs:
+        elemental_targets = set(translator.global_vectorize_aliases.values())
         o.w("")
         o.w("contains")
         o.w("")
@@ -10111,6 +10214,7 @@ def generate_flat(
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
                 local_func_arg_ranks=local_func_arg_ranks,
+                elemental_funcs=elemental_targets,
             )
 
     o.pop()
@@ -10479,6 +10583,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     src = Path(py_path).read_text(encoding="utf-8")
     tree = ast.parse(src)
     translator.global_synthetic_slices = {}
+    translator.global_vectorize_aliases = {}
     comment_map = extract_python_comments(src)
 
     exec_nodes = [
@@ -10550,6 +10655,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
         )
 
     params = find_parameters(effective_tree)
+    translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
     helper_scan_tree = effective_tree
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
