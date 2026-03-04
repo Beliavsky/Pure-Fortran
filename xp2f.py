@@ -1858,9 +1858,11 @@ class translator(ast.NodeVisitor):
         self.alloc_logs = set()
         self.alloc_ints = set()
         self.alloc_reals = set()
+        self.alloc_chars = set()
         self.alloc_real_rank = {}
         self.alloc_int_rank = {}
         self.alloc_log_rank = {}
+        self.alloc_char_rank = {}
         self.broadcast_col2 = set()
         self.broadcast_row2 = set()
         self.nonzero_tuple_vars = set()
@@ -1889,7 +1891,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.logs:
             return
-        if name in self.alloc_ints or name in self.alloc_logs:
+        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_chars:
             return
         self.ints.add(name)
 
@@ -1902,7 +1904,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.logs:
             return
-        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals:
+        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals or name in self.alloc_chars:
             return
         self.reals.add(name)
         self.ints.discard(name)
@@ -1914,7 +1916,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
-        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals:
+        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals or name in self.alloc_chars:
             return
         self.logs.add(name)
         self.ints.discard(name)
@@ -1938,6 +1940,8 @@ class translator(ast.NodeVisitor):
         self.alloc_log_rank.pop(name, None)
         self.alloc_reals.discard(name)
         self.alloc_real_rank.pop(name, None)
+        self.alloc_chars.discard(name)
+        self.alloc_char_rank.pop(name, None)
 
     def _mark_alloc_real(self, name, rank=1):
         if name == "_":
@@ -1957,6 +1961,8 @@ class translator(ast.NodeVisitor):
         self.alloc_log_rank.pop(name, None)
         self.alloc_ints.discard(name)
         self.alloc_int_rank.pop(name, None)
+        self.alloc_chars.discard(name)
+        self.alloc_char_rank.pop(name, None)
 
     def _mark_alloc_log(self, name, rank=1):
         if name == "_":
@@ -1976,6 +1982,29 @@ class translator(ast.NodeVisitor):
         self.alloc_int_rank.pop(name, None)
         self.alloc_reals.discard(name)
         self.alloc_real_rank.pop(name, None)
+        self.alloc_chars.discard(name)
+        self.alloc_char_rank.pop(name, None)
+
+    def _mark_alloc_char(self, name, rank=1):
+        if name == "_":
+            return
+        if name in self.reserved_names:
+            return
+        if name in self.params:
+            return
+        self.alloc_chars.add(name)
+        if rank is None or rank < 1:
+            rank = 1
+        self.alloc_char_rank[name] = max(rank, self.alloc_char_rank.get(name, 1))
+        self.ints.discard(name)
+        self.reals.discard(name)
+        self.logs.discard(name)
+        self.alloc_ints.discard(name)
+        self.alloc_int_rank.pop(name, None)
+        self.alloc_reals.discard(name)
+        self.alloc_real_rank.pop(name, None)
+        self.alloc_logs.discard(name)
+        self.alloc_log_rank.pop(name, None)
 
     def _emit_comments_for(self, node):
         ln = getattr(node, "lineno", None)
@@ -2009,6 +2038,8 @@ class translator(ast.NodeVisitor):
                 return "int"
             if isinstance(node.value, float):
                 return "real"
+            if isinstance(node.value, str):
+                return "char"
             return None
         if isinstance(node, ast.Name):
             if node.id in self.dict_typed_vars:
@@ -2025,6 +2056,8 @@ class translator(ast.NodeVisitor):
                 return "int"
             if node.id in self.alloc_logs:
                 return "logical"
+            if node.id in self.alloc_chars:
+                return "char"
             return None
         if isinstance(node, ast.List):
             if not node.elts:
@@ -2039,6 +2072,8 @@ class translator(ast.NodeVisitor):
                 return "int"
             if kinds == {"logical"}:
                 return "logical"
+            if kinds == {"char"}:
+                return "char"
             return None
         if isinstance(node, ast.Tuple):
             if not node.elts:
@@ -2053,6 +2088,8 @@ class translator(ast.NodeVisitor):
                 return "int"
             if kinds == {"logical"}:
                 return "logical"
+            if kinds == {"char"}:
+                return "char"
             return None
         if isinstance(node, ast.Attribute):
             if node.attr == "size" and isinstance(node.value, ast.Name):
@@ -2116,6 +2153,8 @@ class translator(ast.NodeVisitor):
                     return "int"
                 if nm in self.alloc_reals:
                     return "real"
+                if nm in self.alloc_chars:
+                    return "char"
             return None
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in {
@@ -2518,7 +2557,7 @@ class translator(ast.NodeVisitor):
     def _extent_expr(self, node):
         """Best-effort extent expression for array-valued expressions."""
         if isinstance(node, ast.Name):
-            if node.id in self.alloc_reals or node.id in self.alloc_ints or node.id in self.alloc_logs:
+            if node.id in self.alloc_reals or node.id in self.alloc_ints or node.id in self.alloc_logs or node.id in self.alloc_chars:
                 return f"size({node.id})"
             return None
         if isinstance(node, (ast.List, ast.Tuple)):
@@ -2820,6 +2859,8 @@ class translator(ast.NodeVisitor):
                 return self.alloc_int_rank.get(node.id, 1)
             if node.id in self.alloc_logs:
                 return self.alloc_log_rank.get(node.id, 1)
+            if node.id in self.alloc_chars:
+                return self.alloc_char_rank.get(node.id, 1)
             return 0
         if isinstance(node, ast.List):
             if node.elts and all(isinstance(e, ast.List) for e in node.elts):
@@ -3377,6 +3418,14 @@ class translator(ast.NodeVisitor):
                 return cur.id
             return None
 
+        def _array_constructor(elts):
+            if elts and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in elts):
+                max_len = max(len(e.value) for e in elts)
+                vals = ", ".join(self.expr(e) for e in elts)
+                return f"[character(len={max_len}) :: {vals}]"
+            vals = ", ".join(self.expr(e) for e in elts)
+            return f"[{vals}]"
+
         if isinstance(node, ast.Name):
             return node.id
 
@@ -3403,14 +3452,11 @@ class translator(ast.NodeVisitor):
                 flat_nodes = []
                 for r in node.elts:
                     flat_nodes.extend(r.elts)
-                vals = ", ".join(self.expr(e) for e in flat_nodes)
-                return f"transpose(reshape([{vals}], [{ncol}, {nrow}]))"
-            vals = ", ".join(self.expr(e) for e in node.elts)
-            return f"[{vals}]"
+                return f"transpose(reshape({_array_constructor(flat_nodes)}, [{ncol}, {nrow}]))"
+            return _array_constructor(node.elts)
 
         if isinstance(node, ast.Tuple):
-            vals = ", ".join(self.expr(e) for e in node.elts)
-            return f"[{vals}]"
+            return _array_constructor(node.elts)
 
         if isinstance(node, ast.BinOp):
             op = type(node.op)
@@ -5574,6 +5620,8 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_log(t.id, rank=rk)
                         elif k == "int":
                             self._mark_alloc_int(t.id, rank=rk)
+                        elif k == "char":
+                            self._mark_alloc_char(t.id, rank=rk)
                         else:
                             self._mark_alloc_real(t.id, rank=rk)
                         # Keepdims reductions carry row/column broadcast intent.
@@ -5639,6 +5687,8 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_log(t.id, rank=rk)
                         elif k == "int":
                             self._mark_alloc_int(t.id, rank=rk)
+                        elif k == "char":
+                            self._mark_alloc_char(t.id, rank=rk)
                         else:
                             self._mark_alloc_real(t.id, rank=rk)
                     elif k == "real":
@@ -5647,11 +5697,15 @@ class translator(ast.NodeVisitor):
                         self._mark_int(t.id)
                     elif k == "logical":
                         self._mark_log(t.id)
+                    elif k == "char":
+                        if rk > 0:
+                            self._mark_alloc_char(t.id, rank=rk)
                     elif (
                         t.id not in self.dict_typed_vars
                         and t.id not in self.alloc_ints
                         and t.id not in self.alloc_reals
                         and t.id not in self.alloc_logs
+                        and t.id not in self.alloc_chars
                         and t.id not in self.logs
                     ):
                         # Python numeric default is real; use as fallback when kind
@@ -8406,6 +8460,7 @@ def _emit_local_function(
         tr.alloc_ints.discard(anm)
         tr.alloc_reals.discard(anm)
         tr.alloc_logs.discard(anm)
+        tr.alloc_chars.discard(anm)
     def _pre_arg_rank(nm):
         rr = 0
         for st in fn.body:
@@ -8489,19 +8544,24 @@ def _emit_local_function(
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints - {ret_name})
     alloc_reals_set = set(tr.alloc_reals - {ret_name})
+    alloc_chars_set = set(tr.alloc_chars - {ret_name})
     alloc_logs_set -= set(args)
     alloc_ints_set -= set(args)
     alloc_reals_set -= set(args)
+    alloc_chars_set -= set(args)
     if tuple_return:
         alloc_logs_set -= set(out_names)
         alloc_ints_set -= set(out_names)
         alloc_reals_set -= set(out_names)
+        alloc_chars_set -= set(out_names)
     remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names))
-    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
-    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
-    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
+    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    chars = sorted((getattr(tr, "chars", set()) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
     alloc_logs = sorted(alloc_logs_set)
     alloc_ints = sorted(alloc_ints_set)
+    alloc_chars = sorted(alloc_chars_set)
 
     pure_prefix = "pure " if function_is_pure(fn, known_pure_calls=known_pure_calls) else ""
     if tuple_return:
@@ -8627,6 +8687,12 @@ def _emit_local_function(
                 arg_decl = f"logical, intent({intent_txt}) :: {arg}({dims})"
             else:
                 arg_decl = f"logical, intent({intent_txt}) :: {arg}(:)"
+        elif arg in tr.alloc_chars:
+            if arr_rank > 0:
+                dims = ",".join(":" for _ in range(arr_rank))
+                arg_decl = f"character(len=*), intent({intent_txt}) :: {arg}({dims})"
+            else:
+                arg_decl = f"character(len=*), intent({intent_txt}) :: {arg}(:)"
         elif arr_rank > 0:
             dflt = defaults_map.get(arg, None)
             if ann_is_bool or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, bool)):
@@ -8681,6 +8747,10 @@ def _emit_local_function(
                 rr = max(1, tr.alloc_log_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
+            elif nm in tr.alloc_chars:
+                rr = max(1, tr.alloc_char_rank.get(nm, 1))
+                dims = ",".join(":" for _ in range(rr))
+                o.w(f"character(len=:), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.reals:
                 o.w(f"real(kind=dp), intent(out) :: {nm}")
             else:
@@ -8704,6 +8774,9 @@ def _emit_local_function(
         elif ret_name_src is not None and ret_name_src in tr.alloc_logs:
             ret_decl = f"logical, allocatable :: {ret_name}(:)"
             ret_decl_full = True
+        elif ret_name_src is not None and ret_name_src in tr.alloc_chars:
+            ret_decl = f"character(len=:), allocatable :: {ret_name}(:)"
+            ret_decl_full = True
         else:
             if fn.returns is not None and hasattr(ast, "unparse"):
                 rtxt = ast.unparse(fn.returns).lower()
@@ -8726,6 +8799,8 @@ def _emit_local_function(
         o.w("integer :: " + ", ".join(ints))
     if logs:
         o.w("logical :: " + ", ".join(logs))
+    if chars:
+        o.w("character(len=:), allocatable :: " + ", ".join(chars))
     arg_set = set(args)
     local_dict_vars = sorted((nm, tn) for nm, tn in tr.dict_typed_vars.items() if nm != ret_name and nm not in arg_set)
     for nm, tn in local_dict_vars:
@@ -8742,6 +8817,10 @@ def _emit_local_function(
         rr = max(1, tr.alloc_real_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"real(kind=dp), allocatable :: {nm}({dims})")
+    for nm in alloc_chars:
+        rr = max(1, tr.alloc_char_rank.get(nm, 1))
+        dims = ",".join(":" for _ in range(rr))
+        o.w(f"character(len=:), allocatable :: {nm}({dims})")
     o.w("")
     for i, s in enumerate(fn.body):
         if (
@@ -9043,11 +9122,12 @@ def generate_flat(
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints)
     alloc_reals_set = set(tr.alloc_reals)
+    alloc_chars_set = set(tr.alloc_chars)
     ints = sorted(
-        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set
+        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set
     )
-    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
-    logs = sorted((tr.logs - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set)
+    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    logs = sorted((tr.logs - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
     dict_type_vars = sorted(tr.dict_typed_vars.items())
     if ints:
         o.w("integer :: " + ", ".join(ints))
@@ -9069,6 +9149,10 @@ def generate_flat(
         rr = max(1, tr.alloc_real_rank.get(name, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"real(kind=dp), allocatable :: {name}({dims})")
+    for name in sorted(alloc_chars_set):
+        rr = max(1, tr.alloc_char_rank.get(name, 1))
+        dims = ",".join(":" for _ in range(rr))
+        o.w(f"character(len=:), allocatable :: {name}({dims})")
 
     o.w("")
     for stmt in tree.body:
