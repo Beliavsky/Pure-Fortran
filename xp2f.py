@@ -1925,13 +1925,14 @@ class translator(ast.NodeVisitor):
         k = self._expr_kind(value_node)
         fam = self._kind_family(k)
         rk = self._rank_expr(value_node)
+        rkind = self._expr_real_kind_tag(value_node)
         if fam is None:
             return
         prev = self.var_type_first_seen.get(name)
         if prev is None:
-            self.var_type_first_seen[name] = (k, fam, rk, getattr(assign_node, "lineno", None))
+            self.var_type_first_seen[name] = (k, fam, rk, rkind, getattr(assign_node, "lineno", None))
             return
-        prev_k, prev_fam, prev_rk, prev_line = prev
+        prev_k, prev_fam, prev_rk, prev_rkind, prev_line = prev
         if prev_fam != fam:
             cur_line = getattr(assign_node, "lineno", None)
             raise NotImplementedError(
@@ -1944,6 +1945,80 @@ class translator(ast.NodeVisitor):
                 f"variable '{name}' changes rank from {prev_rk} (line {prev_line}) to {rk} (line {cur_line}); "
                 "Python programs where an array changes rank cannot be translated to Fortran"
             )
+        if (
+            prev_k == "real"
+            and k == "real"
+            and prev_rkind is not None
+            and rkind is not None
+            and prev_rkind != rkind
+        ):
+            cur_line = getattr(assign_node, "lineno", None)
+            raise NotImplementedError(
+                f"variable '{name}' changes real kind from {prev_rkind} (line {prev_line}) to {rkind} (line {cur_line}); "
+                "Python programs where a variable changes real kind cannot be translated to Fortran"
+            )
+
+    def _expr_real_kind_tag(self, node):
+        """Best-effort real kind tag for stability checks: 'real64' or 'real32'."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, float):
+            return "real64"
+        if isinstance(node, ast.Name):
+            prev = self.var_type_first_seen.get(node.id)
+            if prev is not None:
+                # tuple: (k, fam, rk, rkind, line)
+                return prev[3]
+            return "real64" if node.id in self.reals or node.id in self.alloc_reals else None
+        if isinstance(node, ast.BinOp):
+            l = self._expr_real_kind_tag(node.left)
+            r = self._expr_real_kind_tag(node.right)
+            if l == "real32" or r == "real32":
+                return "real32"
+            if l == "real64" or r == "real64":
+                return "real64"
+            return None
+        if isinstance(node, ast.UnaryOp):
+            return self._expr_real_kind_tag(node.operand)
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "astype" and len(node.args) >= 1:
+                a0 = node.args[0]
+                if isinstance(a0, ast.Name):
+                    txt = a0.id.lower()
+                    if "float32" in txt:
+                        return "real32"
+                    if "float64" in txt or txt == "float":
+                        return "real64"
+                elif (
+                    isinstance(a0, ast.Attribute)
+                    and isinstance(a0.value, ast.Name)
+                    and a0.value.id == "np"
+                ):
+                    txt = a0.attr.lower()
+                    if "float32" in txt:
+                        return "real32"
+                    if "float64" in txt or txt == "float_":
+                        return "real64"
+                return "real64"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+            ):
+                if node.func.attr in {"array", "asarray", "zeros", "ones", "full", "empty"}:
+                    dtype_txt = self._np_dtype_text(node)
+                    if "float32" in dtype_txt:
+                        return "real32"
+                    if "float64" in dtype_txt or "float" in dtype_txt:
+                        return "real64"
+                    if self._expr_kind(node) == "real":
+                        return "real64"
+                if node.func.attr in {
+                    "log", "exp", "sqrt", "log1p", "sin", "cos", "tan", "mean", "var", "std",
+                    "nanmean", "nanvar", "nanstd", "nanmin", "nanmax", "cov", "corrcoef",
+                }:
+                    return "real64"
+            if isinstance(node.func, ast.Name) and node.func.id in {"float", "real"}:
+                return "real64"
+        return None
 
     def _mark_int(self, name):
         if name == "_":
