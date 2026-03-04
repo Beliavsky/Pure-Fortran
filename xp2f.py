@@ -2198,7 +2198,17 @@ class translator(ast.NodeVisitor):
                         return 0
                     return r0 if keepdims else max(0, r0 - 1)
                 if node.func.attr in {"mean", "var", "std"} and len(node.args) >= 1:
-                    return 0
+                    r0 = self._rank_expr(node.args[0])
+                    axis_node = None
+                    keepdims = False
+                    for kw in node.keywords:
+                        if kw.arg == "axis":
+                            axis_node = kw.value
+                        elif kw.arg == "keepdims":
+                            keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                    if axis_node is None:
+                        return 0
+                    return r0 if keepdims else max(0, r0 - 1)
                 if node.func.attr == "diag" and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
                     if r0 <= 1:
@@ -2223,17 +2233,19 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.attr in {"sum", "mean", "var", "max"}
+                and node.func.attr in {"sum", "mean", "var", "max", "min"}
             ):
                 r0 = self._rank_expr(node.func.value)
                 axis_node = None
+                keepdims = False
                 for kw in node.keywords:
                     if kw.arg == "axis":
                         axis_node = kw.value
-                        break
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is None:
                     return 0
-                return max(0, r0 - 1)
+                return r0 if keepdims else max(0, r0 - 1)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "reshape":
                 if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
                     return max(1, len(node.args[0].elts))
@@ -2434,8 +2446,9 @@ class translator(ast.NodeVisitor):
             b0 = self.expr(node.right)
             a = a0
             b = b0
-            # Limited NumPy-style broadcasting for rank-2 arrays where one side is
-            # known column vector (n,1) or row vector (1,m).
+            # Limited NumPy-style broadcasting:
+            # - rank-2 with rank-2 where one side is known row/col vector
+            # - rank-2 with rank-1 (NumPy trailing-dimension vector broadcast)
             if self._rank_expr(node.left) == 2 and self._rank_expr(node.right) == 2:
                 lshape = self._shape_anchor_2d(node.left)
                 rshape = self._shape_anchor_2d(node.right)
@@ -2487,6 +2500,17 @@ class translator(ast.NodeVisitor):
                                 b = f"spread({b0}, dim=1, ncopies={_size_dim(node.left, lshape, 1)})"
                             else:
                                 b = f"spread(reshape({b0}, [size({b0},2)]), dim=1, ncopies={_size_dim(node.left, lshape, 1)})"
+            elif self._rank_expr(node.left) == 2 and self._rank_expr(node.right) == 1:
+                if self._is_col2_expr(node.right):
+                    b = f"spread({b0}, dim=2, ncopies=size({a0},2))"
+                else:
+                    # Default NumPy behavior for (n,m) op (m,) is row-wise broadcast.
+                    b = f"spread({b0}, dim=1, ncopies=size({a0},1))"
+            elif self._rank_expr(node.left) == 1 and self._rank_expr(node.right) == 2:
+                if self._is_col2_expr(node.left):
+                    a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
+                else:
+                    a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
             if op is ast.MatMult:
                 return f"matmul({a}, {b})"
             if op is ast.Mod:
@@ -2658,24 +2682,36 @@ class translator(ast.NodeVisitor):
                 attr = node.func.attr
                 if attr == "sum":
                     axis_node = None
+                    keepdims = False
                     for kw in getattr(node, "keywords", []):
                         if kw.arg == "axis":
                             axis_node = kw.value
+                        elif kw.arg == "keepdims":
+                            keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                     if axis_node is None:
                         return f"sum({base_expr})"
                     dim_expr = f"({self.expr(axis_node)} + 1)"
-                    return f"sum({base_expr}, dim={dim_expr})"
+                    reduced = f"sum({base_expr}, dim={dim_expr})"
+                    if keepdims:
+                        return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                    return reduced
                 if attr == "mean":
                     axis_node = None
+                    keepdims = False
                     for kw in getattr(node, "keywords", []):
                         if kw.arg == "axis":
                             axis_node = kw.value
+                        elif kw.arg == "keepdims":
+                            keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                     if axis_node is None:
                         if self._expr_kind(node.func.value) == "logical":
                             return f"(real(count({base_expr}), kind=dp) / real(size({base_expr}), kind=dp))"
                         return f"mean_1d({base_expr})"
                     dim_expr = f"({self.expr(axis_node)} + 1)"
-                    return f"(sum({base_expr}, dim={dim_expr}) / real(size({base_expr}, dim={dim_expr}), kind=dp))"
+                    reduced = f"(sum({base_expr}, dim={dim_expr}) / real(size({base_expr}, dim={dim_expr}), kind=dp))"
+                    if keepdims:
+                        return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                    return reduced
                 if attr == "var":
                     ddof_node = None
                     axis_node = None
@@ -2689,6 +2725,36 @@ class translator(ast.NodeVisitor):
                     if ddof_node is None:
                         return f"var_1d({base_expr})"
                     return f"var_1d({base_expr}, {self.expr(ddof_node)})"
+                if attr == "min":
+                    axis_node = None
+                    keepdims = False
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg == "axis":
+                            axis_node = kw.value
+                        elif kw.arg == "keepdims":
+                            keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                    if axis_node is None:
+                        return f"minval({base_expr})"
+                    dim_expr = f"({self.expr(axis_node)} + 1)"
+                    reduced = f"minval({base_expr}, dim={dim_expr})"
+                    if keepdims:
+                        return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                    return reduced
+                if attr == "max":
+                    axis_node = None
+                    keepdims = False
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg == "axis":
+                            axis_node = kw.value
+                        elif kw.arg == "keepdims":
+                            keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                    if axis_node is None:
+                        return f"maxval({base_expr})"
+                    dim_expr = f"({self.expr(axis_node)} + 1)"
+                    reduced = f"maxval({base_expr}, dim={dim_expr})"
+                    if keepdims:
+                        return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                    return reduced
                 if attr == "ravel":
                     return f"reshape({base_expr}, [size({base_expr})])"
                 if attr == "flatten":
@@ -3111,6 +3177,24 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"argmax", "argmin"}
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                axis_node = None
+                for kw in node.keywords:
+                    if kw.arg == "axis":
+                        axis_node = kw.value
+                        break
+                fn = "maxloc" if node.func.attr == "argmax" else "minloc"
+                if axis_node is None:
+                    return f"({fn}(reshape({a0}, [size({a0})]), dim=1) - 1)"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                return f"({fn}({a0}, dim={dim_expr}) - 1)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"isfinite", "isinf", "isnan"}
                 and len(node.args) == 1
             ):
@@ -3312,7 +3396,20 @@ class translator(ast.NodeVisitor):
                         return f"({arr} /= 0)"
                     return arr
                 if node.func.attr == "mean" and len(node.args) == 0:
-                    return f"(sum({arr}) / real(size({arr}), kind=dp))"
+                    axis_node = None
+                    keepdims = False
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg == "axis":
+                            axis_node = kw.value
+                        elif kw.arg == "keepdims":
+                            keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                    if axis_node is None:
+                        return f"(sum({arr}) / real(size({arr}), kind=dp))"
+                    dim_expr = f"({self.expr(axis_node)} + 1)"
+                    reduced = f"(sum({arr}, dim={dim_expr}) / real(size({arr}, dim={dim_expr}), kind=dp))"
+                    if keepdims:
+                        return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                    return reduced
                 if node.func.attr == "std":
                     ddof = 0
                     for kw in node.keywords:
@@ -3329,7 +3426,21 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "mean"
                 and len(node.args) == 1
             ):
-                return f"mean({self.expr(node.args[0])})"
+                a0 = self.expr(node.args[0])
+                axis_node = None
+                keepdims = False
+                for kw in node.keywords:
+                    if kw.arg == "axis":
+                        axis_node = kw.value
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                if axis_node is None:
+                    return f"mean({a0})"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                reduced = f"(sum({a0}, dim={dim_expr}) / real(size({a0}, dim={dim_expr}), kind=dp))"
+                if keepdims:
+                    return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                return reduced
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3435,6 +3546,14 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError(f"unsupported expr: {type(node).__name__}")
 
     def prescan(self, nodes):
+        def _attr_root_name(n):
+            cur = n
+            while isinstance(cur, ast.Attribute):
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                return cur.id
+            return None
+
         for node in nodes:
             if isinstance(node, ast.AnnAssign):
                 if isinstance(node.target, ast.Name):
@@ -3554,6 +3673,37 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_int(t.id, rank=rk)
                         else:
                             self._mark_alloc_real(t.id, rank=rk)
+                        # Keepdims reductions carry row/column broadcast intent.
+                        if (
+                            isinstance(v, ast.Call)
+                            and isinstance(v.func, ast.Attribute)
+                            and (
+                                (
+                                    isinstance(v.func.value, ast.Name)
+                                    and v.func.value.id == "np"
+                                    and v.func.attr in {"max", "sum", "mean", "min"}
+                                )
+                                or (
+                                    not (_attr_root_name(v.func.value) in {"np", "math", "random"})
+                                    and v.func.attr in {"mean", "sum", "max", "min"}
+                                )
+                            )
+                        ):
+                            axis_node = None
+                            keepdims = False
+                            for kw in v.keywords:
+                                if kw.arg == "axis":
+                                    axis_node = kw.value
+                                elif kw.arg == "keepdims":
+                                    keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                            if keepdims:
+                                if isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int):
+                                    if axis_node.value == 1:
+                                        self.broadcast_col2.add(t.id)
+                                    elif axis_node.value == 0:
+                                        self.broadcast_row2.add(t.id)
+                                else:
+                                    self.broadcast_col2.add(t.id)
                         continue
                     if ext is not None:
                         if k == "real":
@@ -4051,14 +4201,14 @@ class translator(ast.NodeVisitor):
                     else:
                         self._mark_alloc_int(t.id)
 
-                # np.max(..., keepdims=True) / np.sum(..., keepdims=True)
+                # np.max/sum/mean/min(..., keepdims=True)
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
                     and isinstance(v.func, ast.Attribute)
                     and isinstance(v.func.value, ast.Name)
                     and v.func.value.id == "np"
-                    and v.func.attr in {"max", "sum"}
+                    and v.func.attr in {"max", "sum", "mean", "min"}
                 ):
                     axis_node = None
                     keepdims = False
@@ -4076,6 +4226,30 @@ class translator(ast.NodeVisitor):
                                 self.broadcast_row2.add(t.id)
                         else:
                             # Default to column-vector style keepdims (common case axis=1).
+                            self.broadcast_col2.add(t.id)
+
+                # a.mean/sum/max/min(..., keepdims=True)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and not (_attr_root_name(v.func.value) in {"np", "math", "random"})
+                    and v.func.attr in {"mean", "sum", "max", "min"}
+                ):
+                    axis_node = None
+                    keepdims = False
+                    for kw in v.keywords:
+                        if kw.arg == "axis":
+                            axis_node = kw.value
+                        elif kw.arg == "keepdims":
+                            keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                    if keepdims:
+                        if isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int):
+                            if axis_node.value == 1:
+                                self.broadcast_col2.add(t.id)
+                            elif axis_node.value == 0:
+                                self.broadcast_row2.add(t.id)
+                        else:
                             self.broadcast_col2.add(t.id)
 
                 # np.random.normal(size=...)
