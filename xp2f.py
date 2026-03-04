@@ -1743,7 +1743,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round"}
+                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round"}
                 and len(node.args) >= 1
             ):
                 return self._expr_kind(node.args[0])
@@ -1912,7 +1912,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan"}
+                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan"}
                 and len(node.args) >= 1
             ):
                 return self._extent_expr(node.args[0])
@@ -1932,6 +1932,7 @@ class translator(ast.NodeVisitor):
                     "column_stack",
                     "concatenate",
                     "transpose",
+                    "swapaxes",
                     "expand_dims",
                     "abs",
                     "fabs",
@@ -1982,6 +1983,50 @@ class translator(ast.NodeVisitor):
                 return None
         return None
 
+    def _slice_triplet(self, slc, extent_expr):
+        """Convert a Python slice node to a Fortran triplet string."""
+        if not isinstance(slc, ast.Slice):
+            raise NotImplementedError("internal: _slice_triplet expects ast.Slice")
+        def _int_const(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, int):
+                return int(node.value)
+            if (
+                isinstance(node, ast.UnaryOp)
+                and isinstance(node.op, ast.USub)
+                and isinstance(node.operand, ast.Constant)
+                and isinstance(node.operand.value, int)
+            ):
+                return -int(node.operand.value)
+            return None
+        # Python default step is +1.
+        step_val = 1
+        if slc.step is not None:
+            sval = _int_const(slc.step)
+            if sval is None:
+                raise NotImplementedError("slice step must be an integer constant")
+            step_val = int(sval)
+            if step_val == 0:
+                raise NotImplementedError("slice step cannot be zero")
+
+        def _lower_expr_fortran():
+            if slc.lower is None:
+                return extent_expr if step_val < 0 else "1"
+            return f"({self.expr(slc.lower)} + 1)"
+
+        def _upper_expr_fortran():
+            if slc.upper is None:
+                return "1" if step_val < 0 else extent_expr
+            # For negative-step slices, Python upper bound is exclusive and maps to +1 in Fortran.
+            if step_val < 0:
+                return f"({self.expr(slc.upper)} + 1)"
+            return self.expr(slc.upper)
+
+        lb = _lower_expr_fortran()
+        ub = _upper_expr_fortran()
+        if step_val == 1:
+            return ":" if lb == "1" and ub == extent_expr else f"{lb}:{ub}"
+        return f"{lb}:{ub}:{step_val}"
+
     def _rank_expr(self, node):
         if isinstance(node, ast.Name):
             if node.id in self.broadcast_row2 or node.id in self.broadcast_col2:
@@ -2019,14 +2064,25 @@ class translator(ast.NodeVisitor):
                         return max(1, crank)
                     return 0
             if isinstance(node.slice, ast.Tuple):
+                # Scalar tuple indexing yields scalar result.
+                if all((not isinstance(e, ast.Slice)) and (not is_none(e)) for e in node.slice.elts):
+                    return 0
                 return 2
             if isinstance(node.slice, ast.Slice):
                 return 1
             # Vector subscript: x(idx_vec) is array-valued.
             sr = self._rank_expr(node.slice)
             if sr > 0:
+                # Logical mask indexing (NumPy a[mask]) flattens selection to 1D.
+                if self._expr_kind(node.slice) == "logical":
+                    return 1
                 return sr
             return 0
+        if isinstance(node, ast.Compare):
+            r = self._rank_expr(node.left)
+            for c in node.comparators:
+                r = max(r, self._rank_expr(c))
+            return r
         if isinstance(node, ast.IfExp):
             return max(self._rank_expr(node.body), self._rank_expr(node.orelse))
         if isinstance(node, ast.BinOp):
@@ -2096,7 +2152,7 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr in {"full_like", "clip", "transpose", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan"} and len(node.args) >= 1:
+                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "expand_dims" and len(node.args) >= 1:
                     return self._rank_expr(node.args[0]) + 1
@@ -2188,6 +2244,12 @@ class translator(ast.NodeVisitor):
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
                 return 1
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "transpose":
+                if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
+                    return max(1, len(node.args[0].elts))
+                if len(node.args) >= 1:
+                    return max(1, len(node.args))
+                return self._rank_expr(node.func.value)
         return 0
 
     def _is_row2_expr(self, node):
@@ -2508,18 +2570,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.slice, ast.Slice):
                 if node.slice.lower is None and node.slice.upper is None and node.slice.step is None:
                     return base
-                if node.slice.step is not None:
-                    if not (isinstance(node.slice.step, ast.Constant) and isinstance(node.slice.step.value, int) and node.slice.step.value == 1):
-                        raise NotImplementedError("slice steps other than 1 are not supported")
-                if node.slice.lower is None:
-                    lb = "1"
-                else:
-                    lb = f"({self.expr(node.slice.lower)} + 1)"
-                if node.slice.upper is None:
-                    ub = base_size_expr
-                else:
-                    ub = self.expr(node.slice.upper)
-                return f"{base}({lb}:{ub})"
+                trip = self._slice_triplet(node.slice, base_size_expr)
+                return f"{base}({trip})"
             if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
                 a0, a1 = node.slice.elts
                 full0 = isinstance(a0, ast.Slice) and a0.lower is None and a0.upper is None and a0.step is None
@@ -2533,8 +2585,12 @@ class translator(ast.NodeVisitor):
                     return f"reshape({base}, [size({base_name}), 1])"
                 if full0 and full1:
                     return base
-                # 2D slicing with one full dimension and one explicit index/vector.
-                # Python/NumPy indices are 0-based; convert to Fortran 1-based.
+                # General 2D slicing/indexing with Python 0-based to Fortran 1-based mapping.
+                if isinstance(a0, ast.Slice) or isinstance(a1, ast.Slice):
+                    d0 = self._slice_triplet(a0, f"size({base_name},1)") if isinstance(a0, ast.Slice) else f"({self.expr(a0)} + 1)"
+                    d1 = self._slice_triplet(a1, f"size({base_name},2)") if isinstance(a1, ast.Slice) else f"({self.expr(a1)} + 1)"
+                    return f"{base}({d0}, {d1})"
+                # 2D indexing with explicit index/vector.
                 if full0 and (not full1) and (not none1):
                     return f"{base}(:, ({self.expr(a1)} + 1))"
                 if full1 and (not full0) and (not none0):
@@ -2543,6 +2599,22 @@ class translator(ast.NodeVisitor):
                 if (not isinstance(a0, ast.Slice)) and (not isinstance(a1, ast.Slice)) and (not none0) and (not none1):
                     return f"{base}(({self.expr(a0)} + 1), ({self.expr(a1)} + 1))"
                 raise NotImplementedError("only [None,:] and [:,None] tuple subscripts are supported")
+            if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 3:
+                a0, a1, a2 = node.slice.elts
+                if all(not isinstance(a, ast.Slice) and not is_none(a) for a in (a0, a1, a2)):
+                    return (
+                        f"{base}(({self.expr(a0)} + 1), "
+                        f"({self.expr(a1)} + 1), "
+                        f"({self.expr(a2)} + 1))"
+                    )
+                raise NotImplementedError("only scalar 3D tuple subscripts are supported")
+            # Logical mask indexing (NumPy): a[mask] -> pack(a, mask)
+            slice_rank = self._rank_expr(node.slice)
+            if slice_rank > 0 and self._expr_kind(node.slice) == "logical":
+                return f"pack({base}, {self.expr(node.slice)})"
+            # Integer/vector indexing for rank-1 arrays.
+            if slice_rank > 0 and self._rank_expr(node.value) == 1:
+                return f"{base}(({self.expr(node.slice)} + 1))"
             # Python emitters in this project use 0-based forms like (i)-1;
             # map those back to natural Fortran 1-based indexing.
             if (
@@ -2621,6 +2693,32 @@ class translator(ast.NodeVisitor):
                     return f"reshape({base_expr}, [size({base_expr})])"
                 if attr == "flatten":
                     return f"reshape({base_expr}, [size({base_expr})])"
+                if attr == "transpose":
+                    rank0 = self._rank_expr(node.func.value)
+                    if len(node.args) == 0:
+                        if rank0 <= 1:
+                            return base_expr
+                        if rank0 == 2:
+                            return f"transpose({base_expr})"
+                        if rank0 == 3:
+                            return (
+                                f"reshape({base_expr}, "
+                                f"[size({base_expr},3), size({base_expr},2), size({base_expr},1)], "
+                                f"order=[3,2,1])"
+                            )
+                        raise NotImplementedError("transpose() without axes supports rank up to 3")
+                    if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
+                        axes_nodes = list(node.args[0].elts)
+                    else:
+                        axes_nodes = list(node.args)
+                    if not axes_nodes:
+                        return base_expr
+                    if not all(isinstance(a, ast.Constant) and isinstance(a.value, int) for a in axes_nodes):
+                        raise NotImplementedError("transpose axes must be integer constants")
+                    perm = [int(a.value) + 1 for a in axes_nodes]
+                    shp = ", ".join([f"size({base_expr},{p})" for p in perm])
+                    ordp = ", ".join(str(p) for p in perm)
+                    return f"reshape({base_expr}, [{shp}], order=[{ordp}])"
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 return f"isqrt_int({self.expr(node.args[0])})"
@@ -2905,7 +3003,42 @@ class translator(ast.NodeVisitor):
             ):
                 if node.func.attr == "identity":
                     return f"eye(int({self.expr(node.args[0])}), int({self.expr(node.args[0])}))"
-                return f"transpose({self.expr(node.args[0])})"
+                a0 = self.expr(node.args[0])
+                if len(node.args) == 1:
+                    return f"transpose({a0})"
+                axes = node.args[1]
+                if not isinstance(axes, (ast.Tuple, ast.List)):
+                    raise NotImplementedError("np.transpose axes must be tuple/list")
+                if not all(isinstance(a, ast.Constant) and isinstance(a.value, int) for a in axes.elts):
+                    raise NotImplementedError("np.transpose axes must be integer constants")
+                perm = [int(a.value) + 1 for a in axes.elts]
+                shp = ", ".join([f"size({a0},{p})" for p in perm])
+                ordp = ", ".join(str(p) for p in perm)
+                return f"reshape({a0}, [{shp}], order=[{ordp}])"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "swapaxes"
+                and len(node.args) >= 3
+            ):
+                a0 = self.expr(node.args[0])
+                rank0 = self._rank_expr(node.args[0])
+                if not (isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, int)):
+                    raise NotImplementedError("swapaxes axis1 must be integer constant")
+                if not (isinstance(node.args[2], ast.Constant) and isinstance(node.args[2].value, int)):
+                    raise NotImplementedError("swapaxes axis2 must be integer constant")
+                ax1 = int(node.args[1].value)
+                ax2 = int(node.args[2].value)
+                if rank0 <= 0:
+                    return a0
+                perm = list(range(1, rank0 + 1))
+                if not (0 <= ax1 < rank0 and 0 <= ax2 < rank0):
+                    raise NotImplementedError("swapaxes axes out of range")
+                perm[ax1], perm[ax2] = perm[ax2], perm[ax1]
+                shp = ", ".join([f"size({a0},{p})" for p in perm])
+                ordp = ", ".join(str(p) for p in perm)
+                return f"reshape({a0}, [{shp}], order=[{ordp}])"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3172,6 +3305,8 @@ class translator(ast.NodeVisitor):
                     if "float" in dtype_txt:
                         return f"real({arr}, kind=dp)"
                     if "int" in dtype_txt:
+                        if self._expr_kind(node.func.value) == "logical":
+                            return f"merge(1, 0, {arr})"
                         return f"int({arr})"
                     if "bool" in dtype_txt:
                         return f"({arr} /= 0)"
