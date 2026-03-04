@@ -2255,6 +2255,14 @@ class translator(ast.NodeVisitor):
                 if len(node.args) >= 1:
                     return max(1, len(node.args))
                 return self._rank_expr(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "dot" and len(node.args) >= 1:
+                r1 = self._rank_expr(node.func.value)
+                r2 = self._rank_expr(node.args[0])
+                if r1 == 2 and r2 == 2:
+                    return 2
+                if (r1 == 2 and r2 == 1) or (r1 == 1 and r2 == 2):
+                    return 1
+                return 0
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype":
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
@@ -2799,6 +2807,11 @@ class translator(ast.NodeVisitor):
                     shp = ", ".join([f"size({base_expr},{p})" for p in perm])
                     ordp = ", ".join(str(p) for p in perm)
                     return f"reshape({base_expr}, [{shp}], order=[{ordp}])"
+                if attr == "dot" and len(node.args) >= 1:
+                    a1 = self.expr(node.args[0])
+                    if self._rank_expr(node.func.value) == 1 and self._rank_expr(node.args[0]) == 1:
+                        return f"dot_product({base_expr}, {a1})"
+                    return f"matmul({base_expr}, {a1})"
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 return f"isqrt_int({self.expr(node.args[0])})"
