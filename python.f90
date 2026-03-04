@@ -1,5 +1,6 @@
 module python_mod
 use, intrinsic :: iso_fortran_env, only: real64
+use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value, ieee_quiet_nan
 implicit none
 private
 integer, parameter :: dp = real64
@@ -62,6 +63,21 @@ public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):int
 public :: tile_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile real matrix reps0 x reps1 times"
 public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional desc="return n x m identity-like matrix (default m=n)"
 public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="sorted unique values of real vector"
+public :: bincount_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),minlength:integer:intent(in):optional desc="count occurrences of nonnegative integers"
+public :: searchsorted_left_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted left indices for integer vectors"
+public :: searchsorted_right_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted right indices for integer vectors"
+public :: histogram_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:integer(:):intent(out),edges:real(dp)(:):intent(out) desc="1D histogram with explicit real bin edges"
+public :: histogram_int_edges !@pyapi kind=subroutine args=x:integer(:):intent(in),bins:integer(:):intent(in),h:integer(:):intent(out),edges:integer(:):intent(out) desc="1D histogram with explicit integer bin edges"
+public :: reduceat_add_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for real vector"
+public :: reduceat_add_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for integer vector"
+public :: reduceat_mul_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.multiply.reduceat for real vector"
+public :: reduceat_mul_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.multiply.reduceat for integer vector"
+public :: reduceat_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.minimum.reduceat for real vector"
+public :: reduceat_min_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.minimum.reduceat for integer vector"
+public :: reduceat_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.maximum.reduceat for real vector"
+public :: reduceat_max_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.maximum.reduceat for integer vector"
+public :: reduceat_logical_and !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),idx:integer(:):intent(in) desc="np.logical_and.reduceat for logical vector"
+public :: reduceat_logical_or !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),idx:integer(:):intent(in) desc="np.logical_or.reduceat for logical vector"
 public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in) desc="solve linear system A x = b using LAPACK DGESV"
@@ -74,6 +90,14 @@ public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),d
 public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
 public :: std !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="standard deviation of 1D real vector with optional ddof (numpy-style)"
 public :: log2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="base-2 logarithm"
+public :: nansum !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="sum ignoring NaN values"
+public :: nanmean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean ignoring NaN values"
+public :: nanvar !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance ignoring NaN values with optional ddof"
+public :: nanstd !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="standard deviation ignoring NaN values with optional ddof"
+public :: nanmin !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="minimum ignoring NaN values"
+public :: nanmax !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="maximum ignoring NaN values"
+public :: nanargmin !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmin ignoring NaN values; -1 when all NaN"
+public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmax ignoring NaN values; -1 when all NaN"
 public :: cumsum
 public :: cumprod
 public :: eye
@@ -83,6 +107,11 @@ public :: tile
 public :: unique
 public :: sort_vec
 public :: argsort
+public :: histogram
+public :: reduceat_add
+public :: reduceat_mul
+public :: reduceat_min
+public :: reduceat_max
 
 interface cumsum
    module procedure cumsum_real, cumsum_int
@@ -121,6 +150,26 @@ end interface sort_vec
 interface argsort
    module procedure argsort_real, argsort_int
 end interface argsort
+
+interface histogram
+   module procedure histogram_real_edges, histogram_int_edges
+end interface histogram
+
+interface reduceat_add
+   module procedure reduceat_add_real, reduceat_add_int
+end interface reduceat_add
+
+interface reduceat_mul
+   module procedure reduceat_mul_real, reduceat_mul_int
+end interface reduceat_mul
+
+interface reduceat_min
+   module procedure reduceat_min_real, reduceat_min_int
+end interface reduceat_min
+
+interface reduceat_max
+   module procedure reduceat_max_real, reduceat_max_int
+end interface reduceat_max
 
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
@@ -378,6 +427,365 @@ contains
             x(i) = start + (i - 1) * s
          end do
       end function arange_int
+
+      function bincount_int(x, minlength) result(c)
+         integer, intent(in) :: x(:)
+         integer, intent(in), optional :: minlength
+         integer, allocatable :: c(:)
+         integer :: i, nmax, nout, m
+         if (present(minlength)) then
+            m = max(0, minlength)
+         else
+            m = 0
+         end if
+         if (size(x) <= 0) then
+            nout = m
+            allocate(c(1:nout), source=0)
+            return
+         end if
+         if (any(x < 0)) error stop 'bincount_int: negative values are not supported'
+         nmax = maxval(x)
+         nout = max(nmax + 1, m)
+         allocate(c(1:nout), source=0)
+         do i = 1, size(x)
+            c(x(i) + 1) = c(x(i) + 1) + 1
+         end do
+      end function bincount_int
+
+      function searchsorted_left_int(a, v) result(idx)
+         integer, intent(in) :: a(:), v(:)
+         integer, allocatable :: idx(:)
+         integer :: i, lo, hi, mid, n
+         n = size(a)
+         allocate(idx(1:size(v)))
+         do i = 1, size(v)
+            lo = 1
+            hi = n + 1
+            do while (lo < hi)
+               mid = (lo + hi) / 2
+               if (mid <= n .and. a(mid) < v(i)) then
+                  lo = mid + 1
+               else
+                  hi = mid
+               end if
+            end do
+            idx(i) = lo - 1
+         end do
+      end function searchsorted_left_int
+
+      function searchsorted_right_int(a, v) result(idx)
+         integer, intent(in) :: a(:), v(:)
+         integer, allocatable :: idx(:)
+         integer :: i, lo, hi, mid, n
+         n = size(a)
+         allocate(idx(1:size(v)))
+         do i = 1, size(v)
+            lo = 1
+            hi = n + 1
+            do while (lo < hi)
+               mid = (lo + hi) / 2
+               if (mid <= n .and. a(mid) <= v(i)) then
+                  lo = mid + 1
+               else
+                  hi = mid
+               end if
+            end do
+            idx(i) = lo - 1
+         end do
+      end function searchsorted_right_int
+
+      subroutine histogram_real_edges(x, bins, h, edges)
+         real(kind=dp), intent(in) :: x(:), bins(:)
+         integer, allocatable, intent(out) :: h(:)
+         real(kind=dp), allocatable, intent(out) :: edges(:)
+         integer :: i, j, nb
+         logical :: placed
+         nb = size(bins) - 1
+         if (nb < 1) error stop 'histogram_real_edges: bins must have at least 2 entries'
+         allocate(h(1:nb), source=0)
+         allocate(edges(1:size(bins)), source=bins)
+         do i = 1, size(x)
+            if (x(i) < bins(1)) cycle
+            if (x(i) > bins(nb + 1)) cycle
+            placed = .false.
+            do j = 1, nb - 1
+               if (x(i) >= bins(j) .and. x(i) < bins(j + 1)) then
+                  h(j) = h(j) + 1
+                  placed = .true.
+                  exit
+               end if
+            end do
+            if (.not. placed) then
+               if (x(i) >= bins(nb) .and. x(i) <= bins(nb + 1)) h(nb) = h(nb) + 1
+            end if
+         end do
+      end subroutine histogram_real_edges
+
+      subroutine histogram_int_edges(x, bins, h, edges)
+         integer, intent(in) :: x(:), bins(:)
+         integer, allocatable, intent(out) :: h(:), edges(:)
+         integer :: i, j, nb
+         logical :: placed
+         nb = size(bins) - 1
+         if (nb < 1) error stop 'histogram_int_edges: bins must have at least 2 entries'
+         allocate(h(1:nb), source=0)
+         allocate(edges(1:size(bins)), source=bins)
+         do i = 1, size(x)
+            if (x(i) < bins(1)) cycle
+            if (x(i) > bins(nb + 1)) cycle
+            placed = .false.
+            do j = 1, nb - 1
+               if (x(i) >= bins(j) .and. x(i) < bins(j + 1)) then
+                  h(j) = h(j) + 1
+                  placed = .true.
+                  exit
+               end if
+            end do
+            if (.not. placed) then
+               if (x(i) >= bins(nb) .and. x(i) <= bins(nb + 1)) h(nb) = h(nb) + 1
+            end if
+         end do
+      end subroutine histogram_int_edges
+
+      function reduceat_add_real(x, idx) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         real(kind=dp), allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_add_real: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = y(i) + x(j)
+            end do
+         end do
+      end function reduceat_add_real
+
+      function reduceat_add_int(x, idx) result(y)
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         integer, allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_add_int: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = y(i) + x(j)
+            end do
+         end do
+      end function reduceat_add_int
+
+      function reduceat_mul_real(x, idx) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         real(kind=dp), allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_mul_real: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = y(i) * x(j)
+            end do
+         end do
+      end function reduceat_mul_real
+
+      function reduceat_mul_int(x, idx) result(y)
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         integer, allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_mul_int: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = y(i) * x(j)
+            end do
+         end do
+      end function reduceat_mul_int
+
+      function reduceat_min_real(x, idx) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         real(kind=dp), allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_min_real: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = min(y(i), x(j))
+            end do
+         end do
+      end function reduceat_min_real
+
+      function reduceat_min_int(x, idx) result(y)
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         integer, allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_min_int: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = min(y(i), x(j))
+            end do
+         end do
+      end function reduceat_min_int
+
+      function reduceat_max_real(x, idx) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         real(kind=dp), allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_max_real: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = max(y(i), x(j))
+            end do
+         end do
+      end function reduceat_max_real
+
+      function reduceat_max_int(x, idx) result(y)
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         integer, allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_max_int: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = max(y(i), x(j))
+            end do
+         end do
+      end function reduceat_max_int
+
+      function reduceat_logical_and(x, idx) result(y)
+         logical, intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         logical, allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_logical_and: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = y(i) .and. x(j)
+            end do
+         end do
+      end function reduceat_logical_and
+
+      function reduceat_logical_or(x, idx) result(y)
+         logical, intent(in) :: x(:)
+         integer, intent(in) :: idx(:)
+         logical, allocatable :: y(:)
+         integer :: i, j, lo, hi, n, m
+         n = size(x)
+         m = size(idx)
+         allocate(y(1:m))
+         do i = 1, m
+            lo = idx(i) + 1
+            if (lo < 1 .or. lo > n) error stop 'reduceat_logical_or: idx out of bounds'
+            if (i < m) then
+               hi = idx(i + 1)
+            else
+               hi = n
+            end if
+            if (hi < lo) hi = lo
+            y(i) = x(lo)
+            do j = lo + 1, hi
+               y(i) = y(i) .or. x(j)
+            end do
+         end do
+      end function reduceat_logical_or
 
       pure real(kind=dp) function mean_1d(x)
          real(kind=dp), intent(in) :: x(:)
@@ -1322,5 +1730,154 @@ contains
          real(kind=dp), parameter :: log2_base = log(2.0_dp)
          log2 = log(x) / log2_base
       end function log2
+
+      pure real(kind=dp) function nansum(x)
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i
+         nansum = 0.0_dp
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) nansum = nansum + x(i)
+         end do
+      end function nansum
+
+      pure real(kind=dp) function nanmean(x)
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i, cnt
+         nanmean = 0.0_dp
+         cnt = 0
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               nanmean = nanmean + x(i)
+               cnt = cnt + 1
+            end if
+         end do
+         if (cnt <= 0) then
+            nanmean = ieee_value(0.0_dp, ieee_quiet_nan)
+         else
+            nanmean = nanmean / real(cnt, kind=dp)
+         end if
+      end function nanmean
+
+      pure real(kind=dp) function nanvar(x, ddof)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: ddof
+         integer :: i, cnt, d
+         real(kind=dp) :: mu, ss
+         if (present(ddof)) then
+            d = ddof
+         else
+            d = 0
+         end if
+         mu = nanmean(x)
+         if (ieee_is_nan(mu)) then
+            nanvar = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         cnt = 0
+         ss = 0.0_dp
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               cnt = cnt + 1
+               ss = ss + (x(i) - mu)**2
+            end if
+         end do
+         if (cnt - d <= 0) then
+            nanvar = ieee_value(0.0_dp, ieee_quiet_nan)
+         else
+            nanvar = ss / real(cnt - d, kind=dp)
+         end if
+      end function nanvar
+
+      pure real(kind=dp) function nanstd(x, ddof)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: ddof
+         if (present(ddof)) then
+            nanstd = sqrt(nanvar(x, ddof))
+         else
+            nanstd = sqrt(nanvar(x))
+         end if
+      end function nanstd
+
+      pure real(kind=dp) function nanmin(x)
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i
+         logical :: found
+         found = .false.
+         nanmin = ieee_value(0.0_dp, ieee_quiet_nan)
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  nanmin = x(i)
+                  found = .true.
+               else
+                  if (x(i) < nanmin) nanmin = x(i)
+               end if
+            end if
+         end do
+      end function nanmin
+
+      pure real(kind=dp) function nanmax(x)
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i
+         logical :: found
+         found = .false.
+         nanmax = ieee_value(0.0_dp, ieee_quiet_nan)
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  nanmax = x(i)
+                  found = .true.
+               else
+                  if (x(i) > nanmax) nanmax = x(i)
+               end if
+            end if
+         end do
+      end function nanmax
+
+      pure integer function nanargmin(x)
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i, best
+         logical :: found
+         found = .false.
+         best = -1
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  best = i
+                  found = .true.
+               else
+                  if (x(i) < x(best)) best = i
+               end if
+            end if
+         end do
+         if (found) then
+            nanargmin = best - 1
+         else
+            nanargmin = -1
+         end if
+      end function nanargmin
+
+      pure integer function nanargmax(x)
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i, best
+         logical :: found
+         found = .false.
+         best = -1
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  best = i
+                  found = .true.
+               else
+                  if (x(i) > x(best)) best = i
+               end if
+            end if
+         end do
+         if (found) then
+            nanargmax = best - 1
+         else
+            nanargmax = -1
+         end if
+      end function nanargmax
 
 end module python_mod

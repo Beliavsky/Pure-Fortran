@@ -727,6 +727,7 @@ def detect_needed_helpers(tree):
         "unique": {"unique"},
         "bincount": {"bincount_int"},
         "searchsorted": {"searchsorted_left_int", "searchsorted_right_int"},
+        "histogram": {"histogram"},
         "mean": {"mean"},
         "var": {"var"},
         "std": {"std"},
@@ -4749,6 +4750,28 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(outs[1], rank=1)
                         self._mark_alloc_real(outs[2], rank=2)
                         continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and isinstance(node.value.func.value, ast.Name)
+                    and node.value.func.value.id == "np"
+                    and node.value.func.attr == "histogram"
+                ):
+                    outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
+                    if len(outs) >= 2:
+                        self._mark_alloc_int(outs[0], rank=1)
+                        bins_node = node.value.args[1] if len(node.value.args) >= 2 else None
+                        for kw in node.value.keywords:
+                            if kw.arg == "bins":
+                                bins_node = kw.value
+                                break
+                        if bins_node is not None and self._expr_kind(bins_node) == "int":
+                            self._mark_alloc_int(outs[1], rank=1)
+                        else:
+                            self._mark_alloc_real(outs[1], rank=1)
+                        continue
                 if len(node.targets) != 1:
                     continue
                 t = node.targets[0]
@@ -5769,6 +5792,33 @@ class translator(ast.NodeVisitor):
             else:
                 self.o.w(f"{xx} = spread({xname}, dim=2, ncopies=size({yname}))")
                 self.o.w(f"{yy} = spread({yname}, dim=1, ncopies=size({xname}))")
+            return
+        # tuple unpacking from np.histogram(x, bins=...)
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr == "histogram"
+        ):
+            outs = []
+            for e in t.elts:
+                if not isinstance(e, ast.Name):
+                    raise NotImplementedError("tuple assignment targets must be names")
+                outs.append(e.id)
+            if len(outs) < 2 or len(v.args) < 1:
+                raise NotImplementedError("np.histogram assignment expects two outputs and input array")
+            xname = self.expr(v.args[0])
+            bins_node = v.args[1] if len(v.args) >= 2 else None
+            for kw in v.keywords:
+                if kw.arg == "bins":
+                    bins_node = kw.value
+                elif kw.arg in {"range", "weights", "density"}:
+                    raise NotImplementedError(f"np.histogram keyword '{kw.arg}' is not yet supported")
+            if bins_node is None:
+                raise NotImplementedError("np.histogram currently requires explicit bins")
+            self.o.w(f"call histogram({xname}, {self.expr(bins_node)}, {outs[0]}, {outs[1]})")
             return
 
         # ignore module-level param assignment already emitted as parameter
