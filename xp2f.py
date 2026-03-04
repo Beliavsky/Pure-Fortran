@@ -792,6 +792,23 @@ def detect_needed_helpers(tree):
                 and node.func.attr in np_helper_map
             ):
                 needed.update(np_helper_map[node.func.attr])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "trace"
+            ):
+                needed.add("diag")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "einsum"
+                and len(node.args) >= 1
+                and is_const_str(node.args[0])
+                and node.args[0].value == "ii->"
+            ):
+                needed.add("diag")
             if isinstance(node.func, ast.Name) and node.func.id == "print":
                 if len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "primes":
                     needed.add("print_int_list")
@@ -2171,6 +2188,16 @@ class translator(ast.NodeVisitor):
                     if (r1 == 2 and r2 == 1) or (r1 == 1 and r2 == 2):
                         return 1
                     return 0
+                if node.func.attr == "trace" and len(node.args) >= 1:
+                    return 0
+                if node.func.attr == "outer" and len(node.args) >= 2:
+                    return 2
+                if node.func.attr == "kron" and len(node.args) >= 2:
+                    r1 = self._rank_expr(node.args[0])
+                    r2 = self._rank_expr(node.args[1])
+                    if r1 <= 1 and r2 <= 1:
+                        return 1
+                    return 2
                 if node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique"} and len(node.args) >= 1:
                     return 1
                 if node.func.attr in {"hstack", "vstack", "column_stack", "concatenate"} and len(node.args) >= 1:
@@ -2263,6 +2290,14 @@ class translator(ast.NodeVisitor):
                 if (r1 == 2 and r2 == 1) or (r1 == 1 and r2 == 2):
                     return 1
                 return 0
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "trace" and len(node.args) == 0:
+                return 0
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "kron" and len(node.args) >= 1:
+                r1 = self._rank_expr(node.func.value)
+                r2 = self._rank_expr(node.args[0])
+                if r1 <= 1 and r2 <= 1:
+                    return 1
+                return 2
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype":
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
@@ -2812,6 +2847,11 @@ class translator(ast.NodeVisitor):
                     if self._rank_expr(node.func.value) == 1 and self._rank_expr(node.args[0]) == 1:
                         return f"dot_product({base_expr}, {a1})"
                     return f"matmul({base_expr}, {a1})"
+                if attr == "kron" and len(node.args) >= 1:
+                    a1 = self.expr(node.args[0])
+                    if self._rank_expr(node.func.value) <= 1 and self._rank_expr(node.args[0]) <= 1:
+                        return f"reshape(spread({a1}, dim=1, ncopies=size({base_expr})) * spread({base_expr}, dim=2, ncopies=size({a1})), [size({base_expr})*size({a1})])"
+                    raise NotImplementedError("method kron currently supports only 1D arrays")
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 return f"isqrt_int({self.expr(node.args[0])})"
@@ -3144,6 +3184,48 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "dot" and self._rank_expr(node.args[0]) == 1 and self._rank_expr(node.args[1]) == 1:
                     return f"dot_product({a0}, {a1})"
                 return f"matmul({a0}, {a1})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "trace"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                return f"sum(diag({a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "einsum"
+                and len(node.args) >= 2
+                and is_const_str(node.args[0])
+                and node.args[0].value == "ii->"
+            ):
+                a0 = self.expr(node.args[1])
+                return f"sum(diag({a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "outer"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                a1 = self.expr(node.args[1])
+                return f"spread({a0}, dim=2, ncopies=size({a1})) * spread({a1}, dim=1, ncopies=size({a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "kron"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                a1 = self.expr(node.args[1])
+                if self._rank_expr(node.args[0]) <= 1 and self._rank_expr(node.args[1]) <= 1:
+                    return f"reshape(spread({a1}, dim=1, ncopies=size({a0})) * spread({a0}, dim=2, ncopies=size({a1})), [size({a0})*size({a1})])"
+                raise NotImplementedError("np.kron currently supports only 1D arrays")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
