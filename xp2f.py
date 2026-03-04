@@ -3595,6 +3595,11 @@ class translator(ast.NodeVisitor):
             base = self.expr(node.value)
             base_name = node.value.id if isinstance(node.value, ast.Name) else base
             base_size_expr = self.list_counts.get(base_name, f"size({base_name})")
+            base_rank = self._rank_expr(node.value)
+            if base_rank > 1:
+                base_first_dim_size_expr = f"size({base_name},1)" if isinstance(node.value, ast.Name) else f"size({base},1)"
+            else:
+                base_first_dim_size_expr = base_size_expr
             if isinstance(node.slice, ast.Slice):
                 if node.slice.lower is None and node.slice.upper is None and node.slice.step is None:
                     return base
@@ -3663,13 +3668,16 @@ class translator(ast.NodeVisitor):
             ):
                 k = node.slice.operand.value
                 if k == 1:
-                    idx = base_size_expr
+                    idx = base_first_dim_size_expr
                 else:
-                    idx = f"({base_size_expr} - {k - 1})"
+                    idx = f"({base_first_dim_size_expr} - {k - 1})"
             else:
                 # Python indexing is 0-based; default scalar subscripts map to
                 # Fortran 1-based indices.
                 idx = f"({self.expr(node.slice)} + 1)"
+            if base_rank > 1:
+                trailing = ", ".join(":" for _ in range(base_rank - 1))
+                return f"{base}({idx}, {trailing})"
             return f"{base}({idx})"
 
         if isinstance(node, ast.Call):
