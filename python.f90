@@ -59,6 +59,7 @@ public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):int
 public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional desc="return n x m identity-like matrix (default m=n)"
 public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="sorted unique values of real vector"
 public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
+public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 
 public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
 public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
@@ -970,6 +971,27 @@ contains
             end do
          end if
       end function cumprod_real
+
+      function gradient_1d(x) result(g)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: g(:)
+         integer :: n
+         n = size(x)
+         allocate(g(1:n))
+         if (n <= 0) return
+         if (n == 1) then
+            g(1) = 0.0_dp
+            return
+         end if
+         if (n == 2) then
+            g(1) = x(2) - x(1)
+            g(2) = x(2) - x(1)
+            return
+         end if
+         g(1) = x(2) - x(1)
+         g(2:n-1) = 0.5_dp * (x(3:n) - x(1:n-2))
+         g(n) = x(n) - x(n-1)
+      end function gradient_1d
 
       pure real(kind=dp) function var(x, ddof)
          real(kind=dp), intent(in) :: x(:)

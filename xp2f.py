@@ -719,6 +719,7 @@ def detect_needed_helpers(tree):
         "linspace": {"arange_int"},
         "cumsum": {"cumsum"},
         "cumprod": {"cumprod"},
+        "gradient": {"gradient_1d"},
         "eye": {"eye"},
         "diag": {"diag"},
         "repeat": {"repeat"},
@@ -2154,7 +2155,7 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan"} and len(node.args) >= 1:
+                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "expand_dims" and len(node.args) >= 1:
                     return self._rank_expr(node.args[0]) + 1
@@ -3241,7 +3242,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"full", "full_like", "clip", "linspace", "diff"}
+                and node.func.attr in {"full", "full_like", "clip", "linspace", "diff", "gradient"}
                 and len(node.args) >= 1
             ):
                 if node.func.attr == "full" and len(node.args) >= 2:
@@ -3281,6 +3282,12 @@ class translator(ast.NodeVisitor):
                     if axis == 0:
                         return f"({a0}(2:,:) - {a0}(:size({a0},1)-1,:))"
                     return f"({a0}(:,2:) - {a0}(:,:size({a0},2)-1))"
+                if node.func.attr == "gradient":
+                    a0 = self.expr(node.args[0])
+                    r0 = self._rank_expr(node.args[0])
+                    if r0 <= 1:
+                        return f"gradient_1d({a0})"
+                    raise NotImplementedError("np.gradient currently supports only 1D arrays")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
