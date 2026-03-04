@@ -726,7 +726,7 @@ def detect_needed_helpers(tree):
         "tile": {"tile"},
         "unique": {"unique"},
         "bincount": {"bincount_int"},
-        "searchsorted": {"searchsorted_left_int", "searchsorted_right_int"},
+        "searchsorted": {"searchsorted_left_int", "searchsorted_right_int", "searchsorted_left_int_scalar", "searchsorted_right_int_scalar"},
         "histogram": {"histogram"},
         "mean": {"mean"},
         "var": {"var"},
@@ -2339,6 +2339,9 @@ class translator(ast.NodeVisitor):
             if isinstance(node.slice, ast.Slice):
                 return f"size({self.expr(node.value)})"
             if isinstance(node.slice, ast.Tuple):
+                # Scalar tuple indexing like a(i,j) is scalar-valued.
+                if all((not isinstance(e, ast.Slice)) and (not is_none(e)) and self._rank_expr(e) == 0 for e in node.slice.elts):
+                    return None
                 return f"size({self.expr(node.value)})"
             # Vector subscript: x(idx_vec) has extent size(idx_vec).
             sr = self._rank_expr(node.slice)
@@ -2471,7 +2474,9 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "searchsorted"
                 and len(node.args) >= 2
             ):
-                return f"size({self.expr(node.args[1])})"
+                if self._rank_expr(node.args[1]) > 0:
+                    return f"size({self.expr(node.args[1])})"
+                return None
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "reduceat"
@@ -2602,10 +2607,21 @@ class translator(ast.NodeVisitor):
                         return max(1, crank)
                     return 0
             if isinstance(node.slice, ast.Tuple):
-                # Scalar tuple indexing yields scalar result.
-                if all((not isinstance(e, ast.Slice)) and (not is_none(e)) for e in node.slice.elts):
-                    return 0
-                return 2
+                # NumPy-style tuple indexing rank:
+                # - all scalar indices -> scalar
+                # - mixed slices/newaxis/vector indices -> rank from active dimensions
+                # - advanced pairwise indexing with multiple vectors and no slices -> 1D
+                elts = list(node.slice.elts)
+                has_slice_none = any(isinstance(e, ast.Slice) or is_none(e) for e in elts)
+                vec_ranks = [self._rank_expr(e) for e in elts if (not isinstance(e, ast.Slice)) and (not is_none(e)) and self._rank_expr(e) > 0]
+                if not has_slice_none:
+                    if not vec_ranks:
+                        return 0
+                    if len(vec_ranks) >= 2:
+                        return max(vec_ranks)
+                    return vec_ranks[0]
+                base_rank = sum(1 for e in elts if isinstance(e, ast.Slice) or is_none(e))
+                return base_rank + sum(vec_ranks)
             if isinstance(node.slice, ast.Slice):
                 return 1
             # Vector subscript: x(idx_vec) is array-valued.
@@ -3229,7 +3245,22 @@ class translator(ast.NodeVisitor):
             opmap = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "/="}
             if op not in opmap:
                 raise NotImplementedError("unsupported compare op")
-            return f"({self.expr(node.left)} {opmap[op]} {self.expr(node.comparators[0])})"
+            a0 = self.expr(node.left)
+            b0 = self.expr(node.comparators[0])
+            a = a0
+            b = b0
+            # Limited broadcasting for comparisons: rank-2 with rank-1.
+            if self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1:
+                if self._is_col2_expr(node.comparators[0]):
+                    b = f"spread({b0}, dim=2, ncopies=size({a0},2))"
+                else:
+                    b = f"spread({b0}, dim=1, ncopies=size({a0},1))"
+            elif self._rank_expr(node.left) == 1 and self._rank_expr(node.comparators[0]) == 2:
+                if self._is_col2_expr(node.left):
+                    a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
+                else:
+                    a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
+            return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
             # simple dict alias lookup: d["key"] -> mapped expression
@@ -4494,6 +4525,10 @@ class translator(ast.NodeVisitor):
                         break
                 if len(node.args) >= 3 and isinstance(node.args[2], ast.Constant) and isinstance(node.args[2].value, str):
                     side = str(node.args[2].value).lower()
+                if self._rank_expr(node.args[1]) == 0:
+                    if side == "right":
+                        return f"searchsorted_right_int_scalar({a0}, {v0})"
+                    return f"searchsorted_left_int_scalar({a0}, {v0})"
                 if side == "right":
                     return f"searchsorted_right_int({a0}, {v0})"
                 return f"searchsorted_left_int({a0}, {v0})"
@@ -6198,10 +6233,32 @@ class translator(ast.NodeVisitor):
                     scale_node = kw.value
             if size_node is None:
                 raise NotImplementedError("np.random.normal requires size=... in this transpiler")
-            n_expr = self.expr(size_node)
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
-            self.o.w(f"allocate({t.id}(1:{n_expr}))")
-            self.o.w(f"call random_normal_vec({t.id})")
+            n_expr = None
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 2:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp), allocatable :: tmp_norm(:)")
+                    self.o.w(f"allocate(tmp_norm(1:({n0})*({n1})))")
+                    self.o.w("call random_normal_vec(tmp_norm)")
+                    self.o.w(f"{t.id} = reshape(tmp_norm, [({n0}), ({n1})])")
+                    self.o.w("if (allocated(tmp_norm)) deallocate(tmp_norm)")
+                    self.o.pop()
+                    self.o.w("end block")
+                elif len(size_node.elts) == 1:
+                    n_expr = self.expr(size_node.elts[0])
+                    self.o.w(f"allocate({t.id}(1:{n_expr}))")
+                    self.o.w(f"call random_normal_vec({t.id})")
+                else:
+                    raise NotImplementedError("np.random.normal size tuple rank > 2 not supported")
+            else:
+                n_expr = self.expr(size_node)
+                self.o.w(f"allocate({t.id}(1:{n_expr}))")
+                self.o.w(f"call random_normal_vec({t.id})")
 
             # Special case: gather parameters by class labels, e.g.
             # rng.normal(loc=mu[z], scale=sigma[z], size=n)
@@ -6215,7 +6272,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(scale_node.value, ast.Name)
                 and isinstance(scale_node.slice, ast.Name)
             )
-            if loc_gather and scale_gather and loc_node.slice.id == scale_node.slice.id:
+            if n_expr is not None and loc_gather and scale_gather and loc_node.slice.id == scale_node.slice.id:
                 loc_arr = loc_node.value.id
                 scale_arr = scale_node.value.id
                 idx_arr = loc_node.slice.id
@@ -6796,6 +6853,19 @@ class translator(ast.NodeVisitor):
 
         # subscript assignment
         if isinstance(t, ast.Subscript):
+            # NumPy boolean-mask assignment: a[m] = v
+            if self._expr_kind(t.slice) == "logical":
+                rhs_rank = self._rank_expr(v)
+                if rhs_rank == 0:
+                    # Scalar masked assignment can be represented without LHS pack.
+                    self.o.w(f"{self.expr(t.value)} = merge({self.expr(v)}, {self.expr(t.value)}, {self.expr(t.slice)})")
+                else:
+                    self.o.w(f"where (({self.expr(t.slice)}))")
+                    self.o.push()
+                    self.o.w(f"{self.expr(t.value)} = {self.expr(v)}")
+                    self.o.pop()
+                    self.o.w("end where")
+                return
             if isinstance(t.slice, ast.Slice) and t.slice.lower is None and t.slice.upper is None and t.slice.step is None:
                 if not isinstance(t.value, ast.Name):
                     raise NotImplementedError("slice assignment target must be name")
@@ -7052,11 +7122,14 @@ class translator(ast.NodeVisitor):
             arr = self.expr(c.args[0])
             idx = self.expr(c.args[1])
             vals = self.expr(c.args[2])
+            idx_rank = self._rank_expr(c.args[1])
             vals_rank = self._rank_expr(c.args[2])
             vals_kind = self._expr_kind(c.args[2])
             self.o.w("block")
             self.o.push()
             self.o.w("integer :: i_put, n_put")
+            if idx_rank > 0:
+                self.o.w("integer, allocatable :: idx_put(:)")
             if vals_rank > 0:
                 if vals_kind == "int":
                     self.o.w("integer, allocatable :: vals_put(:)")
@@ -7064,16 +7137,28 @@ class translator(ast.NodeVisitor):
                     self.o.w("logical, allocatable :: vals_put(:)")
                 else:
                     self.o.w("real(kind=dp), allocatable :: vals_put(:)")
+            if idx_rank > 0:
+                self.o.w(f"idx_put = {idx}")
+            if vals_rank > 0:
                 self.o.w(f"vals_put = {vals}")
-            self.o.w(f"n_put = size({idx})")
+            if idx_rank > 0:
+                self.o.w("n_put = size(idx_put)")
+            else:
+                self.o.w("n_put = 1")
             if vals_rank > 0:
                 self.o.w("n_put = min(n_put, size(vals_put))")
             self.o.w("do i_put = 1, n_put")
             self.o.push()
             if vals_rank > 0:
-                self.o.w(f"{arr}({idx}(i_put) + 1) = vals_put(i_put)")
+                if idx_rank > 0:
+                    self.o.w(f"{arr}(idx_put(i_put) + 1) = vals_put(i_put)")
+                else:
+                    self.o.w(f"{arr}({idx} + 1) = vals_put(i_put)")
             else:
-                self.o.w(f"{arr}({idx}(i_put) + 1) = {vals}")
+                if idx_rank > 0:
+                    self.o.w(f"{arr}(idx_put(i_put) + 1) = {vals}")
+                else:
+                    self.o.w(f"{arr}({idx} + 1) = {vals}")
             self.o.pop()
             self.o.w("end do")
             self.o.pop()
