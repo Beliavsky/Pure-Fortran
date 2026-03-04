@@ -56,10 +56,17 @@ public :: tile_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:)
 public :: diag_from_vec_int !@pyapi kind=function ret=integer(:,:) args=v:integer(:):intent(in) desc="return diagonal matrix from integer vector"
 public :: cumprod_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative product of integer vector"
 public :: repeat_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="repeat each integer element reps times"
+public :: repeat_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) desc="repeat rows of integer matrix reps times"
+public :: repeat_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) desc="repeat columns of integer matrix reps times"
 public :: diag_from_mat_real !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) desc="return main diagonal of real matrix"
 public :: cumsum_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative sum of integer vector"
 public :: diag_from_vec_real !@pyapi kind=function ret=real(dp)(:,:) args=v:real(dp)(:):intent(in) desc="return diagonal matrix from real vector"
 public :: repeat_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="repeat each real element reps times"
+public :: repeat_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps:integer:intent(in) desc="repeat rows of real matrix reps times"
+public :: repeat_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps:integer:intent(in) desc="repeat columns of real matrix reps times"
+public :: repeat_logical !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),reps:integer:intent(in) desc="repeat each logical element reps times"
+public :: repeat_logical_axis0_2d !@pyapi kind=function ret=logical(:,:) args=x:logical(:,:):intent(in),reps:integer:intent(in) desc="repeat rows of logical matrix reps times"
+public :: repeat_logical_axis1_2d !@pyapi kind=function ret=logical(:,:) args=x:logical(:,:):intent(in),reps:integer:intent(in) desc="repeat columns of logical matrix reps times"
 public :: diag_from_mat_int !@pyapi kind=function ret=integer(:) args=a:integer(:,:):intent(in) desc="return main diagonal of integer matrix"
 public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="tile real vector reps times"
 public :: tile_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile real matrix reps0 x reps1 times"
@@ -142,7 +149,7 @@ interface diag
 end interface diag
 
 interface repeat
-   module procedure repeat_real, repeat_int
+   module procedure repeat_real, repeat_int, repeat_logical
 end interface repeat
 
 interface tile
@@ -1569,6 +1576,38 @@ contains
          end do
       end function repeat_int
 
+      function repeat_int_axis0_2d(x, reps) result(y)
+         integer, intent(in) :: x(:,:)
+         integer, intent(in) :: reps
+         integer, allocatable :: y(:,:)
+         integer :: i, k, m, n, r
+         m = size(x,1)
+         n = size(x,2)
+         r = max(0, reps)
+         allocate(y(1:m*r, 1:n))
+         do i = 1, m
+            do k = 1, r
+               y((i-1)*r + k, :) = x(i, :)
+            end do
+         end do
+      end function repeat_int_axis0_2d
+
+      function repeat_int_axis1_2d(x, reps) result(y)
+         integer, intent(in) :: x(:,:)
+         integer, intent(in) :: reps
+         integer, allocatable :: y(:,:)
+         integer :: j, k, m, n, r
+         m = size(x,1)
+         n = size(x,2)
+         r = max(0, reps)
+         allocate(y(1:m, 1:n*r))
+         do j = 1, n
+            do k = 1, r
+               y(:, (j-1)*r + k) = x(:, j)
+            end do
+         end do
+      end function repeat_int_axis1_2d
+
       function diag_from_mat_real(a) result(v)
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable :: v(:)
@@ -1621,6 +1660,87 @@ contains
             end do
          end do
       end function repeat_real
+
+      function repeat_real_axis0_2d(x, reps) result(y)
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: reps
+         real(kind=dp), allocatable :: y(:,:)
+         integer :: i, k, m, n, r
+         m = size(x,1)
+         n = size(x,2)
+         r = max(0, reps)
+         allocate(y(1:m*r, 1:n))
+         do i = 1, m
+            do k = 1, r
+               y((i-1)*r + k, :) = x(i, :)
+            end do
+         end do
+      end function repeat_real_axis0_2d
+
+      function repeat_real_axis1_2d(x, reps) result(y)
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: reps
+         real(kind=dp), allocatable :: y(:,:)
+         integer :: j, k, m, n, r
+         m = size(x,1)
+         n = size(x,2)
+         r = max(0, reps)
+         allocate(y(1:m, 1:n*r))
+         do j = 1, n
+            do k = 1, r
+               y(:, (j-1)*r + k) = x(:, j)
+            end do
+         end do
+      end function repeat_real_axis1_2d
+
+      function repeat_logical(x, reps) result(y)
+         logical, intent(in) :: x(:)
+         integer, intent(in) :: reps
+         logical, allocatable :: y(:)
+         integer :: i, j, n, r, k
+         n = size(x)
+         r = max(0, reps)
+         allocate(y(1:n*r))
+         k = 0
+         do i = 1, n
+            do j = 1, r
+               k = k + 1
+               y(k) = x(i)
+            end do
+         end do
+      end function repeat_logical
+
+      function repeat_logical_axis0_2d(x, reps) result(y)
+         logical, intent(in) :: x(:,:)
+         integer, intent(in) :: reps
+         logical, allocatable :: y(:,:)
+         integer :: i, k, m, n, r
+         m = size(x,1)
+         n = size(x,2)
+         r = max(0, reps)
+         allocate(y(1:m*r, 1:n))
+         do i = 1, m
+            do k = 1, r
+               y((i-1)*r + k, :) = x(i, :)
+            end do
+         end do
+      end function repeat_logical_axis0_2d
+
+      function repeat_logical_axis1_2d(x, reps) result(y)
+         logical, intent(in) :: x(:,:)
+         integer, intent(in) :: reps
+         logical, allocatable :: y(:,:)
+         integer :: j, k, m, n, r
+         m = size(x,1)
+         n = size(x,2)
+         r = max(0, reps)
+         allocate(y(1:m, 1:n*r))
+         do j = 1, n
+            do k = 1, r
+               y(:, (j-1)*r + k) = x(:, j)
+            end do
+         end do
+      end function repeat_logical_axis1_2d
 
       function diag_from_mat_int(a) result(v)
          integer, intent(in) :: a(:,:)

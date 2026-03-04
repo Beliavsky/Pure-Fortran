@@ -435,6 +435,14 @@ def rename_conflicting_identifiers(src_text):
         # RNG names
         "random_number", "random_seed",
     }
+    callable_forbidden = {
+        # intrinsic/procedure names that can validly appear as calls
+        "abs", "acos", "asin", "atan", "atan2", "ceiling", "cos", "count", "dot_product",
+        "exp", "floor", "huge", "int", "kind", "len", "log", "log10", "max", "maxval",
+        "mean", "merge", "min", "minval", "mod", "modulo", "nint", "pack", "present",
+        "product", "real", "reshape", "sign", "sin", "size", "spread", "sqrt", "sum",
+        "tiny", "transpose", "trim", "ubound", "lbound", "random_number", "random_seed",
+    }
 
     decl_re = re.compile(
         r"^\s*(?:integer|real|logical|complex|character|type\s*\([^)]+\))\b[^!]*::\s*([^!]*)(.*)$",
@@ -516,7 +524,7 @@ def rename_conflicting_identifiers(src_text):
                 return nm
             # Keep function/intrinsic call forms untouched.
             tail = code[m.end() :]
-            if re.match(r"^\s*\(", tail):
+            if re.match(r"^\s*\(", tail) and nm.lower() in callable_forbidden:
                 return nm
             return new
 
@@ -807,7 +815,18 @@ def detect_needed_helpers(tree):
         "gradient": {"gradient_1d"},
         "eye": {"eye"},
         "diag": {"diag"},
-        "repeat": {"repeat"},
+        "repeat": {
+            "repeat",
+            "repeat_int",
+            "repeat_real",
+            "repeat_logical",
+            "repeat_int_axis0_2d",
+            "repeat_int_axis1_2d",
+            "repeat_real_axis0_2d",
+            "repeat_real_axis1_2d",
+            "repeat_logical_axis0_2d",
+            "repeat_logical_axis1_2d",
+        },
         "tile": {"tile"},
         "unique": {"unique"},
         "bincount": {"bincount_int"},
@@ -858,7 +877,7 @@ def detect_needed_helpers(tree):
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
                 and node.func.value.attr == "random"
-                and node.func.attr == "normal"
+                and node.func.attr in {"normal", "randn"}
             ):
                 needed.add("random_normal_vec")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "normal":
@@ -2130,6 +2149,17 @@ class translator(ast.NodeVisitor):
             return "logical"
         if isinstance(node, ast.Subscript):
             if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "np"
+                and node.value.func.attr == "nonzero"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and int(node.slice.value) == 0
+            ):
+                return "int"
+            if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.dict_typed_vars
                 and isinstance(node.slice, ast.Constant)
@@ -2270,6 +2300,13 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"nonzero", "argwhere", "argsort", "searchsorted", "bincount"}
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"array", "asarray"}
                 and len(node.args) >= 1
             ):
@@ -2340,6 +2377,38 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"add", "multiply", "maximum", "power"}
+                and len(node.args) >= 2
+            ):
+                k0 = self._expr_kind(node.args[0])
+                k1 = self._expr_kind(node.args[1])
+                if "real" in {k0, k1}:
+                    return "real"
+                if k0 == "logical" and k1 == "logical" and node.func.attr == "maximum":
+                    return "logical"
+                if k0 == "int" and k1 == "int":
+                    return "int"
+                return k0 or k1
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"logical_and", "logical_or", "logical_xor"}
+                and len(node.args) >= 2
+            ):
+                return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "nan_to_num"
+                and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "bincount"
                 and len(node.args) >= 1
             ):
@@ -2378,6 +2447,15 @@ class translator(ast.NodeVisitor):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "random"
+                and node.func.attr in {"rand", "randn"}
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "integers"
             ):
                 return "int"
@@ -2392,6 +2470,14 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr in {"mean", "var", "std", "log2", "log10", "nansum", "nanmean", "nanvar", "nanstd", "nanmin", "nanmax"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "log1p"
                 and len(node.args) >= 1
             ):
                 return "real"
@@ -2582,6 +2668,18 @@ class translator(ast.NodeVisitor):
             return self._extent_expr(node.orelse)
         if isinstance(node, ast.Subscript):
             if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "np"
+                and node.value.func.attr == "nonzero"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and int(node.slice.value) == 0
+            ):
+                a0 = self.expr(node.value.args[0]) if node.value.args else "0"
+                return f"count(({a0} /= 0))"
+            if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.dict_typed_vars
                 and isinstance(node.slice, ast.Constant)
@@ -2651,7 +2749,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "ascontiguousarray", "asfortranarray", "broadcast_to"}
+                and node.func.attr in {"log", "exp", "sqrt", "log1p", "maximum", "add", "multiply", "power", "logical_and", "logical_or", "logical_xor", "nan_to_num", "asarray", "ascontiguousarray", "asfortranarray", "broadcast_to"}
                 and len(node.args) >= 1
             ):
                 return self._extent_expr(node.args[0])
@@ -2667,7 +2765,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "ascontiguousarray", "asfortranarray", "broadcast_to"}
+                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "nan_to_num", "ascontiguousarray", "asfortranarray", "broadcast_to"}
                 and len(node.args) >= 1
             ):
                 return self._extent_expr(node.args[0])
@@ -2872,6 +2970,17 @@ class translator(ast.NodeVisitor):
             return 1
         if isinstance(node, ast.Subscript):
             if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "np"
+                and node.value.func.attr == "nonzero"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and int(node.slice.value) == 0
+            ):
+                return 1
+            if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.dict_typed_vars
                 and isinstance(node.slice, ast.Constant)
@@ -2969,6 +3078,8 @@ class translator(ast.NodeVisitor):
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"minimum"} and len(node.args) >= 1:
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
+                if node.func.attr in {"add", "multiply", "maximum", "power", "logical_and", "logical_or", "logical_xor"} and len(node.args) >= 2:
+                    return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
                 if node.func.attr == "arange" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "linspace" and len(node.args) >= 1:
@@ -2992,6 +3103,8 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient", "ascontiguousarray", "asfortranarray"} and len(node.args) >= 1:
+                    return self._rank_expr(node.args[0])
+                if node.func.attr in {"log1p", "nan_to_num"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"pad", "roll", "flip"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -3021,6 +3134,18 @@ class translator(ast.NodeVisitor):
                     if isinstance(size_node, (ast.Tuple, ast.List)):
                         return max(1, len(size_node.elts))
                     return 1
+                if (
+                    isinstance(node.func.value, ast.Attribute)
+                    and isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id == "np"
+                    and node.func.value.attr == "random"
+                    and node.func.attr in {"rand", "randn"}
+                ):
+                    if len(node.args) == 0:
+                        return 0
+                    if len(node.args) == 1:
+                        return 1
+                    return 2
                 if node.func.attr == "permutation" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "broadcast_to" and len(node.args) >= 2:
@@ -3069,7 +3194,19 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr in {"sin", "cos", "tan", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr in {"cumsum", "cumprod", "repeat", "unique"} and len(node.args) >= 1:
+                if node.func.attr in {"cumsum", "cumprod", "unique"} and len(node.args) >= 1:
+                    return 1
+                if node.func.attr == "repeat" and len(node.args) >= 1:
+                    r0 = self._rank_expr(node.args[0])
+                    axis_node = None
+                    if len(node.args) >= 3:
+                        axis_node = node.args[2]
+                    for kw in node.keywords:
+                        if kw.arg == "axis":
+                            axis_node = kw.value
+                            break
+                    if axis_node is not None:
+                        return r0
                     return 1
                 if node.func.attr == "tile" and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
@@ -3624,6 +3761,18 @@ class translator(ast.NodeVisitor):
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "np"
+                and node.value.func.attr == "nonzero"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and int(node.slice.value) == 0
+            ):
+                # 1D np.nonzero(x)[0] is the index vector itself.
+                return self.expr(node.value)
             # 1D np.nonzero(...) compatibility: nz is stored as index vector;
             # map nz[0] back to that vector.
             if (
@@ -3738,6 +3887,21 @@ class translator(ast.NodeVisitor):
                 trailing = ", ".join(":" for _ in range(base_rank - 1))
                 return f"{base}({idx}, {trailing})"
             return f"{base}({idx})"
+
+        if isinstance(node, ast.ListComp):
+            # Minimal fallback for simple comprehensions used in prints:
+            # print([f(v) for v in x.tolist()]) -> print(x)
+            if len(node.generators) == 1 and not node.generators[0].ifs:
+                it = node.generators[0].iter
+                if (
+                    isinstance(it, ast.Call)
+                    and isinstance(it.func, ast.Attribute)
+                    and it.func.attr == "tolist"
+                    and len(it.args) == 0
+                ):
+                    return self.expr(it.func.value)
+                return self.expr(it)
+            raise NotImplementedError("ListComp currently supports only single-generator form")
 
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
@@ -4472,6 +4636,60 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "log1p"
+                and len(node.args) >= 1
+            ):
+                return f"log(1.0_dp + {self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"add", "multiply", "maximum", "power"}
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                a1 = self.expr(node.args[1])
+                if node.func.attr == "add":
+                    return f"({a0} + {a1})"
+                if node.func.attr == "multiply":
+                    return f"({a0} * {a1})"
+                if node.func.attr == "maximum":
+                    return f"max({a0}, {a1})"
+                return f"({a0}**{a1})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"logical_and", "logical_or", "logical_xor"}
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                a1 = self.expr(node.args[1])
+                l0 = a0 if self._expr_kind(node.args[0]) == "logical" else f"({a0} /= 0)"
+                l1 = a1 if self._expr_kind(node.args[1]) == "logical" else f"({a1} /= 0)"
+                if node.func.attr == "logical_and":
+                    return f"({l0} .and. {l1})"
+                if node.func.attr == "logical_or":
+                    return f"({l0} .or. {l1})"
+                return f"({l0} .neqv. {l1})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "nan_to_num"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                nan_fill = "0.0_dp"
+                for kw in node.keywords:
+                    if kw.arg == "nan":
+                        nan_fill = self.expr(kw.value)
+                        break
+                return f"merge({nan_fill}, {a0}, ieee_is_nan({a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "mod"
                 and len(node.args) >= 2
             ):
@@ -5056,11 +5274,34 @@ class translator(ast.NodeVisitor):
                             r1 = self.expr(node.args[1].elts[1])
                             return f"tile({a0}, int({r0}), int({r1}))"
                         reps = self.expr(node.args[1])
+                    axis_node = None
                     for kw in node.keywords:
                         if kw.arg in {"repeats", "reps"}:
                             reps = self.expr(kw.value)
-                            break
-                    return f"{node.func.attr}({a0}, int({reps}))"
+                        elif kw.arg == "axis":
+                            axis_node = kw.value
+                    if node.func.attr == "repeat":
+                        k0 = self._expr_kind(node.args[0])
+                        fn = "repeat_real"
+                        if k0 == "int":
+                            fn = "repeat_int"
+                        elif k0 == "logical":
+                            fn = "repeat_logical"
+                        if axis_node is not None:
+                            if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)):
+                                raise NotImplementedError("np.repeat axis must be a constant integer")
+                            ax = int(axis_node.value)
+                            if self._rank_expr(node.args[0]) == 2:
+                                if ax in {0, -2}:
+                                    fn = f"{fn}_axis0_2d"
+                                elif ax in {1, -1}:
+                                    fn = f"{fn}_axis1_2d"
+                                else:
+                                    raise NotImplementedError("np.repeat axis out of range for 2D arrays")
+                            else:
+                                raise NotImplementedError("np.repeat axis currently supports only 2D arrays")
+                        return f"{fn}({a0}, int({reps}))"
+                    return f"tile({a0}, int({reps}))"
                 return f"{node.func.attr}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -6130,10 +6371,11 @@ class translator(ast.NodeVisitor):
                     and len(v.args) >= 1
                 ):
                     k0 = self._expr_kind(v.args[0])
+                    rank_hint = max(1, self._rank_expr(v.args[0]))
                     if k0 == "int":
-                        self._mark_alloc_int(t.id)
+                        self._mark_alloc_int(t.id, rank=rank_hint)
                     else:
-                        self._mark_alloc_real(t.id)
+                        self._mark_alloc_real(t.id, rank=rank_hint)
                 # np.argsort(...)
                 if (
                     isinstance(t, ast.Name)
@@ -6243,6 +6485,23 @@ class translator(ast.NodeVisitor):
                     and v.func.attr == "normal"
                 ):
                     self._mark_alloc_real(t.id)
+
+                # np.random.rand(...) / np.random.randn(...)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Attribute)
+                    and isinstance(v.func.value.value, ast.Name)
+                    and v.func.value.value.id == "np"
+                    and v.func.value.attr == "random"
+                    and v.func.attr in {"rand", "randn"}
+                ):
+                    rr = 0 if len(v.args) == 0 else (1 if len(v.args) == 1 else 2)
+                    if rr > 0:
+                        self._mark_alloc_real(t.id, rank=rr)
+                    else:
+                        self.reals.add(t.id)
 
                 # rng.normal(...)
                 if (
@@ -7062,6 +7321,58 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{t.id} = ({self.expr(scale_node)}) * {t.id}")
             return
 
+        # x = np.random.rand(n0, n1, ...) / np.random.randn(n0, n1, ...)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Attribute)
+            and isinstance(v.func.value.value, ast.Name)
+            and v.func.value.value.id == "np"
+            and v.func.value.attr == "random"
+            and v.func.attr in {"rand", "randn"}
+        ):
+            dims = list(v.args)
+            if not dims:
+                if v.func.attr == "rand":
+                    self.o.w(f"call random_number({t.id})")
+                else:
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp) :: tmp_norm_scalar(1)")
+                    self.o.w("call random_normal_vec(tmp_norm_scalar)")
+                    self.o.w(f"{t.id} = tmp_norm_scalar(1)")
+                    self.o.pop()
+                    self.o.w("end block")
+                return
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            if len(dims) == 1:
+                n0 = self.expr(dims[0])
+                self.o.w(f"allocate({t.id}(1:{n0}))")
+                if v.func.attr == "rand":
+                    self.o.w(f"call random_number({t.id})")
+                else:
+                    self.o.w(f"call random_normal_vec({t.id})")
+                return
+            if len(dims) == 2:
+                n0 = self.expr(dims[0])
+                n1 = self.expr(dims[1])
+                self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
+                if v.func.attr == "rand":
+                    self.o.w(f"call random_number({t.id})")
+                else:
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp), allocatable :: tmp_norm(:)")
+                    self.o.w(f"allocate(tmp_norm(1:({n0})*({n1})))")
+                    self.o.w("call random_normal_vec(tmp_norm)")
+                    self.o.w(f"{t.id} = reshape(tmp_norm, [({n0}), ({n1})])")
+                    self.o.w("if (allocated(tmp_norm)) deallocate(tmp_norm)")
+                    self.o.pop()
+                    self.o.w("end block")
+                return
+            raise NotImplementedError("np.random.rand/randn supports up to 2 dimensions")
+
         # x = rng.uniform(low, high, size=...) / np.random.uniform(...)
         if (
             isinstance(t, ast.Name)
@@ -7453,6 +7764,13 @@ class translator(ast.NodeVisitor):
         ):
             name = t.id
             elts = v.args[0].elts
+            def _ctor(nodes):
+                if nodes and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in nodes):
+                    mlen = max(len(e.value) for e in nodes)
+                    vals0 = ", ".join(self.expr(e) for e in nodes)
+                    return f"[character(len={mlen}) :: {vals0}]"
+                vals0 = ", ".join(self.expr(e) for e in nodes)
+                return f"[{vals0}]"
             self.o.w(f"if (allocated({name})) deallocate({name})")
             if elts and all(isinstance(e, ast.List) for e in elts):
                 nrow = len(elts)
@@ -7463,13 +7781,11 @@ class translator(ast.NodeVisitor):
                 flat_nodes = []
                 for r in elts:
                     flat_nodes.extend(r.elts)
-                vals = ", ".join(self.expr(e) for e in flat_nodes)
-                self.o.w(f"{name} = transpose(reshape([{vals}], [{ncol}, {nrow}]))")
+                self.o.w(f"{name} = transpose(reshape({_ctor(flat_nodes)}, [{ncol}, {nrow}]))")
             else:
                 n_expr = str(len(elts))
                 self.o.w(f"allocate({name}(1:{n_expr}))")
-                vals = ", ".join(self.expr(e) for e in elts)
-                self.o.w(f"{name} = [{vals}]")
+                self.o.w(f"{name} = {_ctor(elts)}")
             return
 
         # x = np.array(list_var, dtype=...) / np.asarray(list_var, dtype=...)
@@ -7543,15 +7859,120 @@ class translator(ast.NodeVisitor):
             and isinstance(v.func, ast.Attribute)
             and isinstance(v.func.value, ast.Name)
             and v.func.value.id == "np"
+            and v.func.attr == "repeat"
+            and len(v.args) >= 2
+        ):
+            name = t.id
+            a0 = self.expr(v.args[0])
+            reps = self.expr(v.args[1])
+            axis_node = None
+            if len(v.args) >= 3:
+                axis_node = v.args[2]
+            for kw in v.keywords:
+                if kw.arg in {"repeats", "reps"}:
+                    reps = self.expr(kw.value)
+                elif kw.arg == "axis":
+                    axis_node = kw.value
+            r0 = self._rank_expr(v.args[0])
+            if axis_node is None:
+                self.o.w(f"{name} = {self.expr(v)}")
+                return
+            if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)):
+                raise NotImplementedError("np.repeat axis must be a constant integer")
+            axis = int(axis_node.value)
+            if r0 != 2:
+                raise NotImplementedError("np.repeat axis currently supports only 2D arrays")
+            self.o.w(f"if (allocated({name})) deallocate({name})")
+            if axis in {0, -2}:
+                self.o.w(f"allocate({name}(1:size({a0},1)*int({reps}),1:size({a0},2)))")
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: i_rep, k_rep")
+                self.o.w(f"do i_rep = 1, size({a0},1)")
+                self.o.push()
+                self.o.w(f"do k_rep = 1, int({reps})")
+                self.o.push()
+                self.o.w(f"{name}((i_rep-1)*int({reps}) + k_rep,:) = {a0}(i_rep,:)")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            if axis in {1, -1}:
+                self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)*int({reps})))")
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: j_rep, k_rep")
+                self.o.w(f"do j_rep = 1, size({a0},2)")
+                self.o.push()
+                self.o.w(f"do k_rep = 1, int({reps})")
+                self.o.push()
+                self.o.w(f"{name}(:,(j_rep-1)*int({reps}) + k_rep) = {a0}(:,j_rep)")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            raise NotImplementedError("np.repeat axis out of range for 2D arrays")
+
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
             and v.func.attr == "sort"
             and len(v.args) >= 1
         ):
             name = t.id
             a0 = self.expr(v.args[0])
-            self.o.w(f"if (allocated({name})) deallocate({name})")
-            self.o.w(f"allocate({name}(1:size({a0})))")
-            self.o.w(f"{name} = {a0}")
-            self.o.w(f"call sort_vec({name})")
+            r0 = self._rank_expr(v.args[0])
+            axis_node = None
+            for kw in v.keywords:
+                if kw.arg == "axis":
+                    axis_node = kw.value
+                    break
+            if r0 <= 1:
+                self.o.w(f"if (allocated({name})) deallocate({name})")
+                self.o.w(f"allocate({name}(1:size({a0})))")
+                self.o.w(f"{name} = {a0}")
+                self.o.w(f"call sort_vec({name})")
+                return
+            if r0 == 2:
+                axis = -1
+                if axis_node is not None:
+                    if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)):
+                        raise NotImplementedError("np.sort axis must be a constant integer")
+                    axis = int(axis_node.value)
+                self.o.w(f"if (allocated({name})) deallocate({name})")
+                self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)))")
+                self.o.w(f"{name} = {a0}")
+                self.o.w("block")
+                self.o.push()
+                if axis in {0, -2}:
+                    self.o.w("integer :: j_sort")
+                    self.o.w(f"do j_sort = 1, size({name},2)")
+                    self.o.push()
+                    self.o.w(f"call sort_vec({name}(:,j_sort))")
+                    self.o.pop()
+                    self.o.w("end do")
+                elif axis in {1, -1}:
+                    self.o.w("integer :: i_sort")
+                    self.o.w(f"do i_sort = 1, size({name},1)")
+                    self.o.push()
+                    self.o.w(f"call sort_vec({name}(i_sort,:))")
+                    self.o.pop()
+                    self.o.w("end do")
+                else:
+                    raise NotImplementedError("np.sort axis out of range for 2D arrays")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            raise NotImplementedError("np.sort currently supports only 1D/2D arrays")
             return
 
         # x = np.argsort(a)
