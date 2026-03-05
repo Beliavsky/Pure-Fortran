@@ -911,7 +911,10 @@ def remove_unused_use_only_imports(lines):
                     check = lhs
                 else:
                     check = it
-                if check and re.search(rf"\b{re.escape(check)}\b", body_txt, flags=re.IGNORECASE):
+                used_word = bool(check and re.search(rf"\b{re.escape(check)}\b", body_txt, flags=re.IGNORECASE))
+                # Kind suffix usage like 1.0_dp does not satisfy word-boundary checks.
+                used_kind_suffix = bool(check and re.search(rf"_{re.escape(check)}\b", body_txt, flags=re.IGNORECASE))
+                if used_word or used_kind_suffix:
                     kept.append(it)
 
             indent = re.match(r"^(\s*)", out[s0]).group(1)
@@ -2095,6 +2098,122 @@ def collect_structured_dtype_info(tree):
     return struct_types, struct_arrays, struct_dtype_strings
 
 
+def collect_dataclass_info(tree):
+    """Collect simple @dataclass and plain class records as Fortran derived types."""
+    class_to_type = {}
+    type_components = {}
+
+    def _is_dataclass_decorator(d):
+        if isinstance(d, ast.Name) and d.id == "dataclass":
+            return True
+        if (
+            isinstance(d, ast.Attribute)
+            and isinstance(d.value, ast.Name)
+            and d.value.id == "dataclasses"
+            and d.attr == "dataclass"
+        ):
+            return True
+        if isinstance(d, ast.Call):
+            return _is_dataclass_decorator(d.func)
+        return False
+
+    def _field_kind(ann):
+        txt = ""
+        if ann is not None and hasattr(ast, "unparse"):
+            txt = ast.unparse(ann).lower()
+        if txt in {"float", "np.float64", "real"}:
+            return "real"
+        if txt in {"int", "np.int64", "integer"}:
+            return "int"
+        if txt in {"bool", "logical"}:
+            return "logical"
+        if txt in {"str", "character"}:
+            return "char"
+        return None
+
+    def _is_namedtuple_base(b):
+        if isinstance(b, ast.Name) and b.id in {"NamedTuple"}:
+            return True
+        if (
+            isinstance(b, ast.Attribute)
+            and isinstance(b.value, ast.Name)
+            and b.value.id in {"typing", "collections"}
+            and b.attr in {"NamedTuple"}
+        ):
+            return True
+        return False
+
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        is_dc = any(_is_dataclass_decorator(d) for d in node.decorator_list)
+        is_nt = any(_is_namedtuple_base(b) for b in node.bases)
+        fields = []
+        ok = True
+        if is_dc or is_nt:
+            for st in node.body:
+                if isinstance(st, ast.Expr) and isinstance(getattr(st, "value", None), ast.Constant) and isinstance(st.value.value, str):
+                    continue
+                if isinstance(st, ast.Pass):
+                    continue
+                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                    k = _field_kind(st.annotation)
+                    if k is None:
+                        ok = False
+                        break
+                    fields.append((st.target.id, k))
+                    continue
+                # Keep subset strict for predictable lowering.
+                ok = False
+                break
+        else:
+            # Plain class subset:
+            # class C:
+            #   def __init__(self, x: T, y: U):
+            #       self.x = x
+            #       self.y = y
+            init_fn = next((s for s in node.body if isinstance(s, ast.FunctionDef) and s.name == "__init__"), None)
+            if init_fn is None:
+                continue
+            if not init_fn.args.args:
+                continue
+            # parameter name -> kind from annotation
+            pmap = {}
+            for a in init_fn.args.args[1:]:
+                k = _field_kind(a.annotation)
+                if k is None:
+                    ok = False
+                    break
+                pmap[a.arg] = k
+            if not ok:
+                continue
+            for st in init_fn.body:
+                if isinstance(st, ast.Expr) and isinstance(getattr(st, "value", None), ast.Constant) and isinstance(st.value.value, str):
+                    continue
+                if (
+                    isinstance(st, ast.Assign)
+                    and len(st.targets) == 1
+                    and isinstance(st.targets[0], ast.Attribute)
+                    and isinstance(st.targets[0].value, ast.Name)
+                    and st.targets[0].value.id == "self"
+                    and isinstance(st.value, ast.Name)
+                    and st.value.id in pmap
+                ):
+                    fields.append((st.targets[0].attr, pmap[st.value.id]))
+                    continue
+                if isinstance(st, ast.Pass):
+                    continue
+                ok = False
+                break
+        if not ok or not fields:
+            continue
+        tname = f"{node.name}_t"
+        class_to_type[node.name] = tname
+        type_components[tname] = fields
+
+    return class_to_type, type_components
+
+
 def detect_scalar_outputs(tree, params):
     # scalars appearing in f-strings in prints in the else-branch
     outs = set()
@@ -2957,8 +3076,12 @@ class translator(ast.NodeVisitor):
         tuple_return_out_kinds=None,
         dict_type_components=None,
         local_func_arg_ranks=None,
+        local_func_arg_kinds=None,
         local_func_defaults=None,
         local_void_funcs=None,
+        local_generic_overloads=None,
+        user_class_types=None,
+        local_func_dict_arg_types=None,
         structured_type_components=None,
         structured_array_types=None,
         structured_dtype_strings=None,
@@ -2996,8 +3119,12 @@ class translator(ast.NodeVisitor):
         self.dict_aliases = {}
         self.dict_type_components = dict(dict_type_components or {})
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
+        self.local_func_arg_kinds = dict(local_func_arg_kinds or {})
         self.local_func_defaults = dict(local_func_defaults or {})
         self.local_void_funcs = set(local_void_funcs or [])
+        self.local_generic_overloads = set(local_generic_overloads or [])
+        self.user_class_types = dict(user_class_types or {})
+        self.local_func_dict_arg_types = dict(local_func_dict_arg_types or {})
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
@@ -3017,6 +3144,37 @@ class translator(ast.NodeVisitor):
             self.name_aliases[name] = alias
             return alias
         return name
+
+    def _coerce_local_actual_kind(self, callee, idx, arg_node, arg_expr):
+        if callee in self.local_generic_overloads:
+            return arg_expr
+        kinds = self.local_func_arg_kinds.get(callee, [])
+        want = kinds[idx] if idx < len(kinds) else None
+        if want not in {"real", "int", "logical", "char"}:
+            return arg_expr
+        have = self._expr_kind(arg_node)
+        if have is None or have == want:
+            return arg_expr
+        if want == "char":
+            return arg_expr
+        if want == "real":
+            if have == "int":
+                return f"real({arg_expr}, kind=dp)"
+            if have == "logical":
+                return f"merge(1.0_dp, 0.0_dp, {arg_expr})"
+            return arg_expr
+        if want == "int":
+            if have == "real":
+                return f"int({arg_expr})"
+            if have == "logical":
+                return f"merge(1, 0, {arg_expr})"
+            return arg_expr
+        # want == logical
+        if have == "int":
+            return f"({arg_expr} /= 0)"
+        if have == "real":
+            return f"({arg_expr} /= 0.0_dp)"
+        return arg_expr
 
     @staticmethod
     def _is_np_vectorize_call(node):
@@ -3576,6 +3734,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "diag" and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Name):
+                if node.func.id in self.user_class_types:
+                    return None
                 if node.func.id in self.local_func_arg_ranks:
                     ranks = self.local_func_arg_ranks.get(node.func.id, [])
                     parts = []
@@ -5111,6 +5271,22 @@ class translator(ast.NodeVisitor):
             return None
 
         def _array_constructor(elts):
+            kinds = {self._expr_kind(e) for e in elts}
+            kinds.discard(None)
+            # Fortran array constructors are homogeneous. Allow numeric promotion,
+            # but reject mixed CHARACTER/LOGICAL with other kinds.
+            if "char" in kinds and len(kinds) > 1:
+                raise NotImplementedError(
+                    "mixed-type list/tuple literals are unsupported (character mixed with non-character)"
+                )
+            if "logical" in kinds and len(kinds) > 1:
+                raise NotImplementedError(
+                    "mixed-type list/tuple literals are unsupported (logical mixed with non-logical)"
+                )
+            if "int" in kinds and "real" in kinds:
+                raise NotImplementedError(
+                    "mixed-type list/tuple literals are unsupported (real mixed with integer)"
+                )
             if elts and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in elts):
                 max_len = max(len(e.value) for e in elts)
                 vals = ", ".join(self.expr(e) for e in elts)
@@ -5697,6 +5873,22 @@ class translator(ast.NodeVisitor):
                     return self.list_counts[a0.id]
                 return f"size({self.expr(a0)})"
             if isinstance(node.func, ast.Name):
+                if node.func.id in self.user_class_types:
+                    tnm = self.user_class_types[node.func.id]
+                    args_nodes = list(node.args)
+                    parts = []
+                    comps = [nm for nm, _ in self.structured_type_components.get(tnm, [])]
+                    for i, a in enumerate(args_nodes):
+                        ae = strip_redundant_outer_parens_expr(self.expr(a))
+                        if i < len(comps):
+                            parts.append(f"{comps[i]}={ae}")
+                        else:
+                            parts.append(ae)
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg is None:
+                            raise NotImplementedError("**kwargs not supported")
+                        parts.append(f"{kw.arg}={strip_redundant_outer_parens_expr(self.expr(kw.value))}")
+                    return f"{tnm}(" + ", ".join(parts) + ")"
                 if node.func.id in self.local_void_funcs:
                     raise NotImplementedError("subroutine call cannot be used in expression context")
                 args_nodes = list(node.args)
@@ -5709,7 +5901,19 @@ class translator(ast.NodeVisitor):
                     for j in range(len(args_nodes), len(dfl)):
                         if dfl[j] is not None:
                             args_nodes.append(dfl[j])
-                args = ", ".join(self.expr(a) for a in args_nodes)
+                ranks = self.local_func_arg_ranks.get(node.func.id, [])
+                parts = []
+                for i, a in enumerate(args_nodes):
+                    ae = self.expr(a)
+                    ae = self._coerce_local_actual_kind(node.func.id, i, a, ae)
+                    er = ranks[i] if i < len(ranks) else 0
+                    ar = self._rank_expr(a)
+                    if er == 2 and ar == 1:
+                        ae = f"reshape({ae}, [size({ae}), 1])"
+                    elif er == 1 and ar == 2:
+                        ae = f"reshape({ae}, [size({ae})])"
+                    parts.append(ae)
+                args = ", ".join(parts)
                 return f"{node.func.id}({args})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -7502,6 +7706,11 @@ class translator(ast.NodeVisitor):
                 return "huge(1.0_dp)"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "NINF":
                 return "(-huge(1.0_dp))"
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in self.dict_typed_vars
+            ):
+                return f"{self.expr(node.value)}%{node.attr}"
             attr_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported attribute expr: {attr_txt}")
 
@@ -7517,12 +7726,57 @@ class translator(ast.NodeVisitor):
             return None
 
         for node in nodes:
+            # Propagate known local function dict-typed dummy arguments to
+            # call-site variables (e.g., foo(a) where foo expects foo_dict_t).
+            for c in ast.walk(node):
+                if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)):
+                    continue
+                amap = self.local_func_dict_arg_types.get(c.func.id, {})
+                if not amap:
+                    continue
+                for i, a in enumerate(c.args):
+                    if i not in amap or not isinstance(a, ast.Name):
+                        continue
+                    tnm = amap[i]
+                    self.dict_typed_vars[a.id] = tnm
+                    self.dict_var_components[a.id] = list(self.dict_type_components.get(tnm, {}).keys())
+                    self.ints.discard(a.id)
+                    self.reals.discard(a.id)
+                    self.logs.discard(a.id)
+                    self.alloc_ints.discard(a.id)
+                    self.alloc_reals.discard(a.id)
+                    self.alloc_logs.discard(a.id)
+                    self.alloc_chars.discard(a.id)
+                    self.alloc_complexes.discard(a.id)
+                    self.alloc_int_rank.pop(a.id, None)
+                    self.alloc_real_rank.pop(a.id, None)
+                    self.alloc_log_rank.pop(a.id, None)
+                    self.alloc_char_rank.pop(a.id, None)
+                    self.alloc_complex_rank.pop(a.id, None)
+
             if isinstance(node, ast.AnnAssign):
                 if isinstance(node.target, ast.Name):
                     tname = node.target.id
                     ann_txt = ast.unparse(node.annotation) if hasattr(ast, "unparse") else ""
                     low_ann = ann_txt.lower()
-                    if "ndarray" in low_ann:
+                    if ann_txt in self.user_class_types:
+                        tnm = self.user_class_types[ann_txt]
+                        self.dict_typed_vars[tname] = tnm
+                        self.dict_var_components[tname] = [nm for nm, _ in self.structured_type_components.get(tnm, [])]
+                        self.ints.discard(tname)
+                        self.reals.discard(tname)
+                        self.logs.discard(tname)
+                        self.alloc_ints.discard(tname)
+                        self.alloc_reals.discard(tname)
+                        self.alloc_logs.discard(tname)
+                        self.alloc_chars.discard(tname)
+                        self.alloc_complexes.discard(tname)
+                        self.alloc_int_rank.pop(tname, None)
+                        self.alloc_real_rank.pop(tname, None)
+                        self.alloc_log_rank.pop(tname, None)
+                        self.alloc_char_rank.pop(tname, None)
+                        self.alloc_complex_rank.pop(tname, None)
+                    elif "ndarray" in low_ann:
                         if "bool" in low_ann:
                             self._mark_alloc_log(tname)
                         else:
@@ -7535,6 +7789,30 @@ class translator(ast.NodeVisitor):
                 continue
 
             if isinstance(node, ast.Assign):
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in self.user_class_types
+                ):
+                    tname = node.targets[0].id
+                    tnm = self.user_class_types[node.value.func.id]
+                    self.dict_typed_vars[tname] = tnm
+                    self.dict_var_components[tname] = [nm for nm, _ in self.structured_type_components.get(tnm, [])]
+                    self.ints.discard(tname)
+                    self.reals.discard(tname)
+                    self.logs.discard(tname)
+                    self.alloc_ints.discard(tname)
+                    self.alloc_reals.discard(tname)
+                    self.alloc_logs.discard(tname)
+                    self.alloc_chars.discard(tname)
+                    self.alloc_complexes.discard(tname)
+                    self.alloc_int_rank.pop(tname, None)
+                    self.alloc_real_rank.pop(tname, None)
+                    self.alloc_log_rank.pop(tname, None)
+                    self.alloc_char_rank.pop(tname, None)
+                    self.alloc_complex_rank.pop(tname, None)
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
@@ -8017,8 +8295,76 @@ class translator(ast.NodeVisitor):
                     and t.id not in self.ints
                     and t.id not in self.reals
                 ):
-                    # Dict placeholders start as None/int sentinel in this subset.
-                    self._mark_int(t.id)
+                    keys = []
+                    kinds = {}
+                    ok = True
+                    for kk, vv in zip(v.keys, v.values):
+                        if not (isinstance(kk, ast.Constant) and isinstance(kk.value, str)):
+                            ok = False
+                            break
+                        kname = kk.value
+                        keys.append(kname)
+                        ek = self._expr_kind(vv)
+                        rr = self._rank_expr(vv)
+                        if rr > 0:
+                            if ek == "int":
+                                kinds[kname] = ("int_array", max(1, rr))
+                            elif ek == "logical":
+                                kinds[kname] = ("logical_array", max(1, rr))
+                            else:
+                                kinds[kname] = ("real_array", max(1, rr))
+                        else:
+                            if ek == "int":
+                                kinds[kname] = ("int_scalar", 0)
+                            elif ek == "logical":
+                                kinds[kname] = ("logical_scalar", 0)
+                            else:
+                                kinds[kname] = ("real_scalar", 0)
+                    matched_t = None
+                    if ok and keys:
+                        key_set = set(keys)
+                        for tnm, comps in self.dict_type_components.items():
+                            comp_keys = set(comps.keys())
+                            if comp_keys != key_set:
+                                continue
+                            good = True
+                            for kn in keys:
+                                have = kinds.get(kn, None)
+                                want = comps.get(kn, None)
+                                if have is None or want is None:
+                                    good = False
+                                    break
+                                if not (isinstance(want, tuple) and len(want) >= 2):
+                                    good = False
+                                    break
+                                if have[0] != want[0]:
+                                    good = False
+                                    break
+                                if "array" in have[0] and int(have[1]) != int(want[1]):
+                                    good = False
+                                    break
+                            if good:
+                                matched_t = tnm
+                                break
+                    if matched_t is not None:
+                        self.dict_typed_vars[t.id] = matched_t
+                        self.dict_var_components[t.id] = list(self.dict_type_components.get(matched_t, {}).keys())
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        self.alloc_int_rank.pop(t.id, None)
+                        self.alloc_real_rank.pop(t.id, None)
+                        self.alloc_log_rank.pop(t.id, None)
+                        self.alloc_char_rank.pop(t.id, None)
+                        self.alloc_complex_rank.pop(t.id, None)
+                    else:
+                        # Dict placeholders start as None/int sentinel in this subset.
+                        self._mark_int(t.id)
 
                 if isinstance(t, ast.Name) and isinstance(v, ast.List) and len(v.elts) == 0:
                     if self.context == "flat":
@@ -11755,6 +12101,7 @@ class translator(ast.NodeVisitor):
             parts = []
             for i, a in enumerate(args_nodes):
                 ae = self.expr(a)
+                ae = self._coerce_local_actual_kind(c.func.id, i, a, ae)
                 er = ranks[i] if i < len(ranks) else 0
                 ar = self._rank_expr(a)
                 if er == 2 and ar == 1:
@@ -12074,13 +12421,20 @@ def _emit_local_function(
     local_func_arg_kinds=None,
     local_func_defaults=None,
     local_void_funcs=None,
+    local_generic_overloads=None,
+    user_class_types=None,
+    local_func_dict_arg_types=None,
+    proc_name_override=None,
+    force_arg_kinds=None,
+    force_arg_ranks=None,
     elemental_funcs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     args = [a.arg for a in fn.args.args]
     if not args:
         raise NotImplementedError("local functions must have at least one argument")
-    ret_name = f"{fn.name}_result"
+    proc_name = proc_name_override or fn.name
+    ret_name = f"{proc_name}_result"
     if dict_return_spec is None:
         ret_vals = [s.value for s in ast.walk(fn) if isinstance(s, ast.Return) and s.value is not None]
         if ret_vals and all(isinstance(v, ast.Name) and v.id == ret_vals[0].id for v in ret_vals):
@@ -12212,8 +12566,12 @@ def _emit_local_function(
         tuple_return_out_kinds=tuple_return_out_kinds,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
+        local_func_arg_kinds=local_func_arg_kinds,
         local_func_defaults=local_func_defaults,
         local_void_funcs=local_void_funcs,
+        local_generic_overloads=local_generic_overloads,
+        user_class_types=user_class_types,
+        local_func_dict_arg_types=local_func_dict_arg_types,
     )
     # Scope comment emission to this procedure body; otherwise comments from
     # earlier procedures leak into the first emitted statement.
@@ -12221,7 +12579,10 @@ def _emit_local_function(
     is_elemental_fn = fn.name in set(elemental_funcs or set())
     for anm, tnm in (dict_arg_types or {}).items():
         tr.dict_typed_vars[anm] = tnm
-        tr.dict_var_components[anm] = list((dict_type_components or {}).get(tnm, {}).keys())
+        if tnm in (dict_type_components or {}):
+            tr.dict_var_components[anm] = list((dict_type_components or {}).get(tnm, {}).keys())
+        else:
+            tr.dict_var_components[anm] = [nm for nm, _ in tr.structured_type_components.get(tnm, [])]
         tr.ints.discard(anm)
         tr.reals.discard(anm)
         tr.alloc_ints.discard(anm)
@@ -12259,12 +12620,17 @@ def _emit_local_function(
         if is_elemental_fn:
             continue
         rr = _pre_arg_rank(a.arg)
+        if force_arg_ranks is not None and a.arg in force_arg_ranks:
+            rr = int(force_arg_ranks[a.arg])
         rk_hint = None
+        if force_arg_kinds is not None and a.arg in force_arg_kinds:
+            rk_hint = force_arg_kinds[a.arg]
         if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
             idxk = next((i for i, aa in enumerate(fn.args.args) if aa.arg == a.arg), -1)
             if idxk >= 0 and idxk < len(local_func_arg_kinds[fn.name]):
-                rk_hint = local_func_arg_kinds[fn.name][idxk]
-        if local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
+                if rk_hint is None:
+                    rk_hint = local_func_arg_kinds[fn.name][idxk]
+        if (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
@@ -12273,6 +12639,8 @@ def _emit_local_function(
                 tr._mark_alloc_int(a.arg, rank=rr)
             elif rk_hint == "logical":
                 tr._mark_alloc_log(a.arg, rank=rr)
+            elif rk_hint == "char":
+                tr._mark_alloc_char(a.arg, rank=rr)
             else:
                 tr._mark_alloc_real(a.arg, rank=rr)
 
@@ -12349,15 +12717,32 @@ def _emit_local_function(
     alloc_chars = sorted(alloc_chars_set)
 
     is_pure_fn = function_is_pure(fn, known_pure_calls=known_pure_calls)
+    # Preserve a declaration/body separator only when Python source had
+    # an explicit blank-line gap between body statements.
+    non_doc_stmts = [
+        s for s in fn.body
+        if not (
+            isinstance(s, ast.Expr)
+            and isinstance(getattr(s, "value", None), ast.Constant)
+            and isinstance(getattr(s.value, "value", None), str)
+        )
+    ]
+    keep_decl_blank = False
+    for i in range(len(non_doc_stmts) - 1):
+        l0 = getattr(non_doc_stmts[i], "lineno", None)
+        l1 = getattr(non_doc_stmts[i + 1], "lineno", None)
+        if isinstance(l0, int) and isinstance(l1, int) and (l1 - l0) > 1:
+            keep_decl_blank = True
+            break
     if is_elemental_fn and not tuple_return and not void_return:
         pure_prefix = "pure elemental " if is_pure_fn else "impure elemental "
     else:
         pure_prefix = "pure " if is_pure_fn else ""
     if tuple_return or void_return:
         sig = args + out_names
-        o.w(f"{pure_prefix}subroutine {fn.name}(" + ", ".join(sig) + ")")
+        o.w(f"{pure_prefix}subroutine {proc_name}(" + ", ".join(sig) + ")")
     else:
-        o.w(f"{pure_prefix}function {fn.name}(" + ", ".join(args) + f") result({ret_name})")
+        o.w(f"{pure_prefix}function {proc_name}(" + ", ".join(args) + f") result({ret_name})")
     o.push()
     emit_python_docstring_as_fortran_comments(o, fn)
     if not no_comment:
@@ -12488,11 +12873,16 @@ def _emit_local_function(
         ann_is_float = "float" in ann
         ann_is_bool = "bool" in ann or "logical" in ann
         hint_kind = None
+        if force_arg_kinds is not None and arg in force_arg_kinds:
+            hint_kind = force_arg_kinds[arg]
         if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
             idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
-                hint_kind = local_func_arg_kinds[fn.name][idx]
+                if hint_kind is None:
+                    hint_kind = local_func_arg_kinds[fn.name][idx]
         arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
+        if force_arg_ranks is not None and arg in force_arg_ranks:
+            arr_rank = int(force_arg_ranks[arg])
         if arg in tr.alloc_real_rank:
             arr_rank = max(arr_rank, int(tr.alloc_real_rank.get(arg, 0)))
         if arg in tr.alloc_int_rank:
@@ -12501,12 +12891,17 @@ def _emit_local_function(
             arr_rank = max(arr_rank, int(tr.alloc_log_rank.get(arg, 0)))
         if arg in tr.alloc_complex_rank:
             arr_rank = max(arr_rank, int(tr.alloc_complex_rank.get(arg, 0)))
-        if local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
+        if (force_arg_ranks is None or arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 arr_rank = max(arr_rank, int(local_func_arg_ranks[fn.name][idx]))
-        if is_elemental_fn:
-            if ann_is_bool or hint_kind == "logical":
+        if arg in (dict_arg_types or {}):
+            tnm = (dict_arg_types or {})[arg]
+            arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg}"
+        elif is_elemental_fn:
+            if hint_kind == "char":
+                arg_kind = "character(len=*)"
+            elif ann_is_bool or hint_kind == "logical":
                 arg_kind = "logical"
             elif ann_is_int or hint_kind == "int":
                 arg_kind = "integer"
@@ -12515,9 +12910,6 @@ def _emit_local_function(
             else:
                 arg_kind = "integer"
             arg_decl = f"{arg_kind}, intent(in) :: {arg}"
-        elif arg in (dict_arg_types or {}):
-            tnm = (dict_arg_types or {})[arg]
-            arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg}"
         elif arg in tr.alloc_ints:
             if arr_rank > 0:
                 dims = ",".join(":" for _ in range(arr_rank))
@@ -12544,12 +12936,14 @@ def _emit_local_function(
                 arg_decl = f"character(len=*), intent({intent_txt}) :: {arg}(:)"
         elif arr_rank > 0:
             dflt = defaults_map.get(arg, None)
-            if ann_is_bool or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, bool)):
+            if hint_kind == "char":
+                arg_kind = "character(len=*)"
+            elif hint_kind == "logical" or ann_is_bool or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, bool)):
                 arg_kind = "logical"
-            elif ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
+            elif hint_kind == "int" or ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
                 arg_kind = "integer"
             elif (
-                (ann_is_float or arg in tr.reals or arg in tr.alloc_reals)
+                (hint_kind == "real" or ann_is_float or arg in tr.reals or arg in tr.alloc_reals)
                 or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, float))
                 or _arg_real_context(arg)
             ):
@@ -12564,12 +12958,14 @@ def _emit_local_function(
             arg_decl = f"real(kind=dp), intent({intent_txt}) :: {arg}({dims})"
         else:
             dflt = defaults_map.get(arg, None)
-            if ann_is_bool or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, bool)):
+            if hint_kind == "char":
+                arg_kind = "character(len=*)"
+            elif hint_kind == "logical" or ann_is_bool or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, bool)):
                 arg_kind = "logical"
-            elif ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
+            elif hint_kind == "int" or ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
                 arg_kind = "integer"
             elif (
-                (ann_is_float or arg in tr.reals)
+                (hint_kind == "real" or ann_is_float or arg in tr.reals)
                 or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, float))
                 or _arg_real_context(arg)
             ):
@@ -12619,6 +13015,8 @@ def _emit_local_function(
             ret_spec = local_return_specs.get(fn.name)
         if dict_return:
             ret_decl = f"type({dict_return_spec['type_name']})"
+        elif fn.returns is not None and hasattr(ast, "unparse") and (ast.unparse(fn.returns) in dict(user_class_types or {})):
+            ret_decl = f"type({dict(user_class_types or {})[ast.unparse(fn.returns)]})"
         elif ret_spec in {"alloc_real", "alloc_int", "alloc_log"}:
             rr = 1
             if returns:
@@ -12714,7 +13112,8 @@ def _emit_local_function(
         rr = max(1, tr.alloc_char_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"character(len=:), allocatable :: {nm}({dims})")
-    o.w("")
+    if keep_decl_blank:
+        o.w("")
     for i, s in enumerate(fn.body):
         if (
             dict_return
@@ -12762,9 +13161,9 @@ def _emit_local_function(
         tr.visit(s)
     o.pop()
     if tuple_return or void_return:
-        o.w(f"end subroutine {fn.name}")
+        o.w(f"end subroutine {proc_name}")
     else:
-        o.w(f"end function {fn.name}")
+        o.w(f"end function {proc_name}")
     o.w("")
 
 
@@ -12852,7 +13251,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
 
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
-    structured_type_components=None, structured_array_types=None, structured_dtype_strings=None
+    structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None
 ):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
     def _infer_arg_rank_in_fn(fn, nm):
@@ -12881,6 +13280,9 @@ def generate_flat(
     # Gather call-site rank/kind hints for local function arguments.
     call_rank_hints = {fn.name: [0 for _ in fn.args.args] for fn in (local_funcs or [])}
     call_kind_hints = {fn.name: [None for _ in fn.args.args] for fn in (local_funcs or [])}
+    call_kind_sets = {fn.name: [set() for _ in fn.args.args] for fn in (local_funcs or [])}
+    call_rank_sets = {fn.name: [set() for _ in fn.args.args] for fn in (local_funcs or [])}
+    call_kind_rank_pairs = {fn.name: [set() for _ in fn.args.args] for fn in (local_funcs or [])}
     if local_funcs:
         tr_seed = translator(emit(), params=params, context="flat", list_counts=list_counts)
         tr_seed.prescan(tree.body)
@@ -12895,13 +13297,25 @@ def generate_flat(
                     continue
                 rr = call_rank_hints[callee]
                 rk = call_kind_hints[callee]
+                rks = call_kind_sets[callee]
+                rrs = call_rank_sets[callee]
+                krp = call_kind_rank_pairs[callee]
                 for i, a in enumerate(n.args):
                     if i >= len(rr):
                         break
-                    rr[i] = max(rr[i], tr_seed._rank_expr(a))
+                    ar = tr_seed._rank_expr(a)
+                    rr[i] = max(rr[i], ar)
+                    rrs[i].add(ar)
                     ak = tr_seed._expr_kind(a)
-                    if rk[i] is None and ak is not None:
-                        rk[i] = ak
+                    if ak is not None:
+                        krp[i].add((ak, ar))
+                        rks[i].add(ak)
+                        if rk[i] is None:
+                            rk[i] = ak
+                        elif rk[i] != ak:
+                            # Mixed numeric calls: prefer real.
+                            if "real" in {rk[i], ak} and "logical" not in {rk[i], ak}:
+                                rk[i] = "real"
 
     local_return_specs, tuple_return_out_kinds = _local_return_maps(
         local_funcs,
@@ -12979,13 +13393,69 @@ def generate_flat(
         if (not has_value_return) and (fn.name not in tuple_return_funcs) and (fn.name not in dict_return_specs):
             local_void_funcs.add(fn.name)
 
+    def _is_print_only_void(fn):
+        for st in fn.body:
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str):
+                continue
+            if isinstance(st, ast.Pass):
+                continue
+            if isinstance(st, ast.Return) and st.value is None:
+                continue
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Name) and st.value.func.id == "print":
+                continue
+            return False
+        return True
+
+    local_overload_specs = {}
+    for fn in (local_funcs or []):
+        if fn.name not in local_void_funcs:
+            continue
+        if len(fn.args.args) != 1:
+            continue
+        if not _is_print_only_void(fn):
+            continue
+        pairs = set(call_kind_rank_pairs.get(fn.name, [set()])[0])
+        if not pairs:
+            continue
+        arg0 = fn.args.args[0].arg
+        pairs = [(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char"} and r in {0, 1}]
+        if not pairs:
+            continue
+        if len(set(pairs)) == 1:
+            continue
+        specs = []
+        seen = set()
+        for k, r in pairs:
+            key = (k, r)
+            if key in seen:
+                continue
+            seen.add(key)
+            suf = "s" if r == 0 else f"r{r}"
+            pname = f"{fn.name}_{k}_{suf}"
+            specs.append((pname, {arg0: k}, {arg0: r}))
+        local_overload_specs[fn.name] = specs
+        # Generic handles kinds/ranks directly; avoid forcing single-kind coercion.
+        local_func_arg_kinds[fn.name][0] = None
+    local_generic_overloads = set(local_overload_specs.keys())
+    pure_local_calls = set(known_pure_calls or set()) | set((user_class_types or {}).keys())
+
     elemental_targets = set(translator.global_vectorize_aliases.values())
     for fn in (local_funcs or []):
         if fn.name in tuple_return_funcs:
             continue
         if fn.name in dict_return_specs:
             continue
-        if not function_is_pure(fn, known_pure_calls=known_pure_calls):
+        # Skip elemental auto-marking for user-defined class/dataclass typed signatures.
+        has_user_type = False
+        for a in fn.args.args:
+            if a.annotation is not None and hasattr(ast, "unparse") and ast.unparse(a.annotation) in dict(user_class_types or {}):
+                has_user_type = True
+                break
+        if (not has_user_type) and fn.returns is not None and hasattr(ast, "unparse"):
+            has_user_type = ast.unparse(fn.returns) in dict(user_class_types or {})
+        if has_user_type:
+            continue
+        if not function_is_pure(fn, known_pure_calls=pure_local_calls):
             continue
         base_ranks = base_func_arg_ranks.get(fn.name, [])
         if any(int(rr) > 0 for rr in base_ranks):
@@ -13069,11 +13539,54 @@ def generate_flat(
                     target_o.w(f"real(kind=dp) :: {fname}")
                 elif fkind == "logical":
                     target_o.w(f"logical :: {fname}")
+                elif fkind == "char":
+                    target_o.w(f"character(len=:), allocatable :: {fname}")
                 else:
                     target_o.w(f"integer :: {fname}")
             target_o.pop()
             target_o.w(f"end type {tname}")
         return type_names
+
+    def _arg_dict_types_for_fn(fn):
+        out = {}
+        for a in fn.args.args:
+            anm = a.arg
+            if (
+                a.annotation is not None
+                and hasattr(ast, "unparse")
+                and ast.unparse(a.annotation) in dict(user_class_types or {})
+            ):
+                out[anm] = dict(user_class_types or {})[ast.unparse(a.annotation)]
+                continue
+            keys = set()
+            for st in ast.walk(fn):
+                if (
+                    isinstance(st, ast.Subscript)
+                    and isinstance(st.value, ast.Name)
+                    and st.value.id == anm
+                    and isinstance(st.slice, ast.Constant)
+                    and isinstance(st.slice.value, str)
+                ):
+                    keys.add(st.slice.value)
+            if not keys:
+                continue
+            matches = []
+            for tnm, comps in dict_type_components.items():
+                if keys.issubset(set(comps.keys())):
+                    matches.append(tnm)
+            if len(matches) >= 1:
+                out[anm] = sorted(matches)[0]
+        return out
+
+    local_func_dict_arg_types = {}
+    for fn in (local_funcs or []):
+        by_name = _arg_dict_types_for_fn(fn)
+        by_idx = {}
+        for i, a in enumerate(fn.args.args):
+            if a.arg in by_name:
+                by_idx[i] = by_name[a.arg]
+        if by_idx:
+            local_func_dict_arg_types[fn.name] = by_idx
 
     module_text = ""
     if use_proc_module:
@@ -13092,52 +13605,71 @@ def generate_flat(
         proc_public_syms = sorted(set(["dp"] + [fn.name for fn in local_funcs] + type_names))
         if proc_public_syms:
             om.w("public :: " + ", ".join(proc_public_syms))
+        for gname in sorted(local_generic_overloads):
+            om.w(f"interface {gname}")
+            om.push()
+            for pname, _, _ in local_overload_specs[gname]:
+                om.w(f"module procedure {pname}")
+            om.pop()
+            om.w(f"end interface {gname}")
         om.pop()
         om.w("")
         om.w("contains")
         om.w("")
         for fn in local_funcs:
-            arg_dict_types = {}
-            for a in fn.args.args:
-                anm = a.arg
-                keys = set()
-                for st in ast.walk(fn):
-                    if (
-                        isinstance(st, ast.Subscript)
-                        and isinstance(st.value, ast.Name)
-                        and st.value.id == anm
-                        and isinstance(st.slice, ast.Constant)
-                        and isinstance(st.slice.value, str)
-                    ):
-                        keys.add(st.slice.value)
-                if not keys:
-                    continue
-                matches = []
-                for tnm, comps in dict_type_components.items():
-                    if keys.issubset(set(comps.keys())):
-                        matches.append(tnm)
-                if len(matches) >= 1:
-                    arg_dict_types[anm] = sorted(matches)[0]
-            _emit_local_function(
-                om,
-                fn,
-                params,
-                no_comment=no_comment,
-                known_pure_calls=known_pure_calls,
-                comment_map=comment_map,
-                dict_return_spec=dict_return_specs.get(fn.name),
-                dict_return_types=dict_return_types,
-                local_return_specs=local_return_specs,
-                tuple_return_out_kinds=tuple_return_out_kinds,
-                tuple_return_funcs=tuple_return_funcs,
-                dict_type_components=dict_type_components,
-                dict_arg_types=arg_dict_types,
-                local_func_arg_ranks=local_func_arg_ranks,
-                local_func_arg_kinds=local_func_arg_kinds,
-                local_func_defaults=local_func_defaults,
-                local_void_funcs=local_void_funcs,
-                elemental_funcs=elemental_targets,
-            )
+            arg_dict_types = _arg_dict_types_for_fn(fn)
+            if fn.name in local_overload_specs:
+                for pname, forced_kinds, forced_ranks in local_overload_specs[fn.name]:
+                    _emit_local_function(
+                        om,
+                        fn,
+                        params,
+                        no_comment=no_comment,
+                        known_pure_calls=pure_local_calls,
+                        comment_map=comment_map,
+                        dict_return_spec=dict_return_specs.get(fn.name),
+                        dict_return_types=dict_return_types,
+                        local_return_specs=local_return_specs,
+                        tuple_return_out_kinds=tuple_return_out_kinds,
+                        tuple_return_funcs=tuple_return_funcs,
+                        dict_type_components=dict_type_components,
+                        dict_arg_types=arg_dict_types,
+                        local_func_arg_ranks=local_func_arg_ranks,
+                        local_func_arg_kinds=local_func_arg_kinds,
+                        local_func_defaults=local_func_defaults,
+                        local_void_funcs=local_void_funcs,
+                        local_generic_overloads=local_generic_overloads,
+                        user_class_types=user_class_types,
+                        local_func_dict_arg_types=local_func_dict_arg_types,
+                        proc_name_override=pname,
+                        force_arg_kinds=forced_kinds,
+                        force_arg_ranks=forced_ranks,
+                        elemental_funcs=elemental_targets,
+                    )
+            else:
+                _emit_local_function(
+                    om,
+                    fn,
+                    params,
+                    no_comment=no_comment,
+                    known_pure_calls=pure_local_calls,
+                    comment_map=comment_map,
+                    dict_return_spec=dict_return_specs.get(fn.name),
+                    dict_return_types=dict_return_types,
+                    local_return_specs=local_return_specs,
+                    tuple_return_out_kinds=tuple_return_out_kinds,
+                    tuple_return_funcs=tuple_return_funcs,
+                    dict_type_components=dict_type_components,
+                    dict_arg_types=arg_dict_types,
+                    local_func_arg_ranks=local_func_arg_ranks,
+                    local_func_arg_kinds=local_func_arg_kinds,
+                    local_func_defaults=local_func_defaults,
+                    local_void_funcs=local_void_funcs,
+                    local_generic_overloads=local_generic_overloads,
+                    user_class_types=user_class_types,
+                    local_func_dict_arg_types=local_func_dict_arg_types,
+                    elemental_funcs=elemental_targets,
+                )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
 
@@ -13172,8 +13704,12 @@ def generate_flat(
         tuple_return_out_kinds=tuple_return_out_kinds,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
+        local_func_arg_kinds=local_func_arg_kinds,
         local_func_defaults=local_func_defaults,
         local_void_funcs=local_void_funcs,
+        local_generic_overloads=local_generic_overloads,
+        user_class_types=user_class_types,
+        local_func_dict_arg_types=local_func_dict_arg_types,
         structured_type_components=structured_type_components,
         structured_array_types=structured_array_types,
         structured_dtype_strings=structured_dtype_strings,
@@ -13257,33 +13793,13 @@ def generate_flat(
         o.w("contains")
         o.w("")
         for fn in local_funcs:
-            arg_dict_types = {}
-            for a in fn.args.args:
-                anm = a.arg
-                keys = set()
-                for st in ast.walk(fn):
-                    if (
-                        isinstance(st, ast.Subscript)
-                        and isinstance(st.value, ast.Name)
-                        and st.value.id == anm
-                        and isinstance(st.slice, ast.Constant)
-                        and isinstance(st.slice.value, str)
-                    ):
-                        keys.add(st.slice.value)
-                if not keys:
-                    continue
-                matches = []
-                for tnm, comps in dict_type_components.items():
-                    if keys.issubset(set(comps.keys())):
-                        matches.append(tnm)
-                if len(matches) >= 1:
-                    arg_dict_types[anm] = sorted(matches)[0]
+            arg_dict_types = _arg_dict_types_for_fn(fn)
             _emit_local_function(
                 o,
                 fn,
                 params,
                 no_comment=no_comment,
-                known_pure_calls=known_pure_calls,
+                known_pure_calls=pure_local_calls,
                 comment_map=comment_map,
                 dict_return_spec=dict_return_specs.get(fn.name),
                 dict_return_types=dict_return_types,
@@ -13296,6 +13812,9 @@ def generate_flat(
                 local_func_arg_kinds=local_func_arg_kinds,
                 local_func_defaults=local_func_defaults,
                 local_void_funcs=local_void_funcs,
+                local_generic_overloads=local_generic_overloads,
+                user_class_types=user_class_types,
+                local_func_dict_arg_types=local_func_dict_arg_types,
                 elemental_funcs=elemental_targets,
             )
 
@@ -13664,7 +14183,7 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
 
 
 def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None):
-    src = Path(py_path).read_text(encoding="utf-8")
+    src = Path(py_path).read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
     translator.global_synthetic_slices = {}
     translator.global_vectorize_aliases = {}
@@ -13741,6 +14260,10 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     params = find_parameters(effective_tree)
     translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
     structured_type_components, structured_array_types, structured_dtype_strings = collect_structured_dtype_info(effective_tree)
+    user_class_types, user_type_components = collect_dataclass_info(tree)
+    for tnm, fields in user_type_components.items():
+        if tnm not in structured_type_components:
+            structured_type_components[tnm] = fields
     helper_scan_tree = effective_tree
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
@@ -13768,6 +14291,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
             structured_type_components=structured_type_components,
             structured_array_types=structured_array_types,
             structured_dtype_strings=structured_dtype_strings,
+            user_class_types=user_class_types,
         )
         used_flat_fallback = False
     else:
@@ -13793,6 +14317,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
                 structured_type_components=structured_type_components,
                 structured_array_types=structured_array_types,
                 structured_dtype_strings=structured_dtype_strings,
+                user_class_types=user_class_types,
             )
             used_flat_fallback = True
 
