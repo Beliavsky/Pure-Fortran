@@ -868,6 +868,7 @@ def detect_needed_helpers(tree):
         "cov": {"cov2_real", "cov_matrix_rows_real"},
         "corrcoef": {"corrcoef2_real"},
         "pad": {"pad2d_int", "pad2d_real"},
+        "allclose": {"allclose"},
         "polyval": {"polyval"},
         "polyder": {"polyder"},
     }
@@ -3010,6 +3011,14 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr in {"logical_and", "logical_or", "logical_xor"}
+                and len(node.args) >= 2
+            ):
+                return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "allclose"
                 and len(node.args) >= 2
             ):
                 return "logical"
@@ -5583,6 +5592,47 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "logical_or":
                     return f"({l0} .or. {l1})"
                 return f"({l0} .neqv. {l1})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "allclose"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                a1 = self.expr(node.args[1])
+                rtol = "1.0e-5_dp"
+                atol = "1.0e-8_dp"
+                equal_nan = ".false."
+                if len(node.args) >= 3:
+                    rtol = self.expr(node.args[2])
+                if len(node.args) >= 4:
+                    atol = self.expr(node.args[3])
+                for kw in node.keywords:
+                    if kw.arg == "rtol":
+                        rtol = self.expr(kw.value)
+                    elif kw.arg == "atol":
+                        atol = self.expr(kw.value)
+                    elif kw.arg == "equal_nan":
+                        if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                            equal_nan = ".true." if kw.value.value else ".false."
+                        else:
+                            ev = self.expr(kw.value)
+                            if self._expr_kind(kw.value) == "logical":
+                                equal_nan = ev
+                            else:
+                                equal_nan = f"({ev} /= 0)"
+                r0 = self._rank_expr(node.args[0])
+                r1 = self._rank_expr(node.args[1])
+                if r0 == 0:
+                    aa = f"[real({a0}, kind=dp)]"
+                else:
+                    aa = f"reshape(real({a0}, kind=dp), [size({a0})])"
+                if r1 == 0:
+                    bb = f"[real({a1}, kind=dp)]"
+                else:
+                    bb = f"reshape(real({a1}, kind=dp), [size({a1})])"
+                return f"allclose({aa}, {bb}, real({rtol}, kind=dp), real({atol}, kind=dp), {equal_nan})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)

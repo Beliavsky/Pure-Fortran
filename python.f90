@@ -173,6 +173,8 @@ public :: moveaxis3_real !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(d
 public :: moveaxis3_logical !@pyapi kind=function ret=logical(:,:,:) args=a:logical(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 logical arrays (NumPy-style indices)"
 public :: pad2d_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:integer:intent(in) desc="2D constant pad for integer matrix"
 public :: pad2d_real !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:real(dp):intent(in) desc="2D constant pad for real matrix"
+public :: allclose !@pyapi kind=function ret=logical args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="NumPy-like allclose on 1D arrays"
+public :: allclose_integer !@pyapi kind=function ret=logical args=a:integer(:):intent(in),b:integer(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional desc="NumPy-like allclose on 1D integer arrays"
 public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="2x2 covariance matrix for two real vectors"
 public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional desc="covariance matrix for observations in rows (numpy rowvar=False)"
 public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
@@ -274,6 +276,10 @@ end interface polyval
 interface polyder
    module procedure polyder_real
 end interface polyder
+
+interface allclose
+   module procedure allclose_real, allclose_integer
+end interface allclose
 
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
@@ -3378,6 +3384,61 @@ contains
          out = c
          out(pt+1:pt+n0, pl+1:pl+n1) = a
       end function pad2d_real
+
+      logical function allclose_real(a, b, rtol, atol, equal_nan)
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), intent(in), optional :: rtol, atol
+         logical, intent(in), optional :: equal_nan
+         real(kind=dp) :: rtolv, atolv
+         logical :: eqnan
+         integer :: i
+         rtolv = 1.0e-5_dp
+         atolv = 1.0e-8_dp
+         eqnan = .false.
+         if (present(rtol)) rtolv = rtol
+         if (present(atol)) atolv = atol
+         if (present(equal_nan)) eqnan = equal_nan
+         if (size(a) /= size(b)) then
+            allclose_real = .false.
+            return
+         end if
+         allclose_real = .true.
+         do i = 1, size(a)
+            if (ieee_is_nan(a(i)) .or. ieee_is_nan(b(i))) then
+               if (.not. (eqnan .and. ieee_is_nan(a(i)) .and. ieee_is_nan(b(i)))) then
+                  allclose_real = .false.
+                  return
+               end if
+            else
+               if (abs(a(i) - b(i)) > atolv + rtolv * abs(b(i))) then
+                  allclose_real = .false.
+                  return
+               end if
+            end if
+         end do
+      end function allclose_real
+
+      logical function allclose_integer(a, b, rtol, atol)
+         integer, intent(in) :: a(:), b(:)
+         real(kind=dp), intent(in), optional :: rtol, atol
+         real(kind=dp) :: rtolv, atolv
+         integer :: i
+         rtolv = 1.0e-5_dp
+         atolv = 1.0e-8_dp
+         if (present(rtol)) rtolv = rtol
+         if (present(atol)) atolv = atol
+         if (size(a) /= size(b)) then
+            allclose_integer = .false.
+            return
+         end if
+         allclose_integer = .true.
+         do i = 1, size(a)
+            if (abs(real(a(i), kind=dp) - real(b(i), kind=dp)) > atolv + rtolv * abs(real(b(i), kind=dp))) then
+               allclose_integer = .false.
+               return
+            end if
+         end do
+      end function allclose_integer
 
       function cov2_real(x, y, ddof) result(c)
          real(kind=dp), intent(in) :: x(:), y(:)
