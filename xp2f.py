@@ -340,10 +340,33 @@ def function_is_pure(fn_node, known_pure_calls=None):
         "max",
         "range",
     }
+    pure_np_calls = {
+        "sqrt",
+        "empty",
+        "asarray",
+        "array",
+        "zeros_like",
+        "ones_like",
+        "abs",
+        "max",
+        "min",
+        "sum",
+        "dot",
+        "matmul",
+    }
+    pure_methods = {"reshape", "ravel", "flatten", "copy"}
 
     class scan(ast.NodeVisitor):
         def __init__(self):
             self.ok = True
+
+        def visit_Raise(self, node):
+            # Exceptions are not emitted as executable calls in generated Fortran.
+            return
+
+        def visit_Assert(self, node):
+            # Assertions are treated as compile-time/validation-only in this path.
+            return
 
         def visit_Call(self, node):
             if not self.ok:
@@ -362,13 +385,18 @@ def function_is_pure(fn_node, known_pure_calls=None):
                     return
             elif isinstance(node.func, ast.Attribute):
                 # Allow selected numpy intrinsics lowered without side effects.
-                if not (
+                if (
                     isinstance(node.func.value, ast.Name)
                     and node.func.value.id == "np"
-                    and node.func.attr in {"sqrt", "empty"}
+                    and node.func.attr in pure_np_calls
                 ):
-                    self.ok = False
+                    self.generic_visit(node)
                     return
+                if node.func.attr in pure_methods:
+                    self.generic_visit(node)
+                    return
+                self.ok = False
+                return
             else:
                 self.ok = False
                 return
@@ -431,6 +459,8 @@ def rename_conflicting_identifiers(src_text):
         "parameter", "allocatable", "intent", "in", "out", "inout", "call", "return",
         "stop", "select", "case", "where", "forall", "block", "interface", "type",
         "public", "private", "only",
+        # readability
+        "l",
         # common intrinsics that often collide with variable names
         "abs", "acos", "asin", "atan", "atan2", "ceiling", "cos", "count", "dot_product",
         "exp", "floor", "huge", "int", "kind", "len", "log", "log10", "max", "maxval",
@@ -476,7 +506,9 @@ def rename_conflicting_identifiers(src_text):
 
     def _fresh_name(old):
         # Fortran identifiers must start with a letter.
-        if old and old[0].isalpha():
+        if old.lower() == "l":
+            cand = "ell"
+        elif old and old[0].isalpha():
             cand = old + "_"
         else:
             cand = "v" + old
@@ -512,7 +544,8 @@ def rename_conflicting_identifiers(src_text):
                 continue
             nm = mm.group(1)
             if nm.lower() in forbidden or not nm[0].isalpha():
-                rename_map[nm] = _fresh_name(nm)
+                if nm not in rename_map:
+                    rename_map[nm] = _fresh_name(nm)
 
     if not rename_map:
         return src_text
@@ -543,6 +576,58 @@ def rename_conflicting_identifiers(src_text):
 
 def simplify_generated_parentheses(lines):
     """Targeted paren cleanup that preserves indentation/layout."""
+    def _simplify_intrinsic_single_arg_double_parens(code, fname):
+        low = code.lower()
+        fn = fname.lower()
+        i = 0
+        out = []
+        while i < len(code):
+            j = low.find(fn, i)
+            if j < 0:
+                out.append(code[i:])
+                break
+            # identifier boundary
+            if j > 0 and (low[j - 1].isalnum() or low[j - 1] == "_"):
+                out.append(code[i:j + len(fn)])
+                i = j + len(fn)
+                continue
+            k = j + len(fn)
+            while k < len(code) and code[k].isspace():
+                k += 1
+            if k >= len(code) or code[k] != "(":
+                out.append(code[i:j + len(fn)])
+                i = j + len(fn)
+                continue
+
+            # find matching ')' of call
+            p = k
+            depth = 0
+            while p < len(code):
+                ch = code[p]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                p += 1
+            if p >= len(code):
+                out.append(code[i:])
+                break
+
+            arg = code[k + 1:p]
+            arg_s = arg.strip()
+            if arg_s.startswith("(") and arg_s.endswith(")"):
+                arg2 = strip_redundant_outer_parens_expr(arg_s)
+                if arg2 != arg_s:
+                    out.append(code[i:j])
+                    out.append(code[j:k + 1] + arg2 + ")")
+                    i = p + 1
+                    continue
+            out.append(code[i:p + 1])
+            i = p + 1
+        return "".join(out)
+
     out = []
     do_re = re.compile(
         r"^(\s*do\s+[a-z_]\w*\s*=\s*)([^,]+)(\s*,\s*[^,]+)?(\s*,\s*[^,]+)?(\s*)$",
@@ -573,6 +658,11 @@ def simplify_generated_parentheses(lines):
         # x((i+1)) -> x(i+1)
         code = re.sub(r"\(\(([^()]+)\)\)", r"(\1)", code)
 
+        # Intrinsic single-argument form cleanup:
+        # abs((expr)) -> abs(expr), robust to nested calls inside expr.
+        for fn in ("abs", "sqrt", "exp", "log", "sin", "cos", "tan"):
+            code = _simplify_intrinsic_single_arg_double_parens(code, fn)
+
         # Keyword args like dim=(1) -> dim=1
         code = re.sub(r"\b(dim|axis|ncopies)\s*=\s*\(\s*([^()]+?)\s*\)", r"\1=\2", code, flags=re.IGNORECASE)
 
@@ -596,6 +686,670 @@ def simplify_generated_parentheses(lines):
             out.append(code + bang + comment)
         else:
             out.append(code)
+    return out
+
+
+def simplify_index_arithmetic_notation(lines):
+    """Simplify noisy index arithmetic emitted by conservative lowering."""
+    out = []
+    re_nested_add1 = re.compile(
+        r"\(\s*\(\s*([a-z_]\w*)\s*\+\s*(\d+)\s*\)\s*\+\s*(\d+)\s*\)",
+        re.IGNORECASE,
+    )
+    # In index/arg-list contexts, (i + 1) -> i + 1 is safe and more readable.
+    re_idx_paren = re.compile(
+        r"(?<=[(:,])\s*\(\s*([a-z_]\w*(?:\s*[+\-]\s*\d+)?)\s*\)\s*(?=[,:)])",
+        re.IGNORECASE,
+    )
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        # Fold obvious literal offset noise in loop bounds.
+        code = re.sub(r"(?<![\w.])-1\s*\+\s*1(?![\w.])", "0", code)
+        code = re.sub(r",\s*-1\s*\+\s*1\s*,", ", 0,", code)
+        # ((i + 1) + 1) -> (i + 2)
+        def _nested_add_repl(m):
+            nm = m.group(1)
+            a = int(m.group(2))
+            b = int(m.group(3))
+            return f"({nm} + {a + b})"
+        prev = None
+        while prev != code:
+            prev = code
+            code = re_nested_add1.sub(_nested_add_repl, code)
+        # (i + 1) in index positions -> i + 1
+        code = re_idx_paren.sub(r"\1", code)
+        if bang:
+            out.append(code + bang + comment)
+        else:
+            out.append(code)
+    return out
+
+
+def simplify_allocate_default_lower_bounds(lines):
+    """Omit explicit lower bounds of 1 in ALLOCATE array specs."""
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        if re.match(r"^\s*allocate\s*\(", code, flags=re.IGNORECASE):
+            # In ALLOCATE specs, "1:ub" is equivalent to "ub".
+            code = re.sub(r"(?<=\(|,)\s*1\s*:\s*", "", code)
+        if bang:
+            out.append(code + bang + comment)
+        else:
+            out.append(code)
+    return out
+
+
+def simplify_redundant_int_casts(lines):
+    """Remove `int(...)` when argument is already an integer literal/symbol."""
+    int_names = set()
+    decl_re = re.compile(r"^\s*integer\b[^!]*::\s*([^!]+)$", flags=re.IGNORECASE)
+    name_re = re.compile(r"^[A-Za-z_]\w*$")
+
+    for ln in lines:
+        code = ln.split("!", 1)[0]
+        m = decl_re.match(code)
+        if not m:
+            continue
+        rhs = m.group(1)
+        for part in rhs.split(","):
+            tok = part.strip()
+            if not tok:
+                continue
+            tok = tok.split("=", 1)[0].strip()
+            tok = re.sub(r"\(.*\)$", "", tok).strip()
+            if name_re.match(tok):
+                int_names.add(tok.lower())
+
+    out = []
+    pat_lit = re.compile(r"\bint\(\s*([+-]?\d+)\s*\)", flags=re.IGNORECASE)
+    pat_sym = re.compile(r"\bint\(\s*([A-Za-z_]\w*)\s*\)", flags=re.IGNORECASE)
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        code = pat_lit.sub(r"\1", code)
+        code = pat_sym.sub(
+            lambda m: m.group(1) if m.group(1).lower() in int_names else m.group(0),
+            code,
+        )
+        if bang:
+            out.append(code + bang + comment)
+        else:
+            out.append(code)
+    return out
+
+
+def enforce_space_before_inline_comments(lines):
+    """Ensure inline `!` comments are preceded by at least one space."""
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        if not bang:
+            out.append(ln)
+            continue
+        if code.strip() == "":
+            # Pure comment line; keep as-is.
+            out.append(ln)
+            continue
+        code = code.rstrip()
+        if not code.endswith(" "):
+            code = code + " "
+        out.append(code + bang + comment)
+    return out
+
+
+def remove_unused_ieee_arithmetic_use(lines):
+    """Drop intrinsic ieee_arithmetic USE lines when ieee symbols are not referenced."""
+    out = list(lines)
+    n = len(out)
+    unit_start_re = re.compile(r"^\s*(program|module)\s+\w+", flags=re.IGNORECASE)
+    unit_end_re = re.compile(r"^\s*end\s+(program|module)\b", flags=re.IGNORECASE)
+    use_ieee_re = re.compile(r"^\s*use\s*,\s*intrinsic\s*::\s*ieee_arithmetic\b", flags=re.IGNORECASE)
+    ieee_syms = ("ieee_value", "ieee_quiet_nan", "ieee_is_finite", "ieee_is_nan")
+
+    i = 0
+    remove_idxs = set()
+    while i < n:
+        if not unit_start_re.match(out[i]):
+            i += 1
+            continue
+        u0 = i
+        j = i + 1
+        while j < n and not unit_end_re.match(out[j]):
+            j += 1
+        if j >= n:
+            break
+        u1 = j
+
+        k = u0
+        while k <= u1:
+            if not use_ieee_re.match(out[k]):
+                k += 1
+                continue
+            s0 = k
+            s1 = k
+            while s1 < u1 and out[s1].rstrip().endswith("&"):
+                if s1 + 1 <= u1 and out[s1 + 1].lstrip().startswith("&"):
+                    s1 += 1
+                else:
+                    break
+
+            body_txt = "\n".join(out[t] for t in range(u0, u1 + 1) if not (s0 <= t <= s1))
+            used = any(re.search(rf"\b{nm}\b", body_txt, flags=re.IGNORECASE) for nm in ieee_syms)
+            if not used:
+                for t in range(s0, s1 + 1):
+                    remove_idxs.add(t)
+            k = s1 + 1
+        i = u1 + 1
+
+    if not remove_idxs:
+        return out
+    return [ln for idx, ln in enumerate(out) if idx not in remove_idxs]
+
+
+def remove_unused_use_only_imports(lines):
+    """Prune unused symbols from `use ..., only: ...` statements per program/module unit."""
+    out = list(lines)
+    n = len(out)
+    unit_start_re = re.compile(r"^\s*(program|module)\s+\w+", flags=re.IGNORECASE)
+    unit_end_re = re.compile(r"^\s*end\s+(program|module)\b", flags=re.IGNORECASE)
+    use_only_re = re.compile(
+        r"^(\s*use(?:\s*,\s*intrinsic)?\s*(?:::)?\s*[^!\n]+?\s*,\s*only\s*:\s*)(.*)$",
+        flags=re.IGNORECASE,
+    )
+
+    i = 0
+    while i < n:
+        if not unit_start_re.match(out[i]):
+            i += 1
+            continue
+        u0 = i
+        j = i + 1
+        while j < n and not unit_end_re.match(out[j]):
+            j += 1
+        if j >= n:
+            break
+        u1 = j
+
+        k = u0 + 1
+        while k < u1:
+            m = use_only_re.match(out[k])
+            if not m:
+                k += 1
+                continue
+            s0 = k
+            s1 = k
+            while s1 < u1 and out[s1].rstrip().endswith("&"):
+                if s1 + 1 <= u1 and out[s1 + 1].lstrip().startswith("&"):
+                    s1 += 1
+                else:
+                    break
+
+            prefix = m.group(1)
+            payload = m.group(2).rstrip()
+            for t in range(s0 + 1, s1 + 1):
+                seg = out[t].strip()
+                if seg.startswith("&"):
+                    seg = seg[1:].lstrip()
+                payload += " " + seg.rstrip()
+            payload = payload.replace("&", " ")
+            items = [p.strip() for p in payload.split(",") if p.strip()]
+            if not items:
+                k = s1 + 1
+                continue
+
+            unit_body = []
+            for t in range(u0, u1 + 1):
+                if s0 <= t <= s1:
+                    continue
+                unit_body.append(out[t])
+            body_txt = "\n".join(unit_body)
+
+            kept = []
+            for it in items:
+                if "=>" in it:
+                    lhs = it.split("=>", 1)[0].strip()
+                    check = lhs
+                else:
+                    check = it
+                if check and re.search(rf"\b{re.escape(check)}\b", body_txt, flags=re.IGNORECASE):
+                    kept.append(it)
+
+            indent = re.match(r"^(\s*)", out[s0]).group(1)
+            if kept:
+                out[s0] = f"{prefix}{', '.join(kept)}"
+                for t in range(s0 + 1, s1 + 1):
+                    out[t] = ""
+            else:
+                for t in range(s0, s1 + 1):
+                    out[t] = ""
+            k = s1 + 1
+        i = u1 + 1
+
+    return [ln for ln in out if ln != ""]
+
+
+def ensure_blank_line_between_procedures(lines):
+    """Ensure one blank line between consecutive procedure definitions."""
+    out = []
+    re_end_proc = re.compile(r"^\s*end\s+(function|subroutine)\b", flags=re.IGNORECASE)
+    re_start_proc = re.compile(r"^\s*(pure\s+)?(function|subroutine)\b", flags=re.IGNORECASE)
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        out.append(ln)
+        if re_end_proc.match(ln):
+            j = i + 1
+            while j < n and lines[j].strip() == "":
+                j += 1
+            if j < n and re_start_proc.match(lines[j]):
+                if not out or out[-1].strip() != "":
+                    out.append("")
+        i += 1
+    return out
+
+
+def ensure_blank_line_between_program_units(lines):
+    """Ensure one blank line between adjacent top-level modules/programs."""
+    out = []
+    re_end_unit = re.compile(r"^\s*end\s+(module|program)\b", flags=re.IGNORECASE)
+    re_start_unit = re.compile(r"^\s*(module|program)\b", flags=re.IGNORECASE)
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        out.append(ln)
+        if re_end_unit.match(ln):
+            j = i + 1
+            while j < n and lines[j].strip() == "":
+                j += 1
+            if j < n and re_start_unit.match(lines[j]):
+                if not out or out[-1].strip() != "":
+                    out.append("")
+        i += 1
+    return out
+
+
+def remove_write_only_scalar_locals(lines):
+    """Remove scalar locals that are only assigned and never read."""
+    decl_re = re.compile(
+        r"^\s*(integer|real\(kind=dp\)|logical|complex\(kind=dp\))\s*::\s*(.+)$",
+        flags=re.IGNORECASE,
+    )
+    name_re = re.compile(r"^[A-Za-z_]\w*$")
+    tok_re = re.compile(r"\b[A-Za-z_]\w*\b")
+    asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*.*$")
+
+    decl_line_by_var = {}
+    decl_vars_by_line = {}
+    candidates = set()
+
+    for i, ln in enumerate(lines):
+        code = ln.split("!", 1)[0].strip()
+        m = decl_re.match(code)
+        if not m:
+            continue
+        rhs = m.group(2)
+        vars_here = []
+        ok_line = True
+        for part in rhs.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            if "(" in p or ")" in p:
+                ok_line = False
+                break
+            if "=" in p:
+                ok_line = False
+                break
+            if not name_re.match(p):
+                ok_line = False
+                break
+            vars_here.append(p)
+        if not ok_line or not vars_here:
+            continue
+        decl_vars_by_line[i] = vars_here
+        for v in vars_here:
+            vl = v.lower()
+            decl_line_by_var[vl] = i
+            candidates.add(vl)
+
+    if not candidates:
+        return lines
+
+    read_count = {v: 0 for v in candidates}
+    complex_use = {v: False for v in candidates}
+
+    for i, ln in enumerate(lines):
+        if i in decl_vars_by_line:
+            continue
+        code = ln.split("!", 1)[0]
+        toks = tok_re.findall(code)
+        if not toks:
+            continue
+        m_asn = asn_re.match(code)
+        lhs = m_asn.group(1).lower() if m_asn else None
+        if lhs in candidates:
+            # Count all occurrences except first lhs token as reads.
+            skipped = False
+            for t in toks:
+                tl = t.lower()
+                if tl == lhs and not skipped:
+                    skipped = True
+                    continue
+                if tl in candidates:
+                    read_count[tl] += 1
+            # If lhs appears in a non-simple context on same line, mark complex.
+            lhs_occ = sum(1 for t in toks if t.lower() == lhs)
+            if lhs_occ > 1:
+                complex_use[lhs] = True
+            continue
+        for t in toks:
+            tl = t.lower()
+            if tl in candidates:
+                read_count[tl] += 1
+                complex_use[tl] = True
+
+    dead = {v for v in candidates if read_count[v] == 0 and not complex_use[v]}
+    if not dead:
+        return lines
+
+    out = list(lines)
+
+    # Remove write-only assignments: `v = ...`
+    for i, ln in enumerate(out):
+        code = ln.split("!", 1)[0]
+        m_asn = asn_re.match(code)
+        if not m_asn:
+            continue
+        lhs = m_asn.group(1).lower()
+        if lhs in dead:
+            out[i] = ""
+
+    # Remove dead vars from declarations; drop declaration line if empty.
+    for i, vars_here in decl_vars_by_line.items():
+        keep = [v for v in vars_here if v.lower() not in dead]
+        if not keep:
+            out[i] = ""
+            continue
+        prefix = re.match(r"^(\s*(?:integer|real\(kind=dp\)|logical|complex\(kind=dp\))\s*::\s*)",
+                          out[i].split("!", 1)[0],
+                          flags=re.IGNORECASE)
+        if not prefix:
+            continue
+        code_new = prefix.group(1) + ", ".join(keep)
+        if "!" in out[i]:
+            _, bang, cmt = out[i].partition("!")
+            out[i] = code_new.rstrip() + " " + bang + cmt
+        else:
+            out[i] = code_new
+
+    return [ln for ln in out if ln != ""]
+
+
+def normalize_zero_based_unit_stride_loops(lines):
+    """Rewrite `do i = 0, n - 1` loops to `do i = 1, n` when body matches pattern."""
+    out = list(lines)
+    re_do = re.compile(
+        r"^(\s*)do\s+([a-z_]\w*)\s*=\s*0\s*,\s*(.+?)\s*$",
+        flags=re.IGNORECASE,
+    )
+    re_do_rev = re.compile(
+        r"^(\s*)do\s+([a-z_]\w*)\s*=\s*(.+?)\s*,\s*0\s*,\s*-1\s*$",
+        flags=re.IGNORECASE,
+    )
+    re_do_any = re.compile(r"^\s*do\b", flags=re.IGNORECASE)
+    re_enddo = re.compile(r"^\s*end\s*do\b", flags=re.IGNORECASE)
+
+    i = 0
+    while i < len(out):
+        code_i = out[i].split("!", 1)[0].rstrip()
+        m = re_do.match(code_i)
+        if not m:
+            mrev = re_do_rev.match(code_i)
+            if not mrev:
+                i += 1
+                continue
+            indent = mrev.group(1)
+            iv = mrev.group(2)
+            lb_expr = mrev.group(3).strip()
+            m_lb = re.match(r"^\(?\s*([a-z_]\w*)\s*-\s*1\s*\)?$", lb_expr, flags=re.IGNORECASE)
+            if not m_lb:
+                i += 1
+                continue
+            ub = m_lb.group(1)
+
+            # Find matching END DO with nesting.
+            j = i + 1
+            depth = 1
+            while j < len(out):
+                cj = out[j].split("!", 1)[0].strip()
+                if re_do_any.match(cj):
+                    depth += 1
+                elif re_enddo.match(cj):
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j >= len(out):
+                i += 1
+                continue
+
+            plus1_pat = re.compile(rf"\b{re.escape(iv)}\s*\+\s*1\b", flags=re.IGNORECASE)
+            plus1_hits = 0
+            for k in range(i + 1, j):
+                ck = out[k].split("!", 1)[0]
+                plus1_hits += len(plus1_pat.findall(ck))
+            if plus1_hits < 2:
+                i = j + 1
+                continue
+
+            out[i] = f"{indent}do {iv} = {ub}, 1, -1"
+            for k in range(i + 1, j):
+                code, bang, comment = out[k].partition("!")
+                # old `iv + N` becomes new `iv + (N-1)`
+                def _shift_plus_rev(mm):
+                    n = int(mm.group(1))
+                    n2 = n - 1
+                    if n2 <= 0:
+                        return iv
+                    if n2 == 1:
+                        return f"{iv} + 1"
+                    return f"{iv} + {n2}"
+                code = re.sub(
+                    rf"\(\s*{re.escape(iv)}\s*\+\s*(\d+)\s*\)",
+                    lambda mm: _shift_plus_rev(mm),
+                    code,
+                    flags=re.IGNORECASE,
+                )
+                code = re.sub(
+                    rf"\b{re.escape(iv)}\s*\+\s*(\d+)\b",
+                    lambda mm: _shift_plus_rev(mm),
+                    code,
+                    flags=re.IGNORECASE,
+                )
+                out[k] = code + (bang + comment if bang else "")
+            i = j + 1
+            continue
+
+        if not m:
+            i += 1
+            continue
+
+        indent = m.group(1)
+        iv = m.group(2)
+        ub_expr = m.group(3).strip()
+        m_ub = re.match(r"^\(?\s*([a-z_]\w*)\s*-\s*1\s*\)?$", ub_expr, flags=re.IGNORECASE)
+        if not m_ub:
+            i += 1
+            continue
+        ub = m_ub.group(1)
+
+        # Find matching END DO with nesting.
+        j = i + 1
+        depth = 1
+        while j < len(out):
+            cj = out[j].split("!", 1)[0].strip()
+            if re_do_any.match(cj):
+                depth += 1
+            elif re_enddo.match(cj):
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(out):
+            i += 1
+            continue
+
+        # Only apply when i+1 is clearly the dominant indexing style in body.
+        plus1_pat = re.compile(rf"\b{re.escape(iv)}\s*\+\s*1\b", flags=re.IGNORECASE)
+        plus1_hits = 0
+        for k in range(i + 1, j):
+            ck = out[k].split("!", 1)[0]
+            plus1_hits += len(plus1_pat.findall(ck))
+        if plus1_hits < 2:
+            i = j + 1
+            continue
+
+        out[i] = f"{indent}do {iv} = 1, {ub}"
+        for k in range(i + 1, j):
+            code, bang, comment = out[k].partition("!")
+            # Rebase old zero-based index variable to new one-based loop:
+            # old `iv + N` becomes new `iv + (N-1)`.
+            def _shift_plus(m):
+                n = int(m.group(1))
+                n2 = n - 1
+                if n2 <= 0:
+                    return iv
+                if n2 == 1:
+                    return f"{iv} + 1"
+                return f"{iv} + {n2}"
+
+            code = re.sub(
+                rf"\(\s*{re.escape(iv)}\s*\+\s*(\d+)\s*\)",
+                lambda m: _shift_plus(m),
+                code,
+                flags=re.IGNORECASE,
+            )
+            code = re.sub(
+                rf"\b{re.escape(iv)}\s*\+\s*(\d+)\b",
+                lambda m: _shift_plus(m),
+                code,
+                flags=re.IGNORECASE,
+            )
+            # 1:i -> 1:i-1
+            code = re.sub(
+                rf"1\s*:\s*{re.escape(iv)}\b",
+                f"1:{iv} - 1",
+                code,
+                flags=re.IGNORECASE,
+            )
+            out[k] = code + (bang + comment if bang else "")
+        i = j + 1
+    return out
+
+
+def simplify_allocate_shape_to_mold(lines):
+    """Rewrite shape-clone ALLOCATE to use `mold=`."""
+    def _split_top_level(s):
+        out = []
+        cur = []
+        depth = 0
+        in_s = False
+        in_d = False
+        for ch in s:
+            if ch == "'" and not in_d:
+                in_s = not in_s
+                cur.append(ch)
+                continue
+            if ch == '"' and not in_s:
+                in_d = not in_d
+                cur.append(ch)
+                continue
+            if not in_s and not in_d:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "," and depth == 0:
+                    out.append("".join(cur).strip())
+                    cur = []
+                    continue
+            cur.append(ch)
+        out.append("".join(cur).strip())
+        return [x for x in out if x]
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        m_alloc = re.match(r"^(\s*)allocate\s*\((.*)\)\s*$", code, flags=re.IGNORECASE)
+        if m_alloc:
+            indent = m_alloc.group(1)
+            inner = m_alloc.group(2).strip()
+            items = _split_top_level(inner)
+            if len(items) == 1:
+                m_item = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", items[0], flags=re.IGNORECASE)
+                if m_item:
+                    dst = m_item.group(1)
+                    dims = _split_top_level(m_item.group(2))
+                    src = None
+                    ok = len(dims) >= 1
+                    for i, d in enumerate(dims, start=1):
+                        mm = re.fullmatch(r"size\s*\(\s*([a-z_]\w*)\s*,\s*(\d+)\s*\)", d, flags=re.IGNORECASE)
+                        if not mm:
+                            ok = False
+                            break
+                        nm = mm.group(1)
+                        dimi = int(mm.group(2))
+                        if dimi != i:
+                            ok = False
+                            break
+                        if src is None:
+                            src = nm
+                        elif src.lower() != nm.lower():
+                            ok = False
+                            break
+                    if ok and src is not None:
+                        code = f"{indent}allocate({dst}, mold={src})"
+        if bang:
+            out.append(code + bang + comment)
+        else:
+            out.append(code)
+    return out
+
+
+def combine_allocate_mold_with_scalar_source(lines):
+    """Merge allocate+scalar init using a shape-carrying SOURCE expression."""
+    out = []
+    i = 0
+    re_alloc_mold = re.compile(
+        r"^(\s*allocate\s*\(\s*)([a-z_]\w*)(\s*,\s*mold\s*=\s*[^)]+)\s*(\)\s*)$",
+        flags=re.IGNORECASE,
+    )
+    re_assign = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+)$", flags=re.IGNORECASE)
+    while i < len(lines):
+        if i + 1 < len(lines):
+            c0 = lines[i].split("!", 1)[0].rstrip()
+            c1 = lines[i + 1].split("!", 1)[0].rstrip()
+            m0 = re_alloc_mold.match(c0)
+            m1 = re_assign.match(c1)
+            if m0 and m1 and m0.group(2).lower() == m1.group(1).lower():
+                rhs = m1.group(2).strip()
+                # Only fold scalar RHS (no constructors, sections, or function calls).
+                if ("[" not in rhs and "]" not in rhs and "(" not in rhs and ")" not in rhs):
+                    mold_txt = m0.group(3)
+                    mm = re.search(r"mold\s*=\s*([a-z_]\w*)", mold_txt, flags=re.IGNORECASE)
+                    if mm:
+                        src = mm.group(1)
+                        # Fortran disallows MOLD and SOURCE together; use SOURCE only.
+                        # `rhs + 0*src` preserves scalar value while inheriting shape from src.
+                        out.append(f"{m0.group(1)}{m0.group(2)}, source=({rhs} + 0*{src}){m0.group(4)}")
+                        i += 2
+                        continue
+        out.append(lines[i])
+        i += 1
     return out
 
 
@@ -737,6 +1491,10 @@ def remove_redundant_first_guarded_deallocate(lines):
         r"^\s*(?:use\b|implicit\b|contains\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|interface\b|module\b|program\b|subroutine\b|function\b|end\b)",
         re.IGNORECASE,
     )
+    re_proc_start = re.compile(
+        r"^\s*(?:(?:pure|impure|elemental|recursive)\s+)*(?:subroutine|function)\b",
+        re.IGNORECASE,
+    )
 
     i = 0
     while i < len(out):
@@ -764,15 +1522,16 @@ def remove_redundant_first_guarded_deallocate(lines):
 
         prior_use = False
         tok_re = re.compile(rf"\b{re.escape(var)}\b", re.IGNORECASE)
-        re_flow = re.compile(r"^\s*(?:do\b|if\b|select\b|where\b|forall\b|block\b)", re.IGNORECASE)
-        for k in range(i):
+        k0 = 0
+        for k in range(i - 1, -1, -1):
+            ck0 = out[k].split("!", 1)[0].strip()
+            if re_proc_start.match(ck0):
+                k0 = k + 1
+                break
+        for k in range(k0, i):
             ck = out[k].split("!", 1)[0].strip()
             if not ck:
                 continue
-            # Conservative: once control-flow has started, keep guarded deallocate.
-            if re_flow.match(ck):
-                prior_use = True
-                break
             if re_declish.match(ck):
                 continue
             if tok_re.search(ck):
@@ -893,9 +1652,34 @@ def detect_needed_helpers(tree):
                 and node.func.value.attr == "random"
                 and node.func.attr in {"normal", "standard_normal", "randn", "multivariate_normal"}
             ):
-                needed.add("random_normal_vec")
+                needed.add("rnorm")
                 if node.func.attr == "multivariate_normal":
                     needed.add("random_mvn_samples")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "random"
+                and node.func.attr in {"rand", "random"}
+            ):
+                needed.add("runif")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr == "random"
+            ):
+                needed.add("runif")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "random"
+                and node.func.attr == "default_rng"
+            ):
+                needed.add("seed_rng")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
@@ -978,7 +1762,7 @@ def detect_needed_helpers(tree):
                 elif node.func.attr == "multivariate_hypergeometric":
                     needed.update({"random_multivariate_hypergeometric", "random_multivariate_hypergeometric_samples"})
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"normal", "standard_normal"}:
-                needed.add("random_normal_vec")
+                needed.add("rnorm")
             if isinstance(node.func, ast.Attribute) and node.func.attr in {
                 "exponential", "gamma", "beta", "lognormal", "chisquare",
                 "standard_exponential", "standard_gamma", "standard_t", "f",
@@ -1485,6 +2269,28 @@ def runtime_helper_templates():
          call random_number(r)
          random_uniform = r
       end function random_uniform"""
+
+    seed_rng_pub = (
+        "public :: seed_rng !@pyapi kind=subroutine "
+        "args=seed:integer:intent(in):optional desc=\"seed intrinsic RNG; deterministic stream when seed is provided\""
+    )
+    seed_rng_blk = """      subroutine seed_rng(seed)
+         integer, intent(in), optional :: seed
+         integer :: nseed_rng, i_rng, s0
+         integer, allocatable :: seed_buf(:)
+         if (.not. present(seed)) then
+            call random_seed()
+            return
+         end if
+         s0 = seed
+         call random_seed(size=nseed_rng)
+         allocate(seed_buf(nseed_rng))
+         do i_rng = 1, nseed_rng
+            seed_buf(i_rng) = s0 + 104729 * (i_rng - 1)
+         end do
+         call random_seed(put=seed_buf)
+         deallocate(seed_buf)
+      end subroutine seed_rng"""
 
     rnv_pub = (
         "public :: random_normal_vec !@pyapi kind=subroutine "
@@ -2019,6 +2825,7 @@ def runtime_helper_templates():
         "isqrt_int": (isqrt_pub, isqrt_blk),
         "print_int_list": (pil_pub, pil_blk),
         "random_uniform": (ru_pub, ru_blk),
+        "seed_rng": (seed_rng_pub, seed_rng_blk),
         "random_normal_vec": (rnv_pub, rnv_blk),
         "random_choice2": (rc2_pub, rc2_blk),
         "random_choice_norep": (rcnr_pub, rcnr_blk),
@@ -8474,7 +9281,7 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "random"
             and len(v.args) == 0
         ):
-            self.o.w(f"call random_number({t.id})")
+            self.o.w(f"{t.id} = runif()")
             return
 
         # x = np.random.random() -> call random_number(x)
@@ -8489,7 +9296,7 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "random"
             and len(v.args) == 0
         ):
-            self.o.w(f"call random_number({t.id})")
+            self.o.w(f"{t.id} = runif()")
             return
 
         # x = float(np.random.random()) -> call random_number(x)
@@ -8508,7 +9315,7 @@ class translator(ast.NodeVisitor):
             and v.args[0].func.attr == "random"
             and len(v.args[0].args) == 0
         ):
-            self.o.w(f"call random_number({t.id})")
+            self.o.w(f"{t.id} = runif()")
             return
 
         # x = rng.choice(arr, size=k, replace=False) if cond else expr
@@ -8763,22 +9570,10 @@ class translator(ast.NodeVisitor):
                 if kw.arg == "seed":
                     seed_node = kw.value
             if seed_node is None or is_none(seed_node):
-                self.o.w("call random_seed()")
+                self.o.w("call seed_rng()")
             else:
                 seed_expr = self.expr(seed_node)
-                self.o.w("block")
-                self.o.push()
-                self.o.w("integer :: nseed_rng, i_rng")
-                self.o.w("integer, allocatable :: seed_rng(:)")
-                self.o.w("call random_seed(size=nseed_rng)")
-                self.o.w("allocate(seed_rng(1:nseed_rng))")
-                self.o.w("do i_rng = 1, nseed_rng")
-                self.o.w(f"   seed_rng(i_rng) = int({seed_expr}) + 104729 * (i_rng - 1)")
-                self.o.w("end do")
-                self.o.w("call random_seed(put=seed_rng)")
-                self.o.w("if (allocated(seed_rng)) deallocate(seed_rng)")
-                self.o.pop()
-                self.o.w("end block")
+                self.o.w(f"call seed_rng(int({seed_expr}))")
             # Keep a placeholder scalar for the RNG object name.
             self.o.w(f"{t.id} = 0")
             return
@@ -8809,42 +9604,24 @@ class translator(ast.NodeVisitor):
             if size_node is None and not is_standard:
                 raise NotImplementedError("np.random.normal requires size=... in this transpiler")
             if size_node is None and is_standard:
-                self.o.w("block")
-                self.o.push()
-                self.o.w("real(kind=dp) :: tmp_norm(1)")
-                self.o.w("call random_normal_vec(tmp_norm)")
-                self.o.w(f"{t.id} = tmp_norm(1)")
-                self.o.pop()
-                self.o.w("end block")
+                self.o.w(f"{t.id} = rnorm()")
                 return
-            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
             n_expr = None
             if isinstance(size_node, (ast.Tuple, ast.List)):
                 if len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
-                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
-                    self.o.w("block")
-                    self.o.push()
-                    self.o.w("real(kind=dp), allocatable :: tmp_norm(:)")
-                    self.o.w(f"allocate(tmp_norm(1:({n0})*({n1})))")
-                    self.o.w("call random_normal_vec(tmp_norm)")
-                    self.o.w(f"{t.id} = reshape(tmp_norm, [({n0}), ({n1})])")
-                    self.o.w("if (allocated(tmp_norm)) deallocate(tmp_norm)")
-                    self.o.pop()
-                    self.o.w("end block")
+                    self.o.w(f"{t.id} = rnorm({n0}, {n1})")
                 elif len(size_node.elts) == 1:
                     n_expr = self.expr(size_node.elts[0])
-                    self.o.w(f"allocate({t.id}(1:{n_expr}))")
-                    self.o.w(f"call random_normal_vec({t.id})")
+                    self.o.w(f"{t.id} = rnorm({n_expr})")
                 else:
                     if is_standard:
                         raise NotImplementedError("np.random.standard_normal size tuple rank > 2 not supported")
                     raise NotImplementedError("np.random.normal size tuple rank > 2 not supported")
             else:
                 n_expr = self.expr(size_node)
-                self.o.w(f"allocate({t.id}(1:{n_expr}))")
-                self.o.w(f"call random_normal_vec({t.id})")
+                self.o.w(f"{t.id} = rnorm({n_expr})")
 
             # Special case: gather parameters by class labels, e.g.
             # rng.normal(loc=mu[z], scale=sigma[z], size=n)
@@ -9672,41 +10449,24 @@ class translator(ast.NodeVisitor):
             dims = list(v.args)
             if not dims:
                 if v.func.attr == "rand":
-                    self.o.w(f"call random_number({t.id})")
+                    self.o.w(f"{t.id} = runif()")
                 else:
-                    self.o.w("block")
-                    self.o.push()
-                    self.o.w("real(kind=dp) :: tmp_norm_scalar(1)")
-                    self.o.w("call random_normal_vec(tmp_norm_scalar)")
-                    self.o.w(f"{t.id} = tmp_norm_scalar(1)")
-                    self.o.pop()
-                    self.o.w("end block")
+                    self.o.w(f"{t.id} = rnorm()")
                 return
-            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
             if len(dims) == 1:
                 n0 = self.expr(dims[0])
-                self.o.w(f"allocate({t.id}(1:{n0}))")
                 if v.func.attr == "rand":
-                    self.o.w(f"call random_number({t.id})")
+                    self.o.w(f"{t.id} = runif({n0})")
                 else:
-                    self.o.w(f"call random_normal_vec({t.id})")
+                    self.o.w(f"{t.id} = rnorm({n0})")
                 return
             if len(dims) == 2:
                 n0 = self.expr(dims[0])
                 n1 = self.expr(dims[1])
-                self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
                 if v.func.attr == "rand":
-                    self.o.w(f"call random_number({t.id})")
+                    self.o.w(f"{t.id} = runif({n0}, {n1})")
                 else:
-                    self.o.w("block")
-                    self.o.push()
-                    self.o.w("real(kind=dp), allocatable :: tmp_norm(:)")
-                    self.o.w(f"allocate(tmp_norm(1:({n0})*({n1})))")
-                    self.o.w("call random_normal_vec(tmp_norm)")
-                    self.o.w(f"{t.id} = reshape(tmp_norm, [({n0}), ({n1})])")
-                    self.o.w("if (allocated(tmp_norm)) deallocate(tmp_norm)")
-                    self.o.pop()
-                    self.o.w("end block")
+                    self.o.w(f"{t.id} = rnorm({n0}, {n1})")
                 return
             raise NotImplementedError("np.random.rand/randn supports up to 2 dimensions")
 
@@ -10560,6 +11320,7 @@ class translator(ast.NodeVisitor):
             # Mixed-rank Python returns (e.g., conditional x vs x.ravel()) cannot
             # be represented by a single Fortran function result rank. Keep rank
             # stable by returning the base array when flatten appears in return.
+            expr_txt = None
             if (
                 isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
@@ -10567,13 +11328,80 @@ class translator(ast.NodeVisitor):
                 and len(node.value.args) == 0
                 and self._rank_expr(node.value.func.value) > 1
             ):
-                self.o.w(f"{self.function_result_name} = {self.expr(node.value.func.value)}")
+                expr_txt = self.expr(node.value.func.value)
             else:
-                self.o.w(f"{self.function_result_name} = {self.expr(node.value)}")
+                expr_txt = self.expr(node.value)
+            if expr_txt.strip().lower() != self.function_result_name.lower():
+                self.o.w(f"{self.function_result_name} = {expr_txt}")
         self.o.w("return")
 
     def visit_If(self, node):
         self._emit_comments_for(node)
+        def _num_lit_from_expr(txt):
+            s = txt.strip()
+            # peel simple outer parentheses
+            while s.startswith("(") and s.endswith(")"):
+                depth = 0
+                ok = True
+                for i, ch in enumerate(s):
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0 and i != len(s) - 1:
+                            ok = False
+                            break
+                if not ok or depth != 0:
+                    break
+                s = s[1:-1].strip()
+            if re.fullmatch(r"[+-]?\d+", s):
+                return float(int(s))
+            m = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?)(?:_dp)?", s)
+            if m:
+                return float(m.group(1).replace("d", "e").replace("D", "E"))
+            return None
+
+        def _const_bool(test):
+            if isinstance(test, ast.Constant):
+                if isinstance(test.value, bool):
+                    return bool(test.value)
+                if isinstance(test.value, (int, float)):
+                    return bool(test.value)
+                return None
+            if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+                v = _const_bool(test.operand)
+                return (not v) if v is not None else None
+            if isinstance(test, ast.BoolOp) and len(test.values) >= 1:
+                vals = [_const_bool(v) for v in test.values]
+                if any(v is None for v in vals):
+                    return None
+                if isinstance(test.op, ast.And):
+                    return all(vals)
+                if isinstance(test.op, ast.Or):
+                    return any(vals)
+                return None
+            if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
+                ltxt = self.expr(test.left)
+                rtxt = self.expr(test.comparators[0])
+                lv = _num_lit_from_expr(ltxt)
+                rv = _num_lit_from_expr(rtxt)
+                if lv is None or rv is None:
+                    return None
+                op = test.ops[0]
+                if isinstance(op, ast.Eq):
+                    return lv == rv
+                if isinstance(op, ast.NotEq):
+                    return lv != rv
+                if isinstance(op, ast.Lt):
+                    return lv < rv
+                if isinstance(op, ast.LtE):
+                    return lv <= rv
+                if isinstance(op, ast.Gt):
+                    return lv > rv
+                if isinstance(op, ast.GtE):
+                    return lv >= rv
+            return None
+
         def _is_seed_noop_call(c):
             return (
                 isinstance(c, ast.Call)
@@ -10597,6 +11425,8 @@ class translator(ast.NodeVisitor):
         def _is_noop_stmt(s):
             if isinstance(s, ast.Pass):
                 return True
+            if isinstance(s, ast.Raise):
+                return True
             if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
                 if _is_seed_noop_call(s.value):
                     return True
@@ -10605,6 +11435,16 @@ class translator(ast.NodeVisitor):
         body_eff = [s for s in node.body if not _is_noop_stmt(s)]
         else_eff = [s for s in node.orelse if not _is_noop_stmt(s)] if node.orelse else []
         if not body_eff and not else_eff:
+            return
+
+        const_test = _const_bool(node.test)
+        if const_test is True:
+            for s in body_eff:
+                self.visit(s)
+            return
+        if const_test is False:
+            for s in else_eff:
+                self.visit(s)
             return
 
         # Preserve Python short-circuit semantics for simple boolean chains.
@@ -11207,6 +12047,12 @@ def _emit_local_function(
     if not args:
         raise NotImplementedError("local functions must have at least one argument")
     ret_name = f"{fn.name}_result"
+    if dict_return_spec is None:
+        ret_vals = [s.value for s in ast.walk(fn) if isinstance(s, ast.Return) and s.value is not None]
+        if ret_vals and all(isinstance(v, ast.Name) and v.id == ret_vals[0].id for v in ret_vals):
+            cand = ret_vals[0].id
+            if cand not in args:
+                ret_name = cand
 
     if fn.name == "logsumexp" and len(args) >= 3:
         o.w(f"function {fn.name}(" + ", ".join(args[:3]) + f") result({ret_name})")
@@ -11544,11 +12390,38 @@ def _emit_local_function(
         return rr
 
     def _arg_is_assigned(nm):
+        def _is_self_normalization_assign(rhs):
+            # Ignore benign normalization rebinds like:
+            #   a = np.asarray(a, ...)
+            #   a = a.reshape(...)
+            if (
+                isinstance(rhs, ast.Call)
+                and isinstance(rhs.func, ast.Attribute)
+                and isinstance(rhs.func.value, ast.Name)
+                and rhs.func.value.id == "np"
+                and rhs.func.attr in {"asarray", "array"}
+                and len(rhs.args) >= 1
+                and isinstance(rhs.args[0], ast.Name)
+                and rhs.args[0].id == nm
+            ):
+                return True
+            if (
+                isinstance(rhs, ast.Call)
+                and isinstance(rhs.func, ast.Attribute)
+                and isinstance(rhs.func.value, ast.Name)
+                and rhs.func.value.id == nm
+                and rhs.func.attr in {"reshape", "copy"}
+            ):
+                return True
+            return False
+
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.Assign):
                     for tg in n.targets:
                         if isinstance(tg, ast.Name) and tg.id == nm:
+                            if _is_self_normalization_assign(n.value):
+                                continue
                             return True
                 if isinstance(n, ast.AugAssign):
                     if isinstance(n.target, ast.Name) and n.target.id == nm:
@@ -11790,7 +12663,9 @@ def _emit_local_function(
                     else:
                         if tr.function_result_name is None:
                             raise NotImplementedError("return value only supported in function context")
-                        o.w(f"{tr.function_result_name} = {tr.expr(s.value)}")
+                        rhs = tr.expr(s.value)
+                        if rhs.strip().lower() != tr.function_result_name.lower():
+                            o.w(f"{tr.function_result_name} = {rhs}")
             if i != len(fn.body) - 1:
                 o.w("return")
             continue
@@ -11992,56 +12867,144 @@ def generate_flat(
                 tuple_return_funcs.add(fn.name)
                 break
 
+    use_proc_module = bool(local_funcs)
+    proc_mod_name = f"{stem}_proc_mod"
+    proc_public_syms = []
+    helper_uses_proc = {}
+    if use_proc_module:
+        proc_tree = ast.Module(body=list(local_funcs), type_ignores=[])
+        proc_needed = detect_needed_helpers(proc_tree)
+        for mod, syms in helper_uses.items():
+            keep = sorted([s for s in syms if s in proc_needed])
+            if keep:
+                helper_uses_proc[mod] = keep
+
+    def _emit_type_defs(target_o):
+        emitted = set()
+        type_names = []
+        for fn_name in sorted(dict_return_specs):
+            spec = dict_return_specs[fn_name]
+            tname = spec["type_name"]
+            if tname in emitted:
+                continue
+            emitted.add(tname)
+            type_names.append(tname)
+            target_o.w(f"type :: {tname}")
+            target_o.push()
+            for cname, ckind, _, crank in spec["components"]:
+                if ckind == "real_array":
+                    dims = ",".join(":" for _ in range(max(1, crank)))
+                    target_o.w(f"real(kind=dp), allocatable :: {cname}({dims})")
+                elif ckind == "int_array":
+                    dims = ",".join(":" for _ in range(max(1, crank)))
+                    target_o.w(f"integer, allocatable :: {cname}({dims})")
+                elif ckind == "logical_array":
+                    dims = ",".join(":" for _ in range(max(1, crank)))
+                    target_o.w(f"logical, allocatable :: {cname}({dims})")
+                elif ckind == "real_scalar":
+                    target_o.w(f"real(kind=dp) :: {cname}")
+                else:
+                    target_o.w(f"integer :: {cname}")
+            target_o.pop()
+            target_o.w(f"end type {tname}")
+        for tname, fields in sorted((structured_type_components or {}).items()):
+            if tname in emitted:
+                continue
+            emitted.add(tname)
+            type_names.append(tname)
+            target_o.w(f"type :: {tname}")
+            target_o.push()
+            for fname, fkind in fields:
+                if fkind == "real":
+                    target_o.w(f"real(kind=dp) :: {fname}")
+                elif fkind == "logical":
+                    target_o.w(f"logical :: {fname}")
+                else:
+                    target_o.w(f"integer :: {fname}")
+            target_o.pop()
+            target_o.w(f"end type {tname}")
+        return type_names
+
+    module_text = ""
+    if use_proc_module:
+        om = emit()
+        om.w(f"module {proc_mod_name}")
+        om.push()
+        for mod, syms in helper_uses_proc.items():
+            if syms:
+                om.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
+        om.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
+        om.w("use, intrinsic :: iso_fortran_env, only: real64")
+        om.w("implicit none")
+        om.w("private")
+        om.w("integer, parameter :: dp = real64")
+        type_names = _emit_type_defs(om)
+        proc_public_syms = sorted(set(["dp"] + [fn.name for fn in local_funcs] + type_names))
+        if proc_public_syms:
+            om.w("public :: " + ", ".join(proc_public_syms))
+        om.pop()
+        om.w("")
+        om.w("contains")
+        om.w("")
+        elemental_targets = set(translator.global_vectorize_aliases.values())
+        for fn in local_funcs:
+            arg_dict_types = {}
+            for a in fn.args.args:
+                anm = a.arg
+                keys = set()
+                for st in ast.walk(fn):
+                    if (
+                        isinstance(st, ast.Subscript)
+                        and isinstance(st.value, ast.Name)
+                        and st.value.id == anm
+                        and isinstance(st.slice, ast.Constant)
+                        and isinstance(st.slice.value, str)
+                    ):
+                        keys.add(st.slice.value)
+                if not keys:
+                    continue
+                matches = []
+                for tnm, comps in dict_type_components.items():
+                    if keys.issubset(set(comps.keys())):
+                        matches.append(tnm)
+                if len(matches) >= 1:
+                    arg_dict_types[anm] = sorted(matches)[0]
+            _emit_local_function(
+                om,
+                fn,
+                params,
+                no_comment=no_comment,
+                known_pure_calls=known_pure_calls,
+                comment_map=comment_map,
+                dict_return_spec=dict_return_specs.get(fn.name),
+                dict_return_types=dict_return_types,
+                local_return_specs=local_return_specs,
+                tuple_return_out_kinds=tuple_return_out_kinds,
+                tuple_return_funcs=tuple_return_funcs,
+                dict_type_components=dict_type_components,
+                dict_arg_types=arg_dict_types,
+                local_func_arg_ranks=local_func_arg_ranks,
+                local_func_defaults=local_func_defaults,
+                elemental_funcs=elemental_targets,
+            )
+        om.w(f"end module {proc_mod_name}")
+        module_text = om.text()
+
     o = emit()
     o.w(f"program {stem}")
     o.push()
+    if use_proc_module:
+        o.w(f"use {proc_mod_name}, only: " + ", ".join(proc_public_syms))
     for mod, syms in helper_uses.items():
         if syms:
             o.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
     o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
     o.w("use, intrinsic :: iso_fortran_env, only: real64")
     o.w("implicit none")
-    o.w("integer, parameter :: dp = real64")
-    emitted_types = set()
-    for fn_name in sorted(dict_return_specs):
-        spec = dict_return_specs[fn_name]
-        tname = spec["type_name"]
-        if tname in emitted_types:
-            continue
-        emitted_types.add(tname)
-        o.w(f"type :: {tname}")
-        o.push()
-        for cname, ckind, _, crank in spec["components"]:
-            if ckind == "real_array":
-                dims = ",".join(":" for _ in range(max(1, crank)))
-                o.w(f"real(kind=dp), allocatable :: {cname}({dims})")
-            elif ckind == "int_array":
-                dims = ",".join(":" for _ in range(max(1, crank)))
-                o.w(f"integer, allocatable :: {cname}({dims})")
-            elif ckind == "logical_array":
-                dims = ",".join(":" for _ in range(max(1, crank)))
-                o.w(f"logical, allocatable :: {cname}({dims})")
-            elif ckind == "real_scalar":
-                o.w(f"real(kind=dp) :: {cname}")
-            else:
-                o.w(f"integer :: {cname}")
-        o.pop()
-        o.w(f"end type {tname}")
-    for tname, fields in sorted((structured_type_components or {}).items()):
-        if tname in emitted_types:
-            continue
-        emitted_types.add(tname)
-        o.w(f"type :: {tname}")
-        o.push()
-        for fname, fkind in fields:
-            if fkind == "real":
-                o.w(f"real(kind=dp) :: {fname}")
-            elif fkind == "logical":
-                o.w(f"logical :: {fname}")
-            else:
-                o.w(f"integer :: {fname}")
-        o.pop()
-        o.w(f"end type {tname}")
+    if not use_proc_module:
+        o.w("integer, parameter :: dp = real64")
+    if not use_proc_module:
+        _emit_type_defs(o)
 
     for name, val in sorted(params.items()):
         o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
@@ -12137,7 +13100,7 @@ def generate_flat(
             continue
         tr.visit(stmt)
 
-    if local_funcs:
+    if local_funcs and not use_proc_module:
         elemental_targets = set(translator.global_vectorize_aliases.values())
         o.w("")
         o.w("contains")
@@ -12185,6 +13148,8 @@ def generate_flat(
 
     o.pop()
     o.w(f"end program {stem}")
+    if module_text:
+        return module_text + "\n" + o.text()
     return o.text()
 
 
@@ -12688,14 +13653,31 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
     f90_lines = collapse_allocate_before_array_constructor_assignment(f90_lines)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
+    f90_lines = simplify_index_arithmetic_notation(f90_lines)
+    f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
+    f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
+    f90_lines = simplify_allocate_shape_to_mold(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_redundant_parens_in_lines(f90_lines)
+    f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = remove_empty_if_blocks(f90_lines)
     f90_lines = inline_shape_comments(f90_lines)
+    f90_lines = remove_write_only_scalar_locals(f90_lines)
+    f90_lines = remove_unused_use_only_imports(f90_lines)
+    f90_lines = ensure_blank_line_between_procedures(f90_lines)
+    f90_lines = ensure_blank_line_between_program_units(f90_lines)
     # First coalesce adjacent declarations without wrapping, then apply
     # the dedicated 80-column wrapper that packs continuation lines.
     f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
     f90_lines = wrap_long_declaration_lines(f90_lines, max_len=80)
+    # Run arithmetic simplification once more after wrapping/rewrites.
+    f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
+    # Final loop-index normalization pass after all other line rewrites.
+    f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
+    f90_lines = simplify_redundant_int_casts(f90_lines)
+    f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
+    # Keep inline Fortran comments consistently separated from code.
+    f90_lines = enforce_space_before_inline_comments(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     out_path = Path(out_path) if out_path else Path(py_path).with_name(f"{Path(py_path).stem}_p.f90")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -12926,9 +13908,13 @@ def main():
         stage_w = max(len("stage"), max(len(name) for name, _ in rows))
         sec_vals = [f"{val:.6f}" for _name, val in rows]
         sec_w = max(len("seconds"), max(len(s) for s in sec_vals))
-        print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    ratio(vs python run)")
+        ratio_hdr = "ratio(vs python run)"
+        ratio_vals = [_ratio(val) for _name, val in rows]
+        ratio_w = max(len(r) for r in ratio_vals)
+        print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    {ratio_hdr}")
         for name, val in rows:
-            print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}    {_ratio(val)}")
+            rtxt = _ratio(val)
+            print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}    {rtxt:>{ratio_w}}")
     return 0
 
 

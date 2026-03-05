@@ -11,7 +11,10 @@ end type strvec_t
 
 public :: isqrt_int       !@pyapi kind=function ret=integer args=x:integer:intent(in) desc="integer square root: return floor(sqrt(x)) for x >= 0"
 public :: print_int_list  !@pyapi kind=subroutine args=a:integer(:):intent(in),n:integer:intent(in) desc="print integer list a(1:n) in python-style [..] format"
+public :: seed_rng !@pyapi kind=subroutine args=seed:integer:intent(in):optional desc="seed intrinsic RNG; deterministic stream when seed is provided"
 public :: random_normal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out) desc="fill x with N(0,1) variates using Box-Muller"
+public :: runif !@pyapi kind=function ret=real(dp) args=n:integer:intent(in):optional,m:integer:intent(in):optional desc="uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)"
+public :: rnorm !@pyapi kind=function ret=real(dp) args=n:integer:intent(in):optional,m:integer:intent(in):optional desc="normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)"
 public :: random_exponential !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional desc="sample scalar exponential with scale (default 1)"
 public :: random_exponential_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional desc="fill x with exponential samples with scale (default 1)"
 public :: random_gamma !@pyapi kind=function ret=real(dp) args=shape:real(dp):intent(in),scale:real(dp):intent(in):optional desc="sample scalar gamma(shape, scale), shape>0"
@@ -277,6 +280,14 @@ interface polyder
    module procedure polyder_real
 end interface polyder
 
+interface runif
+   module procedure runif0, runif1, runif2
+end interface runif
+
+interface rnorm
+   module procedure rnorm0, rnorm1, rnorm2
+end interface rnorm
+
 interface allclose
    module procedure allclose_real, allclose_integer
 end interface allclose
@@ -324,6 +335,24 @@ contains
          write(*,'(a)') ']'
       end subroutine print_int_list
 
+      subroutine seed_rng(seed)
+         integer, intent(in), optional :: seed
+         integer :: nseed_rng, i_rng, s0
+         integer, allocatable :: seed_buf(:)
+         if (.not. present(seed)) then
+            call random_seed()
+            return
+         end if
+         s0 = seed
+         call random_seed(size=nseed_rng)
+         allocate(seed_buf(nseed_rng))
+         do i_rng = 1, nseed_rng
+            seed_buf(i_rng) = s0 + 104729 * (i_rng - 1)
+         end do
+         call random_seed(put=seed_buf)
+         deallocate(seed_buf)
+      end subroutine seed_rng
+
       subroutine random_normal_vec(x)
          ! fill x with N(0,1) variates using Box-Muller
          implicit none
@@ -344,6 +373,56 @@ contains
             i = i + 2
          end do
       end subroutine random_normal_vec
+
+      function runif0() result(x)
+         real(kind=dp) :: x
+         call random_number(x)
+      end function runif0
+
+      function runif1(n) result(x)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: x(:)
+         if (n < 0) stop "runif: n must be >= 0"
+         allocate(x(n))
+         if (n > 0) call random_number(x)
+      end function runif1
+
+      function runif2(n, m) result(x)
+         integer, intent(in) :: n, m
+         real(kind=dp), allocatable :: x(:,:)
+         if (n < 0 .or. m < 0) stop "runif: n,m must be >= 0"
+         allocate(x(n, m))
+         if (n > 0 .and. m > 0) call random_number(x)
+      end function runif2
+
+      function rnorm0() result(x)
+         real(kind=dp) :: x
+         real(kind=dp) :: tmp(1)
+         call random_normal_vec(tmp)
+         x = tmp(1)
+      end function rnorm0
+
+      function rnorm1(n) result(x)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: x(:)
+         if (n < 0) stop "rnorm: n must be >= 0"
+         allocate(x(n))
+         if (n > 0) call random_normal_vec(x)
+      end function rnorm1
+
+      function rnorm2(n, m) result(x)
+         integer, intent(in) :: n, m
+         real(kind=dp), allocatable :: x(:,:)
+         real(kind=dp), allocatable :: tmp(:)
+         if (n < 0 .or. m < 0) stop "rnorm: n,m must be >= 0"
+         allocate(x(n, m))
+         if (n > 0 .and. m > 0) then
+            allocate(tmp(n * m))
+            call random_normal_vec(tmp)
+            x = reshape(tmp, [n, m])
+            deallocate(tmp)
+         end if
+      end function rnorm2
 
       real(kind=dp) function random_exponential(scale)
          real(kind=dp), intent(in), optional :: scale
