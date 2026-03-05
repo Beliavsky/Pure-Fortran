@@ -3159,6 +3159,19 @@ class translator(ast.NodeVisitor):
         self.var_type_first_seen = {}
         self.reserved_names = {"dp"}
         self.name_aliases = {}
+        self.rng_vars = set()
+        self.python_list_vars = set()
+
+    def _is_python_list_expr(self, node):
+        if isinstance(node, (ast.List, ast.ListComp)):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in self.python_list_vars
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return self._is_python_list_expr(node.left) and self._is_python_list_expr(node.right)
+        if isinstance(node, ast.IfExp):
+            return self._is_python_list_expr(node.body) and self._is_python_list_expr(node.orelse)
+        return False
 
     def _aliased_name(self, name):
         if name in self.name_aliases:
@@ -3591,6 +3604,48 @@ class translator(ast.NodeVisitor):
             if kinds == {"char"}:
                 return "char"
             return None
+        if isinstance(node, ast.ListComp):
+            # Homogeneous list comprehensions map to homogeneous rank-1 arrays.
+            if (
+                len(node.generators) == 1
+                and isinstance(node.generators[0].target, ast.Name)
+            ):
+                gen = node.generators[0]
+                loop_var = gen.target.id
+                it = gen.iter
+                iter_kind = self._expr_kind(it.func.value) if (
+                    isinstance(it, ast.Call)
+                    and isinstance(it.func, ast.Attribute)
+                    and it.func.attr == "tolist"
+                    and len(it.args) == 0
+                ) else self._expr_kind(it)
+
+                def _combine_binop_kind(op_node, lk, rk):
+                    if isinstance(op_node, ast.Div):
+                        if lk == "complex" or rk == "complex":
+                            return "complex"
+                        return "real"
+                    if lk == "complex" or rk == "complex":
+                        return "complex"
+                    if lk == "real" or rk == "real":
+                        return "real"
+                    if lk == "int" and rk == "int":
+                        return "int"
+                    if lk == "logical" and rk == "logical" and isinstance(op_node, (ast.BitAnd, ast.BitOr)):
+                        return "logical"
+                    return None
+
+                if isinstance(node.elt, ast.Name) and node.elt.id == loop_var:
+                    return iter_kind
+                if isinstance(node.elt, ast.UnaryOp):
+                    if isinstance(node.elt.operand, ast.Name) and node.elt.operand.id == loop_var:
+                        return iter_kind
+                    return self._expr_kind(node.elt)
+                if isinstance(node.elt, ast.BinOp):
+                    lk = iter_kind if (isinstance(node.elt.left, ast.Name) and node.elt.left.id == loop_var) else self._expr_kind(node.elt.left)
+                    rk = iter_kind if (isinstance(node.elt.right, ast.Name) and node.elt.right.id == loop_var) else self._expr_kind(node.elt.right)
+                    return _combine_binop_kind(node.elt.op, lk, rk)
+            return self._expr_kind(node.elt)
         if isinstance(node, ast.Tuple):
             if not node.elts:
                 return None
@@ -4670,6 +4725,8 @@ class translator(ast.NodeVisitor):
             if node.elts and all(isinstance(e, ast.Tuple) for e in node.elts):
                 return 2
             return 1
+        if isinstance(node, ast.ListComp):
+            return 1
         if isinstance(node, ast.Subscript):
             if (
                 isinstance(node.value, ast.Name)
@@ -5378,6 +5435,50 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported binop")
             a0 = self.expr(node.left)
             b0 = self.expr(node.right)
+            # Python list repetition semantics: n * list or list * n.
+            if op is ast.Mult:
+                left_list = self._is_python_list_expr(node.left)
+                right_list = self._is_python_list_expr(node.right)
+                if left_list ^ right_list:
+                    list_node = node.left if left_list else node.right
+                    rep_node = node.right if left_list else node.left
+                    list_expr = a0 if left_list else b0
+                    if self._rank_expr(list_node) > 1 or self._rank_expr(rep_node) != 0:
+                        raise NotImplementedError("list repetition currently supports only rank-1 list and scalar repeat count")
+                    if self._expr_kind(rep_node) != "int":
+                        raise NotImplementedError("list repetition requires integer repeat count")
+                    reps = None
+                    if isinstance(rep_node, ast.Constant) and isinstance(rep_node.value, int) and not isinstance(rep_node.value, bool):
+                        reps = int(rep_node.value)
+                    elif (
+                        isinstance(rep_node, ast.UnaryOp)
+                        and isinstance(rep_node.op, ast.USub)
+                        and isinstance(rep_node.operand, ast.Constant)
+                        and isinstance(rep_node.operand.value, int)
+                        and not isinstance(rep_node.operand.value, bool)
+                    ):
+                        reps = -int(rep_node.operand.value)
+                    if reps is None:
+                        raise NotImplementedError("list repetition currently requires a constant integer repeat count")
+                    if reps <= 0:
+                        k = self._expr_kind(list_node)
+                        if k == "real":
+                            return "[real(kind=dp) :: ]"
+                        if k == "logical":
+                            return "[logical :: ]"
+                        if k == "char":
+                            return "[character(len=1) :: ]"
+                        return "[integer :: ]"
+                    return "[" + ", ".join(list_expr for _ in range(reps)) + "]"
+            # Python list concatenation semantics: list + list appends RHS.
+            if (
+                op is ast.Add
+                and self._is_python_list_expr(node.left)
+                and self._is_python_list_expr(node.right)
+            ):
+                if self._rank_expr(node.left) <= 1 and self._rank_expr(node.right) <= 1:
+                    return f"[{a0}, {b0}]"
+                raise NotImplementedError("list concatenation currently supports only rank-1 lists")
             if op is ast.MatMult:
                 # Fortran MATMUL already handles rank-1/rank-2 combinations.
                 return f"matmul({a0}, {b0})"
@@ -5682,10 +5783,94 @@ class translator(ast.NodeVisitor):
             return f"{base}({idx})"
 
         if isinstance(node, ast.ListComp):
-            # Minimal fallback for simple comprehensions used in prints:
-            # print([f(v) for v in x.tolist()]) -> print(x)
-            if len(node.generators) == 1 and not node.generators[0].ifs:
-                it = node.generators[0].iter
+            # Support simple 1-generator comprehensions with elementwise lowering.
+            if (
+                len(node.generators) == 1
+                and isinstance(node.generators[0].target, ast.Name)
+            ):
+                gen = node.generators[0]
+                it = gen.iter
+                loop_var = gen.target.id
+                base = self.expr(it.func.value) if (
+                    isinstance(it, ast.Call)
+                    and isinstance(it.func, ast.Attribute)
+                    and it.func.attr == "tolist"
+                    and len(it.args) == 0
+                ) else self.expr(it)
+
+                def _map_expr(n):
+                    if isinstance(n, ast.Name) and n.id == loop_var:
+                        return base
+                    if isinstance(n, ast.Constant):
+                        return self.expr(n)
+                    if isinstance(n, ast.Name):
+                        return self.expr(n)
+                    if isinstance(n, ast.BinOp):
+                        op_txt = None
+                        if isinstance(n.op, ast.Add):
+                            op_txt = "+"
+                        elif isinstance(n.op, ast.Sub):
+                            op_txt = "-"
+                        elif isinstance(n.op, ast.Mult):
+                            op_txt = "*"
+                        elif isinstance(n.op, ast.Div):
+                            op_txt = "/"
+                        elif isinstance(n.op, ast.Pow):
+                            op_txt = "**"
+                        elif isinstance(n.op, ast.Mod):
+                            return f"mod({_map_expr(n.left)}, {_map_expr(n.right)})"
+                        if op_txt is not None:
+                            return f"({_map_expr(n.left)} {op_txt} {_map_expr(n.right)})"
+                    if isinstance(n, ast.UnaryOp):
+                        if isinstance(n.op, ast.USub):
+                            return f"(-{_map_expr(n.operand)})"
+                        if isinstance(n.op, ast.UAdd):
+                            return f"(+{_map_expr(n.operand)})"
+                    raise NotImplementedError("ListComp element expression is unsupported")
+
+                def _map_pred(n):
+                    if isinstance(n, ast.Compare) and len(n.ops) == 1 and len(n.comparators) == 1:
+                        opmap = {
+                            ast.Lt: "<",
+                            ast.LtE: "<=",
+                            ast.Gt: ">",
+                            ast.GtE: ">=",
+                            ast.Eq: "==",
+                            ast.NotEq: "/=",
+                        }
+                        op_t = type(n.ops[0])
+                        if op_t not in opmap:
+                            raise NotImplementedError("ListComp filter compare op unsupported")
+                        return f"({_map_expr(n.left)} {opmap[op_t]} {_map_expr(n.comparators[0])})"
+                    if isinstance(n, ast.BoolOp) and len(n.values) >= 2:
+                        if isinstance(n.op, ast.And):
+                            bop = ".and."
+                        elif isinstance(n.op, ast.Or):
+                            bop = ".or."
+                        else:
+                            raise NotImplementedError("ListComp filter boolean op unsupported")
+                        parts = [_map_pred(v) for v in n.values]
+                        return "(" + f" {bop} ".join(parts) + ")"
+                    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+                        return f"(.not. {_map_pred(n.operand)})"
+                    # Allow truthy element variables: if x
+                    if isinstance(n, ast.Name) and n.id == loop_var:
+                        return base
+                    raise NotImplementedError("ListComp filter expression is unsupported")
+
+                try:
+                    mapped = _map_expr(node.elt)
+                    if gen.ifs:
+                        mapped = strip_redundant_outer_parens_expr(mapped)
+                        masks = [strip_redundant_outer_parens_expr(_map_pred(cond)) for cond in gen.ifs]
+                        if len(masks) == 1:
+                            return f"pack({mapped}, {masks[0]})"
+                        return f"pack({mapped}, ({' .and. '.join(masks)}))"
+                    return mapped
+                except NotImplementedError:
+                    pass
+
+                # Print-oriented fallback: [f(v) for v in x.tolist()] -> x
                 if (
                     isinstance(it, ast.Call)
                     and isinstance(it.func, ast.Attribute)
@@ -5693,7 +5878,6 @@ class translator(ast.NodeVisitor):
                     and len(it.args) == 0
                 ):
                     return self.expr(it.func.value)
-                return self.expr(it)
             raise NotImplementedError("ListComp currently supports only single-generator form")
 
         if isinstance(node, ast.Call):
@@ -9195,8 +9379,25 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("multiple assignment not supported")
         t = node.targets[0]
         v = node.value
+        if isinstance(t, ast.Name):
+            if self._is_python_list_expr(v):
+                self.python_list_vars.add(t.id)
+            else:
+                self.python_list_vars.discard(t.id)
         if isinstance(t, ast.Name) and t.id in self.reserved_names:
             t = ast.Name(id=self._aliased_name(t.id), ctx=t.ctx)
+
+        def _is_rng_source(src):
+            if (
+                isinstance(src, ast.Attribute)
+                and isinstance(src.value, ast.Name)
+                and src.value.id == "np"
+                and src.attr == "random"
+            ):
+                return True
+            if isinstance(src, ast.Name) and (src.id == "random" or src.id in self.rng_vars):
+                return True
+            return False
         if isinstance(t, ast.Name):
             vec_target = self._vectorize_target_name(v)
             if vec_target is not None:
@@ -9977,6 +10178,7 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"call seed_rng(int({seed_expr}))")
             # Keep a placeholder scalar for the RNG object name.
             self.o.w(f"{t.id} = 0")
+            self.rng_vars.add(t.id)
             return
 
         # x = np.random.normal(...) / np.random.standard_normal(...) / rng.{...}
@@ -9984,6 +10186,7 @@ class translator(ast.NodeVisitor):
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
+            and _is_rng_source(v.func.value)
             and v.func.attr in {"normal", "standard_normal"}
         ):
             is_standard = (v.func.attr == "standard_normal")
@@ -10063,6 +10266,7 @@ class translator(ast.NodeVisitor):
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
+            and _is_rng_source(v.func.value)
             and v.func.attr in {
                 "exponential", "gamma", "beta", "lognormal", "chisquare",
                 "standard_exponential", "standard_gamma", "standard_t", "f",
