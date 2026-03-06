@@ -95,6 +95,7 @@ public :: ones_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in
 public :: zeros_logical !@pyapi kind=function ret=logical(:) args=n:integer:intent(in) desc="allocate and return length-n logical array initialized to .false."
 public :: ones_logical !@pyapi kind=function ret=logical(:) args=n:integer:intent(in) desc="allocate and return length-n logical array initialized to .true."
 public :: strvec_t !@pyapi kind=type desc="string vector helper type"
+public :: py_str !@pyapi kind=function ret=character args=x:any:intent(in) desc="python-like str() conversion for scalar int/real/logical/char"
 public :: to_lower !@pyapi kind=function ret=character args=s:character:intent(in) desc="lowercase string"
 public :: to_upper !@pyapi kind=function ret=character args=s:character:intent(in) desc="uppercase string"
 public :: str_strip !@pyapi kind=function ret=character args=s:character:intent(in),chars:character:intent(in):optional desc="strip leading/trailing characters"
@@ -115,6 +116,7 @@ public :: str_isspace !@pyapi kind=function ret=logical args=s:character:intent(
 
 public :: cumsum_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative sum of real vector"
 public :: unique_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="sorted unique values of integer vector"
+public :: unique_char !@pyapi kind=function ret=character(:) args=x:character(:):intent(in) desc="unique values of character vector (first-occurrence order)"
 public :: tile_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="tile integer vector reps times"
 public :: tile_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile integer matrix reps0 x reps1 times"
 public :: diag_from_vec_int !@pyapi kind=function ret=integer(:,:) args=v:integer(:):intent(in) desc="return diagonal matrix from integer vector"
@@ -143,6 +145,8 @@ public :: searchsorted_left_int_scalar !@pyapi kind=function ret=integer args=a:
 public :: searchsorted_right_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) desc="searchsorted right index for scalar integer query"
 public :: setdiff1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique values in a not in b"
 public :: intersect1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique intersection of a and b"
+public :: setdiff1d_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),b:character(:):intent(in) desc="unique values in a not in b (character)"
+public :: intersect1d_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),b:character(:):intent(in) desc="unique intersection of a and b (character)"
 public :: unique_int_inv_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),inv:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with inverse and counts"
 public :: unique_int_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with counts"
 public :: lexsort2_int !@pyapi kind=function ret=integer(:) args=key0:integer(:):intent(in),key1:integer(:):intent(in) desc="lexsort((key0,key1)): sort by key1 then key0, return 0-based indices"
@@ -241,7 +245,7 @@ interface tile
 end interface tile
 
 interface unique
-   module procedure unique_real, unique_int
+   module procedure unique_real, unique_int, unique_char
 end interface unique
 
 interface sort_vec
@@ -292,6 +296,11 @@ interface allclose
    module procedure allclose_real, allclose_integer
 end interface allclose
 
+interface py_str
+   module procedure py_str_int, py_str_real, py_str_logical, py_str_char
+   module procedure py_str_int_vec, py_str_real_vec, py_str_logical_vec, py_str_char_vec
+end interface py_str
+
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
 end interface linalg_solve
@@ -334,6 +343,75 @@ contains
          end do
          write(*,'(a)') ']'
       end subroutine print_int_list
+
+      function py_str_int(x) result(s)
+         integer, intent(in) :: x
+         character(len=:), allocatable :: s
+         character(len=64) :: buf
+         write(buf, "(i0)") x
+         s = trim(adjustl(buf))
+      end function py_str_int
+
+      function py_str_real(x) result(s)
+         real(kind=dp), intent(in) :: x
+         character(len=:), allocatable :: s
+         character(len=128) :: buf
+         write(buf, "(g0)") x
+         s = trim(adjustl(buf))
+      end function py_str_real
+
+      function py_str_logical(x) result(s)
+         logical, intent(in) :: x
+         character(len=:), allocatable :: s
+         if (x) then
+            s = "True"
+         else
+            s = "False"
+         end if
+      end function py_str_logical
+
+      function py_str_char(x) result(s)
+         character(len=*), intent(in) :: x
+         character(len=:), allocatable :: s
+         s = x
+      end function py_str_char
+
+      function py_str_int_vec(x) result(s)
+         integer, intent(in) :: x(:)
+         character(len=:), allocatable :: s(:)
+         integer :: i
+         allocate(character(len=64) :: s(size(x)))
+         do i = 1, size(x)
+            s(i) = py_str_int(x(i))
+         end do
+      end function py_str_int_vec
+
+      function py_str_real_vec(x) result(s)
+         real(kind=dp), intent(in) :: x(:)
+         character(len=:), allocatable :: s(:)
+         integer :: i
+         allocate(character(len=128) :: s(size(x)))
+         do i = 1, size(x)
+            s(i) = py_str_real(x(i))
+         end do
+      end function py_str_real_vec
+
+      function py_str_logical_vec(x) result(s)
+         logical, intent(in) :: x(:)
+         character(len=:), allocatable :: s(:)
+         integer :: i
+         allocate(character(len=5) :: s(size(x)))
+         do i = 1, size(x)
+            s(i) = py_str_logical(x(i))
+         end do
+      end function py_str_logical_vec
+
+      function py_str_char_vec(x) result(s)
+         character(len=*), intent(in) :: x(:)
+         character(len=:), allocatable :: s(:)
+         allocate(character(len=len(x)) :: s(size(x)))
+         s = x
+      end function py_str_char_vec
 
       subroutine seed_rng(seed)
          integer, intent(in), optional :: seed
@@ -1731,6 +1809,54 @@ contains
          if (nout > 0) c = tmp(1:nout)
       end function intersect1d_int
 
+      function setdiff1d_char(a, b) result(c)
+         character(len=*), intent(in) :: a(:), b(:)
+         character(len=:), allocatable :: c(:)
+         character(len=:), allocatable :: ua(:), ub(:), tmp(:)
+         integer :: i, j, nout, llen
+         ua = unique_char(a)
+         ub = unique_char(b)
+         llen = max(len(a), len(b))
+         if (llen < 1) llen = 1
+         allocate(character(len=llen) :: tmp(size(ua)))
+         nout = 0
+         do i = 1, size(ua)
+            do j = 1, size(ub)
+               if (ua(i) == ub(j)) exit
+            end do
+            if (j > size(ub)) then
+               nout = nout + 1
+               tmp(nout) = ua(i)
+            end if
+         end do
+         allocate(character(len=llen) :: c(nout))
+         if (nout > 0) c = tmp(1:nout)
+      end function setdiff1d_char
+
+      function intersect1d_char(a, b) result(c)
+         character(len=*), intent(in) :: a(:), b(:)
+         character(len=:), allocatable :: c(:)
+         character(len=:), allocatable :: ua(:), ub(:), tmp(:)
+         integer :: i, j, nout, llen
+         ua = unique_char(a)
+         ub = unique_char(b)
+         llen = max(len(a), len(b))
+         if (llen < 1) llen = 1
+         allocate(character(len=llen) :: tmp(min(size(ua), size(ub))))
+         nout = 0
+         do i = 1, size(ua)
+            do j = 1, size(ub)
+               if (ua(i) == ub(j)) then
+                  nout = nout + 1
+                  tmp(nout) = ua(i)
+                  exit
+               end if
+            end do
+         end do
+         allocate(character(len=llen) :: c(nout))
+         if (nout > 0) c = tmp(1:nout)
+      end function intersect1d_char
+
       subroutine unique_int_inv_counts(a, u, inv, cnt)
          integer, intent(in) :: a(:)
          integer, allocatable, intent(out) :: u(:), inv(:), cnt(:)
@@ -2567,6 +2693,42 @@ contains
          end do
          deallocate(tmp)
       end function unique_int
+
+      function unique_char(x) result(y)
+         character(len=*), intent(in) :: x(:)
+         character(len=:), allocatable :: y(:)
+         integer :: i, j, n, m, llen
+         logical :: seen
+         n = size(x)
+         llen = len(x)
+         if (llen < 1) llen = 1
+         m = 0
+         do i = 1, n
+            seen = .false.
+            do j = 1, i - 1
+               if (x(i) == x(j)) then
+                  seen = .true.
+                  exit
+               end if
+            end do
+            if (.not. seen) m = m + 1
+         end do
+         allocate(character(len=llen) :: y(m))
+         m = 0
+         do i = 1, n
+            seen = .false.
+            do j = 1, i - 1
+               if (x(i) == x(j)) then
+                  seen = .true.
+                  exit
+               end if
+            end do
+            if (.not. seen) then
+               m = m + 1
+               y(m) = x(i)
+            end if
+         end do
+      end function unique_char
 
       function tile_int(x, reps) result(y)
          integer, intent(in) :: x(:)

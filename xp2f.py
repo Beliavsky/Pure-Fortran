@@ -577,6 +577,44 @@ def rename_conflicting_identifiers(src_text):
 
 def simplify_generated_parentheses(lines):
     """Targeted paren cleanup that preserves indentation/layout."""
+    def _split_top_level_commas(s):
+        out = []
+        cur = []
+        depth = 0
+        in_str = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                cur.append(ch)
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "," and depth == 0:
+                out.append("".join(cur).strip())
+                cur = []
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+        if cur:
+            out.append("".join(cur).strip())
+        return out
+
     def _simplify_intrinsic_single_arg_double_parens(code, fname):
         low = code.lower()
         fn = fname.lower()
@@ -628,6 +666,44 @@ def simplify_generated_parentheses(lines):
             out.append(code[i:p + 1])
             i = p + 1
         return "".join(out)
+
+    def _split_top_level_concat(s):
+        out = []
+        cur = []
+        depth = 0
+        in_str = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                cur.append(ch)
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "/" and i + 1 < len(s) and s[i + 1] == "/" and depth == 0:
+                out.append("".join(cur).strip())
+                cur = []
+                i += 2
+                continue
+            cur.append(ch)
+            i += 1
+        if cur:
+            out.append("".join(cur).strip())
+        return out
 
     out = []
     do_re = re.compile(
@@ -688,6 +764,24 @@ def simplify_generated_parentheses(lines):
                         break
                     prev = cur
                 code = lhs + prev
+
+        # PRINT argument cleanup:
+        #   print *, (expr) -> print *, expr
+        m_pr = re.match(r"^(\s*print\s*\*,\s*)(.+)$", code, flags=re.IGNORECASE)
+        if m_pr:
+            head, rhs = m_pr.group(1), m_pr.group(2)
+            parts = _split_top_level_commas(rhs)
+            if parts:
+                cleaned = []
+                for p in parts:
+                    q = strip_redundant_outer_parens_expr(p)
+                    cparts = _split_top_level_concat(q)
+                    if len(cparts) > 1:
+                        cparts = [strip_redundant_outer_parens_expr(cp) for cp in cparts]
+                        q = " // ".join(cparts)
+                    cleaned.append(q)
+                parts = cleaned
+                code = head + ", ".join(parts)
 
         if bang:
             out.append(code + bang + comment)
@@ -794,6 +888,20 @@ def normalize_unary_minus_after_operator(lines):
     for ln in lines:
         code, bang, comment = ln.partition("!")
         code = pat.sub(r"\1 (-\2)", code)
+        if bang:
+            out.append(code + bang + comment)
+        else:
+            out.append(code)
+    return out
+
+
+def normalize_string_concat_operator(lines):
+    """Repair accidental splitting of Fortran string concatenation `//`."""
+    out = []
+    pat = re.compile(r"(?<!/)/\s*/(?!/)")
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        code = pat.sub("//", code)
         if bang:
             out.append(code + bang + comment)
         else:
@@ -2211,6 +2319,16 @@ def detect_needed_helpers(tree):
                     needed.add("print_int_list")
             if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
                 needed.add("py_str")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"strip", "lstrip", "rstrip"}
+            ):
+                if node.func.attr == "strip":
+                    needed.add("str_strip")
+                elif node.func.attr == "lstrip":
+                    needed.add("str_lstrip")
+                else:
+                    needed.add("str_rstrip")
             self.generic_visit(node)
 
         def visit_Set(self, node):
@@ -4462,6 +4580,11 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.UnaryOp):
             return self._expr_kind(node.operand)
         if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Add):
+                lk = self._expr_kind(node.left)
+                rk = self._expr_kind(node.right)
+                if lk == "char" and rk == "char" and self._rank_expr(node.left) == 0 and self._rank_expr(node.right) == 0:
+                    return "char"
             if isinstance(node.op, ast.Div):
                 lk = self._expr_kind(node.left)
                 rk = self._expr_kind(node.right)
@@ -4566,6 +4689,14 @@ class translator(ast.NodeVisitor):
                     return "char"
             return None
         if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"strip", "lstrip", "rstrip"}
+                and len(node.args) <= 1
+            ):
+                bk = self._expr_kind(node.func.value)
+                if bk == "char":
+                    return "char"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
                 return self._expr_kind(node.func.value)
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
@@ -6292,6 +6423,14 @@ class translator(ast.NodeVisitor):
                     return f"repeat({a0}, max(0, {b0}))"
                 if rk == "char" and rr == 0 and lk == "int" and lr == 0:
                     return f"repeat({b0}, max(0, {a0}))"
+            # Python string concatenation.
+            if op is ast.Add:
+                lk = self._expr_kind(node.left)
+                rk = self._expr_kind(node.right)
+                lr = self._rank_expr(node.left)
+                rr = self._rank_expr(node.right)
+                if lk == "char" and rk == "char" and lr == 0 and rr == 0:
+                    return f"({a0} // {b0})"
             # Python list repetition semantics: n * list or list * n.
             if op is ast.Mult:
                 left_list = self._is_python_list_expr(node.left)
@@ -6834,6 +6973,15 @@ class translator(ast.NodeVisitor):
             ):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
+                if attr in {"strip", "lstrip", "rstrip"}:
+                    if len(node.args) > 1:
+                        raise NotImplementedError(f"{attr}() supports at most one argument")
+                    arg0 = self.expr(node.args[0]) if len(node.args) == 1 else None
+                    if attr == "strip":
+                        return f"str_strip({base_expr}, {arg0})" if arg0 is not None else f"str_strip({base_expr})"
+                    if attr == "lstrip":
+                        return f"str_lstrip({base_expr}, {arg0})" if arg0 is not None else f"str_lstrip({base_expr})"
+                    return f"str_rstrip({base_expr}, {arg0})" if arg0 is not None else f"str_rstrip({base_expr})"
                 if attr == "sum":
                     axis_node = None
                     keepdims = False
@@ -8780,6 +8928,18 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 return f"sqrt({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"strip", "lstrip", "rstrip"}
+                and len(node.args) <= 1
+            ):
+                base = self.expr(node.func.value)
+                arg0 = self.expr(node.args[0]) if len(node.args) == 1 else None
+                if node.func.attr == "strip":
+                    return f"str_strip({base}, {arg0})" if arg0 is not None else f"str_strip({base})"
+                if node.func.attr == "lstrip":
+                    return f"str_lstrip({base}, {arg0})" if arg0 is not None else f"str_lstrip({base})"
+                return f"str_rstrip({base}, {arg0})" if arg0 is not None else f"str_rstrip({base})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -16100,6 +16260,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = simplify_allocate_shape_to_mold(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_redundant_parens_in_lines(f90_lines)
+    f90_lines = normalize_string_concat_operator(f90_lines)
     f90_lines = normalize_unary_minus_after_operator(f90_lines)
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = remove_empty_if_blocks(f90_lines)
@@ -16119,6 +16280,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = simplify_redundant_int_casts(f90_lines)
     f90_lines = promote_immediate_scalar_constants(f90_lines)
+    f90_lines = normalize_string_concat_operator(f90_lines)
     f90_lines = normalize_unary_minus_after_operator(f90_lines)
     f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
