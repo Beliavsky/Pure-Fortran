@@ -37,6 +37,8 @@ from fortran_scan import (
     wrap_long_declaration_lines,
 )
 
+SHOW_TRANSLATION_NOTES = False
+
 
 def run_capture(cmd, tee=False, stream_line_filter=None):
     """
@@ -5905,6 +5907,17 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"sum", "max", "min"}
+                and len(node.args) >= 1
+            ):
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"real", "int", "logical", "complex", "char"}:
+                    return k0
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"mean", "var", "std", "log2", "log10", "nansum", "nanmean", "nanvar", "nanstd", "nanmin", "nanmax"}
                 and len(node.args) >= 1
             ):
@@ -7649,8 +7662,18 @@ class translator(ast.NodeVisitor):
                     else:
                         base_view = f"{base}({', '.join(comps)})"
                     out_expr = base_view
+                    # Common NumPy broadcast pattern for pairwise differences:
+                    #   x[:, None, :] and x[None, :, :]
+                    # Fortran has no implicit broadcasting, so expand the inserted
+                    # axis to size(x,1) directly when all consumed axes are full slices.
+                    is_full_slice = lambda a: isinstance(a, ast.Slice) and a.lower is None and a.upper is None and a.step is None
+                    full_slices_only = all(is_full_slice(a) for a in non_none)
+                    if len(elts3) == 3 and eff_base_rank == 2 and full_slices_only:
+                        nc_default = _dim_size_expr(1)
+                    else:
+                        nc_default = "1"
                     for p0 in none_pos:
-                        out_expr = f"spread({out_expr}, dim={p0 + 1}, ncopies=1)"
+                        out_expr = f"spread({out_expr}, dim={p0 + 1}, ncopies={nc_default})"
                     return out_expr
 
                 # General 3D scalar/slice indexing.
@@ -17039,13 +17062,26 @@ def generate_flat(
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None
 ):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
+    def _tuple_subscript_base_rank(elts):
+        # Base-array rank consumed by a tuple subscript.
+        # `None`/`np.newaxis` inserts an axis and does not consume one.
+        # Ellipsis is ignored here (conservative lower bound).
+        r = 0
+        for e in elts:
+            if is_none(e):
+                continue
+            if isinstance(e, ast.Constant) and e.value is Ellipsis:
+                continue
+            r += 1
+        return r
+
     def _infer_arg_rank_in_fn(fn, nm):
         rr = 0
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == nm:
                     if isinstance(n.slice, ast.Tuple):
-                        rr = max(rr, len(n.slice.elts))
+                        rr = max(rr, _tuple_subscript_base_rank(n.slice.elts))
                     else:
                         rr = max(rr, 1)
                 if (
@@ -18448,7 +18484,7 @@ def main():
     ap.add_argument("--comment", action="store_true", help="emit generated procedure/argument comments")
     ap.add_argument(
         "--compiler",
-        default="gfortran -O3 -march=native -flto",
+        default="gfortran -O3 -march=native -flto -Wfatal-errors",
         help='compiler command, e.g. "gfortran -O2 -Wall"',
     )
     args = ap.parse_args()
@@ -18548,9 +18584,9 @@ def main():
         return 1
     timings["transpile"] = time.perf_counter() - t0_transpile
     print(f"wrote {out}")
-    if used_flat_fallback and not args.flat:
+    if SHOW_TRANSLATION_NOTES and used_flat_fallback and not args.flat:
         print("note: structured mode not applicable; used flat mode fallback")
-    if used_main_unwrap:
+    if SHOW_TRANSLATION_NOTES and used_main_unwrap:
         print("note: unwrapped guarded main() body for transpilation")
     if args.tee:
         try:
