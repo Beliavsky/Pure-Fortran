@@ -2563,6 +2563,25 @@ def detect_needed_helpers(tree):
     }
 
     class scan(ast.NodeVisitor):
+        def __init__(self):
+            super().__init__()
+            self.rng_names = set()
+
+        def visit_Assign(self, node):
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Attribute)
+                and isinstance(node.value.func.value.value, ast.Name)
+                and node.value.func.value.value.id == "np"
+                and node.value.func.value.attr == "random"
+                and node.value.func.attr == "default_rng"
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                self.rng_names.add(node.targets[0].id)
+            self.generic_visit(node)
+
         def visit_Call(self, node):
             if isinstance(node.func, ast.Name) and node.func.id == "set":
                 needed.add("unique_char")
@@ -2593,11 +2612,25 @@ def detect_needed_helpers(tree):
                     needed.add("random_mvn_samples")
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.rng_names
+                and node.func.attr in {"normal", "standard_normal"}
+            ):
+                needed.add("rnorm")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
                 and node.func.value.attr == "random"
                 and node.func.attr in {"rand", "random"}
+            ):
+                needed.add("runif")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.rng_names
+                and node.func.attr == "random"
             ):
                 needed.add("runif")
             if (
@@ -4435,6 +4468,7 @@ class translator(ast.NodeVisitor):
         local_func_dict_arg_types=None,
         local_elemental_funcs=None,
         optional_dummy_args=None,
+        tuple_return_out_names=None,
         structured_type_components=None,
         structured_array_types=None,
         structured_dtype_strings=None,
@@ -4483,6 +4517,7 @@ class translator(ast.NodeVisitor):
         self.local_func_dict_arg_types = dict(local_func_dict_arg_types or {})
         self.local_elemental_funcs = set(local_elemental_funcs or [])
         self.optional_dummy_args = set(optional_dummy_args or [])
+        self.tuple_return_out_names = list(tuple_return_out_names or [])
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
@@ -6482,6 +6517,39 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Attribute) and node.attr == "T":
             return self._rank_expr(node.value)
         if isinstance(node, ast.Call):
+            def _is_rng_rank_source(src):
+                if (
+                    isinstance(src, ast.Attribute)
+                    and isinstance(src.value, ast.Name)
+                    and src.value.id == "np"
+                    and src.attr == "random"
+                ):
+                    return True
+                if isinstance(src, ast.Name):
+                    return True
+                return False
+
+            if (
+                isinstance(node.func, ast.Attribute)
+                and _is_rng_rank_source(node.func.value)
+                and node.func.attr in {"random", "normal", "standard_normal"}
+            ):
+                size_node = None
+                if node.func.attr in {"random", "standard_normal"}:
+                    if len(node.args) >= 1:
+                        size_node = node.args[0]
+                else:
+                    if len(node.args) >= 3:
+                        size_node = node.args[2]
+                for kw in node.keywords:
+                    if kw.arg == "size":
+                        size_node = kw.value
+                if size_node is None:
+                    return 0
+                if isinstance(size_node, (ast.Tuple, ast.List)):
+                    return max(1, len(size_node.elts))
+                return 1
+
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 if len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -6506,6 +6574,12 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id in {"log_normal_pdf_1d", "normal_logpdf_1d"}:
                     return 2
+                if node.func.id in {"runif", "rnorm"}:
+                    if len(node.args) >= 2:
+                        return 2
+                    if len(node.args) == 1:
+                        return 1
+                    return 0
                 if node.func.id in self.local_elemental_funcs and len(node.args) >= 1:
                     return max(self._rank_expr(a) for a in node.args)
                 if node.func.id == "reshape" and len(node.args) >= 2 and isinstance(node.args[1], ast.List):
@@ -9751,7 +9825,11 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "sqrt"
                 and len(node.args) == 1
             ):
-                return f"sqrt({self.expr(node.args[0])})"
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"sqrt({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"strip", "lstrip", "rstrip"}
@@ -9782,7 +9860,11 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "sqrt"
                 and len(node.args) == 1
             ):
-                return f"sqrt({self.expr(node.args[0])})"
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"sqrt({a0})"
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
@@ -14150,6 +14232,13 @@ class translator(ast.NodeVisitor):
     def visit_Return(self, node):
         self._emit_comments_for(node)
         if node.value is not None:
+            if self.tuple_return_out_names:
+                if not (isinstance(node.value, ast.Tuple) and len(node.value.elts) == len(self.tuple_return_out_names)):
+                    raise NotImplementedError("inconsistent tuple return shape")
+                for j, e in enumerate(node.value.elts):
+                    self.o.w(f"{self.tuple_return_out_names[j]} = {self.expr(e)}")
+                self.o.w("return")
+                return
             if self.function_result_name is None:
                 raise NotImplementedError("return value only supported in function context")
             # Mixed-rank Python returns (e.g., conditional x vs x.ravel()) cannot
@@ -15110,15 +15199,20 @@ def _emit_local_function(
     elemental_funcs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
-    args = [a.arg for a in fn.args.args]
+    arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
+    args = [a.arg for a in arg_nodes]
     proc_name = proc_name_override or fn.name
     ret_name = f"{proc_name}_result"
     defaults_map = {}
     if fn.args.defaults:
-        arg_names = [a.arg for a in fn.args.args]
-        tail_names = arg_names[len(arg_names) - len(fn.args.defaults):]
+        pos_names = [a.arg for a in fn.args.args]
+        tail_names = pos_names[len(pos_names) - len(fn.args.defaults):]
         for nm, dv in zip(tail_names, fn.args.defaults):
             defaults_map[nm] = dv
+    for a, dv in zip(fn.args.kwonlyargs, fn.args.kw_defaults):
+        # kw-only parameters with no default are required (kw_default is None).
+        if dv is not None:
+            defaults_map[a.arg] = dv
     # Any Python argument with a default can be omitted at call sites; mark its
     # Fortran dummy counterpart OPTIONAL.
     optional_args = set(defaults_map.keys())
@@ -15309,7 +15403,7 @@ def _emit_local_function(
                     and isinstance(n.func, ast.Attribute)
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "np"
-                    and n.func.attr in {"max", "sum", "log", "exp", "sqrt", "maximum", "asarray"}
+                    and n.func.attr in {"max", "sum"}
                     and len(n.args) >= 1
                     and isinstance(n.args[0], ast.Name)
                     and n.args[0].id == nm
@@ -15319,7 +15413,7 @@ def _emit_local_function(
         return rr
 
     dict_arg_names = set((dict_arg_types or {}).keys())
-    for a in fn.args.args:
+    for a in arg_nodes:
         if a.arg in dict_arg_names:
             continue
         rr = 0 if is_elemental_fn else _pre_arg_rank(a.arg)
@@ -15329,12 +15423,12 @@ def _emit_local_function(
         if force_arg_kinds is not None and a.arg in force_arg_kinds:
             rk_hint = force_arg_kinds[a.arg]
         if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
-            idxk = next((i for i, aa in enumerate(fn.args.args) if aa.arg == a.arg), -1)
+            idxk = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
             if idxk >= 0 and idxk < len(local_func_arg_kinds[fn.name]):
                 if rk_hint is None:
                     rk_hint = local_func_arg_kinds[fn.name][idxk]
         if (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
-            idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == a.arg), -1)
+            idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
         if rr > 0:
@@ -15407,9 +15501,13 @@ def _emit_local_function(
         tuple_return = True
         for j, e in enumerate(returns[0].value.elts):
             if isinstance(e, ast.Name):
-                out_names.append(e.id)
+                nm = e.id
+                if nm in args:
+                    nm = f"{proc_name}_out_{j + 1}"
+                out_names.append(nm)
             else:
                 out_names.append(f"{proc_name}_out_{j + 1}")
+    tr.tuple_return_out_names = list(out_names)
     if returns and (not tuple_return) and (not dict_return):
         rv0 = returns[0].value
         rr0 = max(0, int(tr._rank_expr(rv0)))
@@ -15486,15 +15584,18 @@ def _emit_local_function(
     if not no_comment:
         o.w(f"! {procedure_comment(fn.name, 'subroutine' if (tuple_return or void_return) else 'function')}")
     ann_map = {}
-    for a in fn.args.args:
+    for a in arg_nodes:
         if a.annotation is not None and hasattr(ast, "unparse"):
             ann_map[a.arg] = ast.unparse(a.annotation).lower()
     defaults_map = {}
     if fn.args.defaults:
-        arg_names = [a.arg for a in fn.args.args]
-        tail_names = arg_names[len(arg_names) - len(fn.args.defaults):]
+        pos_names = [a.arg for a in fn.args.args]
+        tail_names = pos_names[len(pos_names) - len(fn.args.defaults):]
         for nm, dv in zip(tail_names, fn.args.defaults):
             defaults_map[nm] = dv
+    for a, dv in zip(fn.args.kwonlyargs, fn.args.kw_defaults):
+        if dv is not None:
+            defaults_map[a.arg] = dv
     def _name_used(node, nm):
         def rec(x):
             if isinstance(x, ast.Name) and x.id == nm:
@@ -15587,7 +15688,7 @@ def _emit_local_function(
                     and isinstance(n.func, ast.Attribute)
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "np"
-                    and n.func.attr in {"max", "sum", "log", "exp", "sqrt", "maximum", "asarray"}
+                    and n.func.attr in {"max", "sum"}
                     and len(n.args) >= 1
                     and isinstance(n.args[0], ast.Name)
                     and n.args[0].id == nm
@@ -15683,7 +15784,7 @@ def _emit_local_function(
         if force_arg_kinds is not None and arg in force_arg_kinds:
             hint_kind = force_arg_kinds[arg]
         if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
-            idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == arg), -1)
+            idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
                 if hint_kind is None:
                     hint_kind = local_func_arg_kinds[fn.name][idx]
@@ -15699,7 +15800,7 @@ def _emit_local_function(
         if arg in tr.alloc_complex_rank:
             arr_rank = max(arr_rank, int(tr.alloc_complex_rank.get(arg, 0)))
         if (force_arg_ranks is None or arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
-            idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == arg), -1)
+            idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 arr_rank = max(arr_rank, int(local_func_arg_ranks[fn.name][idx]))
         if arg in (dict_arg_types or {}):
@@ -16171,7 +16272,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
         # Seed argument rank/kind from call-site observations when available.
         rr_h = arg_rank_hints.get(fn.name, [])
         rk_h = arg_kind_hints.get(fn.name, [])
-        for i, a in enumerate(fn.args.args):
+        fn_args_all = list(fn.args.args) + list(fn.args.kwonlyargs)
+        for i, a in enumerate(fn_args_all):
             rr = rr_h[i] if i < len(rr_h) else 0
             rk = rk_h[i] if i < len(rk_h) else None
             if rr > 0:
@@ -16282,7 +16384,7 @@ def generate_flat(
                     and isinstance(n.func, ast.Attribute)
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "np"
-                    and n.func.attr in {"max", "sum", "log", "exp", "sqrt", "maximum", "asarray"}
+                    and n.func.attr in {"max", "sum"}
                     and len(n.args) >= 1
                     and isinstance(n.args[0], ast.Name)
                     and n.args[0].id == nm
@@ -16291,13 +16393,17 @@ def generate_flat(
                     rr = max(rr, 2 if axis_present else 1)
         return rr
 
+    local_arg_names_map = {
+        fn.name: [a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))]
+        for fn in (local_funcs or [])
+    }
     # Gather call-site rank/kind hints for local function arguments.
-    call_rank_hints = {fn.name: [0 for _ in fn.args.args] for fn in (local_funcs or [])}
-    call_kind_hints = {fn.name: [None for _ in fn.args.args] for fn in (local_funcs or [])}
-    call_kind_sets = {fn.name: [set() for _ in fn.args.args] for fn in (local_funcs or [])}
-    call_rank_sets = {fn.name: [set() for _ in fn.args.args] for fn in (local_funcs or [])}
-    call_kind_rank_pairs = {fn.name: [set() for _ in fn.args.args] for fn in (local_funcs or [])}
-    call_kind_rank_islist = {fn.name: [set() for _ in fn.args.args] for fn in (local_funcs or [])}
+    call_rank_hints = {fn.name: [0 for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    call_kind_hints = {fn.name: [None for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    call_kind_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    call_rank_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    call_kind_rank_pairs = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    call_kind_rank_islist = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     if local_funcs:
         tr_seed = translator(emit(), params=params, context="flat", list_counts=list_counts)
         tr_seed.prescan(tree.body)
@@ -16358,6 +16464,34 @@ def generate_flat(
                                 if pk in {"int", "real", "logical", "char"}:
                                     is_list = bool(tr_seed._is_python_list_expr(a))
                                     krl[i].add((pk, pr, is_list))
+                if n.keywords:
+                    name_to_idx = {nm: i for i, nm in enumerate(local_arg_names_map.get(callee, []))}
+                    for kw in n.keywords:
+                        if kw.arg is None or kw.arg not in name_to_idx:
+                            continue
+                        i = name_to_idx[kw.arg]
+                        ar = tr_seed._rank_expr(kw.value)
+                        rr[i] = max(rr[i], ar)
+                        rrs[i].add(ar)
+                        ak = tr_seed._expr_kind(kw.value)
+                        if ak is not None:
+                            krp[i].add((ak, ar))
+                            krl[i].add((ak, ar, bool(tr_seed._is_python_list_expr(kw.value))))
+                            rks[i].add(ak)
+                            if rk[i] is None:
+                                rk[i] = ak
+                            elif rk[i] != ak:
+                                if "real" in {rk[i], ak} and "logical" not in {rk[i], ak}:
+                                    rk[i] = "real"
+                        if isinstance(kw.value, ast.Name):
+                            anm = tr_seed._aliased_name(tr_seed._resolve_list_alias(kw.value.id))
+                            poss = _name_possible_specs(tr_seed, anm)
+                            if poss:
+                                for pk, pr in poss:
+                                    krp[i].add((pk, pr))
+                                    if pk in {"int", "real", "logical", "char"}:
+                                        is_list = bool(tr_seed._is_python_list_expr(kw.value))
+                                        krl[i].add((pk, pr, is_list))
 
     local_return_specs, tuple_return_out_kinds = _local_return_maps(
         local_funcs,
@@ -16370,8 +16504,8 @@ def generate_flat(
     local_func_arg_kinds = {}
     local_func_arg_names = {}
     for fn in (local_funcs or []):
-        local_func_arg_names[fn.name] = [a.arg for a in fn.args.args]
-        base_ranks = [_infer_arg_rank_in_fn(fn, a.arg) for a in fn.args.args]
+        local_func_arg_names[fn.name] = list(local_arg_names_map.get(fn.name, []))
+        base_ranks = [_infer_arg_rank_in_fn(fn, a) for a in local_func_arg_names[fn.name]]
         base_func_arg_ranks[fn.name] = list(base_ranks)
         hint_ranks = call_rank_hints.get(fn.name, [])
         hint_kinds = call_kind_hints.get(fn.name, [])
@@ -16385,12 +16519,18 @@ def generate_flat(
         ]
     local_func_defaults = {}
     for fn in (local_funcs or []):
-        narg = len(fn.args.args)
+        fn_args_all = list(fn.args.args) + list(fn.args.kwonlyargs)
+        narg = len(fn_args_all)
         dfl = [None for _ in range(narg)]
         if fn.args.defaults:
-            start = narg - len(fn.args.defaults)
+            npos = len(fn.args.args)
+            start = npos - len(fn.args.defaults)
             for j, dv in enumerate(fn.args.defaults):
                 dfl[start + j] = dv
+        if fn.args.kwonlyargs:
+            start_kw = len(fn.args.args)
+            for j, dv in enumerate(fn.args.kw_defaults):
+                dfl[start_kw + j] = dv
         local_func_defaults[fn.name] = dfl
     dict_return_specs = {}
     dict_return_types = {}
