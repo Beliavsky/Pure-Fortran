@@ -103,6 +103,398 @@ def ensure_blank_line_between_module_procedures(lines: List[str]) -> List[str]:
     return out
 
 
+def ensure_blank_line_between_program_units(lines: List[str]) -> List[str]:
+    """Ensure at least one blank line between adjacent top-level modules/programs."""
+    out: List[str] = []
+    re_end_unit = re.compile(r"^\s*end\s+(module|program)\b", flags=re.IGNORECASE)
+    re_start_unit = re.compile(r"^\s*(module|program)\b", flags=re.IGNORECASE)
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        out.append(ln)
+        if re_end_unit.match(ln):
+            j = i + 1
+            while j < n and lines[j].strip() == "":
+                j += 1
+            if j < n and re_start_unit.match(lines[j]):
+                if not out or out[-1].strip() != "":
+                    out.append("\n" if any(("\n" in x) or ("\r" in x) for x in lines) else "")
+        i += 1
+    return out
+
+
+def simplify_norm2_patterns(lines: List[str]) -> List[str]:
+    """Rewrite simple Euclidean norm patterns to `norm2(...)`.
+
+    Conservative rewrite:
+    - `sqrt(sum(v**2))` -> `norm2(v)`
+    - `sqrt(sum((v)**2))` -> `norm2(v)`
+    where `v` is a simple identifier.
+    """
+    out: List[str] = []
+    pat = re.compile(
+        r"\bsqrt\s*\(\s*sum\s*\(\s*\(?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)?\s*\*\*\s*2\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    p_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    p_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+    decl_re = re.compile(r"^\s*([^!]*?)::\s*(.+)$")
+
+    def _split_decl_entities(rhs: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        for ch in rhs:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            parts.append("".join(cur).strip())
+        return [p for p in parts if p]
+
+    in_proc = False
+    array_names: set[str] = set()
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        if p_start_re.match(code):
+            in_proc = True
+            array_names = set()
+        if in_proc:
+            md = decl_re.match(code)
+            if md:
+                lhs = md.group(1).lower()
+                rhs = md.group(2)
+                has_dim_attr = "dimension(" in lhs
+                for ent in _split_decl_entities(rhs):
+                    mname = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", ent)
+                    if not mname:
+                        continue
+                    nm = mname.group(1).lower()
+                    if has_dim_attr or ("(" in ent and ")" in ent):
+                        array_names.add(nm)
+
+        def _repl(m: re.Match[str]) -> str:
+            nm = m.group(1).lower()
+            if in_proc and (nm in array_names):
+                return f"norm2({m.group(1)})"
+            return m.group(0)
+
+        code = pat.sub(_repl, code)
+        out.append(f"{code}{comment}{eol}")
+        if p_end_re.match(code):
+            in_proc = False
+            array_names = set()
+    return out
+
+
+def rewrite_named_arguments(lines: List[str], *, max_positional: int = 3) -> List[str]:
+    """Rewrite eligible positional call arguments into named arguments."""
+    out, _nchg, _missing = fscan.rewrite_named_arguments_in_lines(
+        lines,
+        max_positional=max_positional,
+        name_optional=False,
+        name_after_positional_limit=False,
+    )
+    return out
+
+
+def wrap_long_lines(lines: List[str], *, max_len: int = 80) -> List[str]:
+    """Wrap long Fortran statements using continuation lines."""
+    return fscan.wrap_long_fortran_lines(lines, max_len=max_len)
+
+
+def tighten_unary_minus_literal_spacing(lines: List[str]) -> List[str]:
+    """Collapse spaced unary-minus numeric literals, e.g. `- 1.2_dp` -> `-1.2_dp`."""
+    out: List[str] = []
+    # unary contexts: start-of-code, after opener/delimiter/operator
+    pat = re.compile(
+        r"(^|[=(,\[*/+\-]\s*)-\s+"
+        r"((?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+\-]?\d+)?(?:_[A-Za-z][A-Za-z0-9_]*)?)"
+    )
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        code = pat.sub(lambda m: f"{m.group(1)}-{m.group(2)}", code)
+        out.append(f"{code}{comment}{eol}")
+    return out
+
+
+def normalize_delimiter_inner_spacing(lines: List[str]) -> List[str]:
+    """Remove unnecessary spaces just inside () and [] outside strings/comments."""
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        chars = list(code)
+        i = 0
+        in_single = False
+        in_double = False
+        cleaned: List[str] = []
+        while i < len(chars):
+            ch = chars[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                cleaned.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                cleaned.append(ch)
+                i += 1
+                continue
+            if in_single or in_double:
+                cleaned.append(ch)
+                i += 1
+                continue
+            if ch in "([":
+                cleaned.append(ch)
+                i += 1
+                # drop spaces/tabs after opener
+                while i < len(chars) and chars[i] in {" ", "\t"}:
+                    i += 1
+                continue
+            if ch in ")]":
+                # trim spaces/tabs before closer
+                while cleaned and cleaned[-1] in {" ", "\t"}:
+                    cleaned.pop()
+                cleaned.append(ch)
+                i += 1
+                continue
+            cleaned.append(ch)
+            i += 1
+        out.append("".join(cleaned) + comment + eol)
+    return out
+
+
+def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
+    """Hoist simple procedure-level `use mod, only: ...` into module scope."""
+    out = list(lines)
+    mod_start_re = re.compile(r"^\s*module\s+([a-z][a-z0-9_]*)\b(?!\s*procedure\b)", re.IGNORECASE)
+    mod_end_re = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
+    contains_re = re.compile(r"^\s*contains\s*$", re.IGNORECASE)
+    proc_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+    use_only_re = re.compile(
+        r"^\s*use\s*(?:,\s*(?P<intrinsic>intrinsic|non_intrinsic)\s*)?"
+        r"(?:::)?\s*(?P<mod>[a-z][a-z0-9_]*)\s*,\s*only\s*:\s*(?P<syms>.+?)\s*$",
+        re.IGNORECASE,
+    )
+    implicit_none_re = re.compile(r"^\s*implicit\s+none\b", re.IGNORECASE)
+
+    def _parse_syms(s: str) -> List[str]:
+        parts = [p.strip() for p in s.split(",")]
+        out_syms: List[str] = []
+        for p in parts:
+            if not p:
+                continue
+            # Skip renames/operators conservatively.
+            if "=>" in p or "operator(" in p.lower() or "assignment(" in p.lower():
+                return []
+            if not re.match(r"^[a-z][a-z0-9_]*$", p, re.IGNORECASE):
+                return []
+            out_syms.append(p)
+        return out_syms
+
+    i = 0
+    n = len(out)
+    while i < n:
+        m0 = mod_start_re.match(fscan.strip_comment(out[i]).strip())
+        if not m0:
+            i += 1
+            continue
+        j = i + 1
+        contains_idx = -1
+        while j < n:
+            code_j = fscan.strip_comment(out[j]).strip()
+            if contains_re.match(code_j):
+                contains_idx = j
+            if mod_end_re.match(code_j):
+                break
+            j += 1
+        if j >= n or contains_idx < 0:
+            i = j + 1
+            continue
+        mod_end = j
+
+        # Existing module-level use-only imports.
+        module_use_lines: Dict[str, int] = {}
+        module_syms: Dict[str, set[str]] = {}
+        use_indent = None
+        insert_idx = None
+        for k in range(i + 1, contains_idx):
+            code_k, _ = xunused.split_code_comment(out[k].rstrip("\r\n"))
+            mk = use_only_re.match(code_k.strip())
+            if mk is not None and mk.group("intrinsic") is None:
+                mod_nm = mk.group("mod").lower()
+                syms = _parse_syms(mk.group("syms"))
+                if syms:
+                    module_use_lines[mod_nm] = k
+                    module_syms.setdefault(mod_nm, set()).update(s.lower() for s in syms)
+                    if use_indent is None:
+                        use_indent = re.match(r"^(\s*)", code_k).group(1)
+            if insert_idx is None and implicit_none_re.match(code_k):
+                insert_idx = k
+        if use_indent is None:
+            use_indent = re.match(r"^(\s*)", out[contains_idx]).group(1)
+        if insert_idx is None:
+            insert_idx = contains_idx
+
+        # Scan procedures for hoistable use-only lines.
+        hoist: Dict[str, set[str]] = {}
+        remove_lines: set[int] = set()
+        p = contains_idx + 1
+        while p < mod_end:
+            code_p = fscan.strip_comment(out[p]).strip()
+            if not proc_start_re.match(code_p):
+                p += 1
+                continue
+            q = p + 1
+            while q < mod_end:
+                code_q, _ = xunused.split_code_comment(out[q].rstrip("\r\n"))
+                mq = use_only_re.match(code_q.strip())
+                if mq is not None and mq.group("intrinsic") is None:
+                    mod_nm = mq.group("mod").lower()
+                    syms = _parse_syms(mq.group("syms"))
+                    if syms:
+                        hoist.setdefault(mod_nm, set()).update(s.lower() for s in syms)
+                        remove_lines.add(q)
+                if proc_end_re.match(fscan.strip_comment(out[q]).strip()):
+                    break
+                q += 1
+            p = q + 1
+
+        if not hoist:
+            i = mod_end + 1
+            continue
+
+        # Apply merged module use lists.
+        for mod_nm, syms in hoist.items():
+            merged = sorted(module_syms.get(mod_nm, set()).union(syms))
+            if mod_nm in module_use_lines:
+                k = module_use_lines[mod_nm]
+                eol = xunused.get_eol(out[k]) or ("\n" if out[k].endswith("\n") else "")
+                out[k] = f"{use_indent}use {mod_nm}, only: {', '.join(merged)}{eol}"
+            else:
+                eol = "\n" if any("\n" in ln or "\r" in ln for ln in out) else ""
+                out.insert(insert_idx, f"{use_indent}use {mod_nm}, only: {', '.join(merged)}{eol}")
+                # Shift pending line numbers after insertion.
+                remove_lines = {ln + 1 if ln >= insert_idx else ln for ln in remove_lines}
+                insert_idx += 1
+                contains_idx += 1
+                mod_end += 1
+
+        # Remove hoisted procedure-local lines.
+        for ln in sorted(remove_lines, reverse=True):
+            del out[ln]
+            if ln <= mod_end:
+                mod_end -= 1
+
+        n = len(out)
+        i = mod_end + 1
+
+    return out
+
+
+def apply_xindent_defaults(lines: List[str], *, max_len: int = 80) -> List[str]:
+    """Apply xindent.py default indentation/wrapping policy to emitted lines."""
+    plain_lines = [ln.rstrip("\r\n") for ln in lines]
+    src = ("\n".join(plain_lines) + "\n") if plain_lines else ""
+    src_lines = src.splitlines()
+    dst = fscan.indent_fortran_blocks(
+        src,
+        indent_step=3,
+        indent_proc=False,
+        indent_module=False,
+        indent_program=False,
+        indent_contains=False,
+    )
+    dst_lines = dst.splitlines()
+
+    def _max_leading_spaces(ls: List[str]) -> int:
+        m = 0
+        for ln in ls:
+            if not ln:
+                continue
+            n = len(ln) - len(ln.lstrip(" "))
+            if n > m:
+                m = n
+        return m
+
+    src_max = _max_leading_spaces(src_lines)
+    dst_max = _max_leading_spaces(dst_lines)
+    if dst_max > max(512, src_max + 120):
+        dst_lines = src_lines
+
+    # Match xindent.py low-risk wrapping behavior.
+    decl_like_re = re.compile(
+        r"^\s*(integer|real|logical|complex|character|type\s*\([^)]+\))\b.*::",
+        re.IGNORECASE,
+    )
+    use_like_re = re.compile(r"^\s*use\b", re.IGNORECASE)
+    wrapped: List[str] = []
+    for ln in dst_lines:
+        if len(ln) <= max_len:
+            wrapped.append(ln)
+            continue
+        if ("!" in ln) or ("'" in ln) or ('"' in ln) or ("//" in ln) or ("&" in ln):
+            wrapped.append(ln)
+            continue
+        if ("**" in ln) or (";" in ln):
+            wrapped.append(ln)
+            continue
+        if decl_like_re.match(ln):
+            wrapped.extend(fscan.wrap_long_declaration_lines([ln], max_len=max_len))
+            continue
+        if use_like_re.match(ln):
+            wrapped.extend(fscan.wrap_long_fortran_lines([ln], max_len=max_len))
+            continue
+        wrapped.append(ln)
+    return wrapped
+
+
+def simplify_bfgs_rank1_update(lines: List[str]) -> List[str]:
+    """Simplify over-expanded scalar-broadcast terms in BFGS rank-1 updates."""
+    out: List[str] = []
+    term_outer_ss = (
+        "spread(s, dim=2, ncopies=size(s)) * spread(s, dim=1, ncopies=size(s))"
+    )
+    term_outer_hys = (
+        "spread(hy, dim=2, ncopies=size(s)) * spread(s, dim=1, ncopies=size(hy)) + "
+        "spread(s, dim=2, ncopies=size(hy)) * spread(hy, dim=1, ncopies=size(s))"
+    )
+    pat1 = (
+        "spread((ys + real(matmul(y, hy), kind=dp)) / ys**2, dim=1, "
+        f"ncopies=size({term_outer_ss},1)) * {term_outer_ss}"
+    )
+    rep1 = f"((ys + dot_product(y, hy)) / (ys * ys)) * {term_outer_ss}"
+    pat2 = f"({term_outer_hys}) / spread(ys, dim=1, ncopies=size(({term_outer_hys}),1))"
+    rep2 = f"({term_outer_hys}) / ys"
+
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        if pat1 in code:
+            code = code.replace(pat1, rep1)
+        if pat2 in code:
+            code = code.replace(pat2, rep2)
+        out.append(f"{code}{comment}{eol}")
+    return out
+
+
 def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
     """Conservative wrapper for unneeded-parentheses cleanup.
 

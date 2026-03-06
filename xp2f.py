@@ -15173,6 +15173,7 @@ def _emit_local_function(
     o,
     fn,
     params,
+    needed_helpers=None,
     no_comment=False,
     known_pure_calls=None,
     comment_map=None,
@@ -15596,6 +15597,8 @@ def _emit_local_function(
     for a, dv in zip(fn.args.kwonlyargs, fn.args.kw_defaults):
         if dv is not None:
             defaults_map[a.arg] = dv
+    if any((not is_none(dv)) for dv in defaults_map.values()):
+        o.w("use python_mod, only: optval")
     def _name_used(node, nm):
         def rec(x):
             if isinstance(x, ast.Name) and x.id == nm:
@@ -15970,7 +15973,7 @@ def _emit_local_function(
                 tr._mark_real(alias)
             else:
                 tr._mark_int(alias)
-        optional_default_inits.append((arg, alias, tr.expr(dflt_node)))
+        optional_default_inits.append((arg, alias, tr.expr(dflt_node), arr_rank))
         tr.name_aliases[arg] = alias
     if tuple_return:
         for idx_out, nm in enumerate(out_names):
@@ -16164,16 +16167,21 @@ def _emit_local_function(
         rr = max(1, tr.alloc_char_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"character(len=:), allocatable :: {nm}({dims})")
-    for arg, alias, dflt_expr in optional_default_inits:
-        o.w(f"if (present({arg})) then")
-        o.push()
-        o.w(f"{alias} = {arg}")
-        o.pop()
-        o.w("else")
-        o.push()
-        o.w(f"{alias} = {dflt_expr}")
-        o.pop()
-        o.w("end if")
+    for arg, alias, dflt_expr, arr_rank in optional_default_inits:
+        if int(arr_rank) == 0:
+            if needed_helpers is not None:
+                needed_helpers.add("optval")
+            o.w(f"{alias} = optval({arg}, {dflt_expr})")
+        else:
+            o.w(f"if (present({arg})) then")
+            o.push()
+            o.w(f"{alias} = {arg}")
+            o.pop()
+            o.w("else")
+            o.push()
+            o.w(f"{alias} = {dflt_expr}")
+            o.pop()
+            o.w("end if")
     if keep_decl_blank:
         o.w("")
     for i, s in enumerate(fn.body):
@@ -16901,6 +16909,7 @@ def generate_flat(
                         om,
                         fn,
                         params,
+                        needed_helpers=needed_helpers,
                         no_comment=no_comment,
                         known_pure_calls=pure_local_calls,
                         comment_map=comment_map,
@@ -16931,6 +16940,7 @@ def generate_flat(
                     om,
                     fn,
                     params,
+                    needed_helpers=needed_helpers,
                     no_comment=no_comment,
                     known_pure_calls=pure_local_calls,
                     comment_map=comment_map,
@@ -17102,6 +17112,7 @@ def generate_flat(
                 o,
                 fn,
                 params,
+                needed_helpers=needed_helpers,
                 no_comment=no_comment,
                 known_pure_calls=pure_local_calls,
                 comment_map=comment_map,
@@ -17652,8 +17663,13 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = simplify_allocate_shape_to_mold(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
+    f90_lines = fpost.simplify_norm2_patterns(f90_lines)
+    f90_lines = fpost.simplify_bfgs_rank1_update(f90_lines)
+    f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
     f90_lines = normalize_string_concat_operator(f90_lines)
     f90_lines = normalize_unary_minus_after_operator(f90_lines)
+    f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
+    f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = remove_empty_if_blocks(f90_lines)
     f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
@@ -17661,6 +17677,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = remove_write_only_scalar_locals(f90_lines)
     f90_lines = remove_unused_named_constants(f90_lines)
     f90_lines = remove_unused_use_only_imports(f90_lines)
+    f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
     f90_lines = ensure_blank_line_between_procedures(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = ensure_blank_line_between_program_units(f90_lines)
@@ -17677,8 +17694,14 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = promote_immediate_scalar_constants(f90_lines)
     f90_lines = normalize_string_concat_operator(f90_lines)
     f90_lines = normalize_unary_minus_after_operator(f90_lines)
+    f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
+    f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
+    f90_lines = fpost.rewrite_named_arguments(f90_lines)
+    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
+    f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
+    f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
