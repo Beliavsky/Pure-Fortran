@@ -383,6 +383,104 @@ def call_forwarded_optional_safe_uses(
     return safe
 
 
+def iter_call_like_invocations(stmt: str) -> List[Tuple[str, str]]:
+    """Return (name, args_text) for call-like invocations found in one statement.
+
+    This is used to recognize function calls in expressions (for example:
+    ``x = f(a, b)``), not only ``call f(a, b)`` statements.
+    """
+    out: List[Tuple[str, str]] = []
+    s = stmt
+    n = len(s)
+    in_single = False
+    in_double = False
+    i = 0
+    while i < n:
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double or ch != "(":
+            i += 1
+            continue
+
+        # Find callee token immediately to the left of '('.
+        j = i - 1
+        while j >= 0 and s[j].isspace():
+            j -= 1
+        end = j + 1
+        while j >= 0 and (s[j].isalnum() or s[j] == "_"):
+            j -= 1
+        name = s[j + 1 : end].strip().lower()
+        if not name or not name[0].isalpha():
+            i += 1
+            continue
+
+        # Capture matching ')', honoring quotes and nested parentheses.
+        depth = 1
+        k = i + 1
+        inner_single = False
+        inner_double = False
+        while k < n and depth > 0:
+            c = s[k]
+            if c == "'" and not inner_double:
+                inner_single = not inner_single
+            elif c == '"' and not inner_single:
+                inner_double = not inner_double
+            elif not inner_single and not inner_double:
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+            k += 1
+        if depth != 0:
+            i += 1
+            continue
+        args_text = s[i + 1 : k - 1].strip()
+        out.append((name, args_text))
+        i = k
+    return out
+
+
+def function_forwarded_optional_safe_uses(
+    stmt: str,
+    opt_args: Set[str],
+    proc_meta: Dict[str, ProcMeta],
+) -> Set[str]:
+    """Return optional args safely forwarded to OPTIONAL function dummies."""
+    safe: Set[str] = set()
+    for callee, args_text in iter_call_like_invocations(stmt):
+        meta = proc_meta.get(callee)
+        if meta is None or not args_text:
+            continue
+        actuals = split_top_level_commas(args_text)
+        pos = 0
+        for raw in actuals:
+            t = raw.strip()
+            if not t:
+                pos += 1
+                continue
+            formal = ""
+            actual_expr = t
+            if "=" in t and "=>" not in t:
+                k, v = t.split("=", 1)
+                formal = k.strip().lower()
+                actual_expr = v.strip()
+            else:
+                if pos < len(meta.ordered_dummies):
+                    formal = meta.ordered_dummies[pos]
+                pos += 1
+            if not formal or formal not in meta.optional_dummies:
+                continue
+            safe.update(extract_optional_uses(actual_expr, opt_args))
+    return safe
+
+
 def call_forwarded_optional_unknown_uses(
     stmt: str,
     opt_args: Set[str],
@@ -444,6 +542,7 @@ def analyze_procedure_optional_use(path: Path, proc: fscan.Procedure, proc_meta:
             local_guard = set(guard_present) | (tset & opt_args)
             uses = extract_optional_uses(tail, opt_args)
             uses -= call_forwarded_optional_safe_uses(tail, opt_args, proc_meta)
+            uses -= function_forwarded_optional_safe_uses(tail, opt_args, proc_meta)
             unknown_forward = call_forwarded_optional_unknown_uses(tail, opt_args, proc_meta)
             for a in sorted(uses):
                 if a in local_guard:
@@ -506,6 +605,7 @@ def analyze_procedure_optional_use(path: Path, proc: fscan.Procedure, proc_meta:
 
         uses = extract_optional_uses(code, opt_args)
         uses -= call_forwarded_optional_safe_uses(code, opt_args, proc_meta)
+        uses -= function_forwarded_optional_safe_uses(code, opt_args, proc_meta)
         unknown_forward = call_forwarded_optional_unknown_uses(code, opt_args, proc_meta)
         for a in sorted(uses):
             if a in guard_present:

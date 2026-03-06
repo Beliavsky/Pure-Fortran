@@ -2611,6 +2611,7 @@ def detect_needed_helpers(tree):
         "moveaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
         "cov": {"cov2_real", "cov_matrix_rows_real"},
         "corrcoef": {"corrcoef2_real"},
+        "convolve": {"convolve_real", "convolve_int"},
         "pad": {"pad2d_int", "pad2d_real"},
         "allclose": {"allclose"},
         "polyval": {"polyval"},
@@ -4642,6 +4643,7 @@ class translator(ast.NodeVisitor):
         self.open_type_rebind_meta = []
         self.reserved_names = {"dp"}
         self.name_aliases = {}
+        self.fortran_name_owner = {}
         self.rng_vars = set()
         self.python_list_vars = set()
         self.list_aliases = {}
@@ -4692,10 +4694,20 @@ class translator(ast.NodeVisitor):
         if name in self.name_aliases:
             return self.name_aliases[name]
         if name in self.reserved_names:
-            alias = f"{name}_v"
-            self.name_aliases[name] = alias
-            return alias
-        return name
+            base = f"{name}_v"
+        else:
+            base = name
+        alias = base
+        k = 2
+        while (
+            alias.lower() in self.fortran_name_owner
+            and self.fortran_name_owner[alias.lower()] != name
+        ):
+            alias = f"{base}_{k}"
+            k += 1
+        self.name_aliases[name] = alias
+        self.fortran_name_owner[alias.lower()] = name
+        return alias
 
     def _coerce_local_actual_kind(self, callee, idx, arg_node, arg_expr):
         if callee in self.local_generic_overloads:
@@ -5080,6 +5092,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         if name in self.reals or name in self.complexes:
             return
         if name in self.logs:
@@ -5097,6 +5110,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         if name in self.logs:
             return
         if name in self.chars:
@@ -5114,6 +5128,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         if name in self.logs:
             return
         if name in self.chars:
@@ -5131,6 +5146,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         if name in self.chars:
             return
         if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals or name in self.alloc_chars:
@@ -5147,6 +5163,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals or name in self.alloc_complexes or name in self.alloc_chars:
             return
         self.chars.add(name)
@@ -5162,6 +5179,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         self.alloc_ints.add(name)
         if rank is None or rank < 1:
             rank = 1
@@ -5187,6 +5205,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         self.alloc_reals.add(name)
         if rank is None or rank < 1:
             rank = 1
@@ -5212,6 +5231,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         self.alloc_complexes.add(name)
         if rank is None or rank < 1:
             rank = 1
@@ -5237,6 +5257,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         self.alloc_logs.add(name)
         if rank is None or rank < 1:
             rank = 1
@@ -5262,6 +5283,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
+        name = self._aliased_name(name)
         self.alloc_chars.add(name)
         if rank is None or rank < 1:
             rank = 1
@@ -5610,6 +5632,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "diag" and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Name):
+                if node.func.id == "callable":
+                    return "logical"
                 if node.func.id in self.lambda_vars:
                     repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
                     if repl is not None:
@@ -5681,6 +5705,20 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "polyder"
                 and len(node.args) >= 1
             ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "convolve"
+                and len(node.args) >= 2
+            ):
+                k0 = self._expr_kind(node.args[0])
+                k1 = self._expr_kind(node.args[1])
+                if k0 == "real" or k1 == "real":
+                    return "real"
+                if k0 == "int" and k1 == "int":
+                    return "int"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -6649,6 +6687,10 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Attribute) and node.attr in {"T", "real", "imag"}:
             return self._rank_expr(node.value)
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in self.lambda_vars:
+                repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
+                if repl is not None:
+                    return self._rank_expr(repl)
             def _is_rng_rank_source(src):
                 if (
                     isinstance(src, ast.Attribute)
@@ -6781,6 +6823,8 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "searchsorted" and len(node.args) >= 2:
                     r = self._rank_expr(node.args[1])
                     return r if r > 0 else 0
+                if node.func.attr == "convolve" and len(node.args) >= 2:
+                    return 1
                 if (
                     node.func.attr == "reduceat"
                     and isinstance(node.func.value, ast.Attribute)
@@ -7557,6 +7601,43 @@ class translator(ast.NodeVisitor):
             ko = self._expr_kind(node.orelse)
             if kb == "char" or ko == "char":
                 raise NotImplementedError("unsupported expr: IfExp with character result")
+            def _cast_scalar(txt, src_kind, dst_kind):
+                if src_kind == dst_kind or dst_kind is None:
+                    return txt
+                if dst_kind == "real" and src_kind == "int":
+                    return f"real({txt}, kind=dp)"
+                if dst_kind == "complex" and src_kind in {"int", "real"}:
+                    rtxt = txt if src_kind == "real" else f"real({txt}, kind=dp)"
+                    return f"cmplx({rtxt}, 0.0_dp, kind=dp)"
+                return txt
+
+            def _broadcast_scalar_to_rank(stxt, arr_txt, rank):
+                if rank <= 0:
+                    return stxt
+                if rank == 1:
+                    return f"spread({stxt}, dim=1, ncopies=size({arr_txt}))"
+                if rank == 2:
+                    return (
+                        f"spread(spread({stxt}, dim=1, ncopies=size({arr_txt},1)), "
+                        f"dim=2, ncopies=size({arr_txt},2))"
+                    )
+                if rank == 3:
+                    return (
+                        f"spread(spread(spread({stxt}, dim=1, ncopies=size({arr_txt},1)), "
+                        f"dim=2, ncopies=size({arr_txt},2)), dim=3, ncopies=size({arr_txt},3))"
+                    )
+                raise NotImplementedError("unsupported expr: IfExp rank mismatch")
+
+            if rb == 0 and ro > 0:
+                btxt = _cast_scalar(self.expr(node.body), kb, ko)
+                otxt = self.expr(node.orelse)
+                btxt = _broadcast_scalar_to_rank(btxt, otxt, ro)
+                return f"merge({btxt}, {otxt}, {self.expr(node.test)})"
+            if ro == 0 and rb > 0:
+                btxt = self.expr(node.body)
+                otxt = _cast_scalar(self.expr(node.orelse), ko, kb)
+                otxt = _broadcast_scalar_to_rank(otxt, btxt, rb)
+                return f"merge({btxt}, {otxt}, {self.expr(node.test)})"
             # Python IfExp short-circuits; Fortran MERGE does not guarantee that.
             # Keep MERGE use to simple branch atoms only.
             if not (
@@ -8270,6 +8351,15 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "sorted":
                 raise NotImplementedError("sorted(...) is currently supported only in for-loops")
             if isinstance(node.func, ast.Name):
+                if node.func.id == "callable" and len(node.args) == 1:
+                    a0 = node.args[0]
+                    if isinstance(a0, ast.Name) and a0.id in self.local_func_arg_names:
+                        return ".true."
+                    return ".false."
+                if node.func.id in self.lambda_vars:
+                    repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
+                    if repl is not None:
+                        return self.expr(repl)
                 if node.func.id in self.user_class_types:
                     tnm = self.user_class_types[node.func.id]
                     args_nodes = list(node.args)
@@ -10081,6 +10171,28 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "convolve"
+                and len(node.args) >= 2
+            ):
+                mode_txt = None
+                if len(node.args) >= 3 and is_const_str(node.args[2]):
+                    mode_txt = str(node.args[2].value)
+                for kw in node.keywords:
+                    if kw.arg == "mode" and is_const_str(kw.value):
+                        mode_txt = str(kw.value.value)
+                        break
+                mode_arg = ""
+                if mode_txt is not None:
+                    mode_arg = f', "{mode_txt}"'
+                k0 = self._expr_kind(node.args[0])
+                k1 = self._expr_kind(node.args[1])
+                if k0 == "int" and k1 == "int":
+                    return f"convolve_int({self.expr(node.args[0])}, {self.expr(node.args[1])}{mode_arg})"
+                return f"convolve_real({self.expr(node.args[0])}, {self.expr(node.args[1])}{mode_arg})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "math"
                 and node.func.attr == "sqrt"
                 and len(node.args) == 1
@@ -10297,6 +10409,14 @@ class translator(ast.NodeVisitor):
                 continue
 
             if isinstance(node, ast.Assign):
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                ):
+                    if isinstance(node.value, ast.Lambda):
+                        self.lambda_vars[node.targets[0].id] = node.value
+                        continue
+                    self.lambda_vars.pop(node.targets[0].id, None)
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
@@ -14637,11 +14757,41 @@ class translator(ast.NodeVisitor):
 
         # NEW: fallback for name = <simple expr>  (e.g., largest = i)
         if isinstance(t, ast.Name):
+            lname = self._aliased_name(t.id)
+            if (
+                isinstance(v, ast.Subscript)
+                and isinstance(v.value, ast.Call)
+                and isinstance(v.slice, ast.Slice)
+                and v.slice.lower is None
+                and v.slice.step is None
+                and self._rank_expr(v.value) == 1
+            ):
+                ktmp = self._expr_kind(v.value)
+                if ktmp in {"real", "int", "logical", "complex"}:
+                    if ktmp == "real":
+                        decl = "real(kind=dp), allocatable :: tmp_slice(:)"
+                    elif ktmp == "int":
+                        decl = "integer, allocatable :: tmp_slice(:)"
+                    elif ktmp == "logical":
+                        decl = "logical, allocatable :: tmp_slice(:)"
+                    else:
+                        decl = "complex(kind=dp), allocatable :: tmp_slice(:)"
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w(decl)
+                    self.o.w(f"tmp_slice = {self.expr(v.value)}")
+                    if v.slice.upper is None:
+                        self.o.w(f"{lname} = tmp_slice")
+                    else:
+                        self.o.w(f"{lname} = tmp_slice(1:{self.expr(v.slice.upper)})")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
             if isinstance(v, ast.IfExp):
                 rb = self._rank_expr(v.body)
                 ro = self._rank_expr(v.orelse)
                 if (rb == 0 and ro > 0) or (ro == 0 and rb > 0):
-                    nm = t.id
+                    nm = lname
                     if (
                         nm in self.alloc_reals
                         or nm in self.alloc_ints
@@ -14653,15 +14803,15 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"if (.not. allocated({nm})) allocate({nm}, mold={arr_expr})")
                 self.o.w(f"if ({self.expr(v.test)}) then")
                 self.o.push()
-                self.o.w(f"{t.id} = {self.expr(v.body)}")
+                self.o.w(f"{lname} = {self.expr(v.body)}")
                 self.o.pop()
                 self.o.w("else")
                 self.o.push()
-                self.o.w(f"{t.id} = {self.expr(v.orelse)}")
+                self.o.w(f"{lname} = {self.expr(v.orelse)}")
                 self.o.pop()
                 self.o.w("end if")
                 return
-            self.o.w(f"{t.id} = {self.expr(v)}")
+            self.o.w(f"{lname} = {self.expr(v)}")
             return
 
         stmt_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
@@ -14671,7 +14821,7 @@ class translator(ast.NodeVisitor):
         self._emit_comments_for(node)
         # supports common augmented assignments on names and indexed targets
         if isinstance(node.target, ast.Name):
-            lhs = node.target.id
+            lhs = self._aliased_name(node.target.id)
         else:
             lhs = self.expr(node.target)
         rhs = self.expr(node.value)
@@ -14699,12 +14849,47 @@ class translator(ast.NodeVisitor):
 
     def visit_Return(self, node):
         self._emit_comments_for(node)
+        def _maybe_rank_stable_ifexp_expr(n):
+            if not isinstance(n, ast.IfExp):
+                return None
+            b = n.body
+            o = n.orelse
+            def _ravel_base(z):
+                if (
+                    isinstance(z, ast.Call)
+                    and isinstance(z.func, ast.Attribute)
+                    and z.func.attr in {"ravel", "flatten"}
+                    and len(z.args) == 0
+                ):
+                    return z.func.value
+                return None
+            bb = _ravel_base(b)
+            ob = _ravel_base(o)
+            if (
+                bb is not None
+                and isinstance(o, ast.Name)
+                and isinstance(bb, ast.Name)
+                and bb.id == o.id
+            ):
+                return self.expr(bb)
+            if (
+                ob is not None
+                and isinstance(b, ast.Name)
+                and isinstance(ob, ast.Name)
+                and ob.id == b.id
+            ):
+                return self.expr(ob)
+            return None
+
         if node.value is not None:
             if self.tuple_return_out_names:
                 if not (isinstance(node.value, ast.Tuple) and len(node.value.elts) == len(self.tuple_return_out_names)):
                     raise NotImplementedError("inconsistent tuple return shape")
                 for j, e in enumerate(node.value.elts):
-                    self.o.w(f"{self.tuple_return_out_names[j]} = {self.expr(e)}")
+                    e_txt = _maybe_rank_stable_ifexp_expr(e)
+                    if e_txt is None:
+                        e_txt = self.expr(e)
+                    self.o.w(f"{self.tuple_return_out_names[j]} = {e_txt}")
                 self.o.w("return")
                 return
             if self.function_result_name is None:
@@ -14722,33 +14907,9 @@ class translator(ast.NodeVisitor):
             ):
                 expr_txt = self.expr(node.value.func.value)
             elif isinstance(node.value, ast.IfExp):
-                b = node.value.body
-                o = node.value.orelse
-                def _ravel_base(n):
-                    if (
-                        isinstance(n, ast.Call)
-                        and isinstance(n.func, ast.Attribute)
-                        and n.func.attr in {"ravel", "flatten"}
-                        and len(n.args) == 0
-                    ):
-                        return n.func.value
-                    return None
-                bb = _ravel_base(b)
-                ob = _ravel_base(o)
-                if (
-                    bb is not None
-                    and isinstance(o, ast.Name)
-                    and isinstance(bb, ast.Name)
-                    and bb.id == o.id
-                ):
-                    expr_txt = self.expr(bb)
-                elif (
-                    ob is not None
-                    and isinstance(b, ast.Name)
-                    and isinstance(ob, ast.Name)
-                    and ob.id == b.id
-                ):
-                    expr_txt = self.expr(ob)
+                rank_stable = _maybe_rank_stable_ifexp_expr(node.value)
+                if rank_stable is not None:
+                    expr_txt = rank_stable
                 else:
                     expr_txt = self.expr(node.value)
             else:
@@ -16709,6 +16870,9 @@ def _emit_local_function(
             tr.alloc_real_rank[_arg] = _rr
 
     optional_default_aliases = []
+    arg_meta = {}
+    optional_none_aliases = []
+    optional_none_copyback = []
     for arg in args:
         if arg in callback_specs:
             cb = callback_specs[arg]
@@ -16905,6 +17069,7 @@ def _emit_local_function(
                 count=1,
                 flags=re.IGNORECASE,
             )
+        arg_meta[arg] = (decl_kind, int(arr_rank), intent_txt)
         o.w(arg_decl + (f" ! {argument_comment(arg, 'in')}" if not no_comment else ""))
         if (
             arg in optional_args
@@ -16952,31 +17117,88 @@ def _emit_local_function(
                 tr._mark_int(alias)
         optional_default_inits.append((arg, alias, tr.expr(dflt_node), arr_rank))
         tr.name_aliases[arg] = alias
+    for arg in optional_args:
+        if arg in defaults_map and (not is_none(defaults_map[arg])):
+            continue
+        # `_aliased_name()` may already have inserted an identity mapping
+        # (`arg -> arg`). That must not suppress optional-local alias creation.
+        if arg in tr.name_aliases and tr.name_aliases.get(arg) != arg:
+            continue
+        meta = arg_meta.get(arg, None)
+        if meta is None:
+            continue
+        decl_kind, arr_rank, intent_txt = meta
+        if decl_kind is None:
+            continue
+        lk = decl_kind.lower()
+        alias = f"{arg}_opt"
+        if int(arr_rank) > 0:
+            dims = ",".join(":" for _ in range(int(arr_rank)))
+            if "character" in lk:
+                o.w(f"character(len=:), allocatable :: {alias}({dims})")
+                tr._mark_alloc_char(alias, rank=int(arr_rank))
+            else:
+                o.w(f"{decl_kind}, allocatable :: {alias}({dims})")
+                if "logical" in lk:
+                    tr._mark_alloc_log(alias, rank=int(arr_rank))
+                elif "complex" in lk:
+                    tr._mark_alloc_complex(alias, rank=int(arr_rank))
+                elif "real" in lk:
+                    tr._mark_alloc_real(alias, rank=int(arr_rank))
+                else:
+                    tr._mark_alloc_int(alias, rank=int(arr_rank))
+            dflt_expr = None
+        else:
+            if "character" in lk:
+                o.w(f"character(len=:), allocatable :: {alias}")
+                tr._mark_char(alias)
+                dflt_expr = '""'
+            else:
+                o.w(f"{decl_kind} :: {alias}")
+                if "logical" in lk:
+                    tr._mark_log(alias)
+                    dflt_expr = ".false."
+                elif "complex" in lk:
+                    tr._mark_complex(alias)
+                    dflt_expr = "cmplx(0.0_dp, 0.0_dp, kind=dp)"
+                elif "real" in lk:
+                    tr._mark_real(alias)
+                    dflt_expr = "0.0_dp"
+                else:
+                    tr._mark_int(alias)
+                    dflt_expr = "0"
+        optional_none_aliases.append((arg, alias, decl_kind, int(arr_rank), dflt_expr, intent_txt))
+        tr.name_aliases[arg] = alias
     if tuple_return:
         for idx_out, nm in enumerate(out_names):
             kind_hint = None
+            rank_hint = 0
             if tuple_return_out_kinds is not None:
                 kh = tuple_return_out_kinds.get(fn.name, [])
                 if idx_out < len(kh):
                     kind_hint = kh[idx_out]
+            if tuple_return_out_ranks is not None:
+                rh = tuple_return_out_ranks.get(fn.name, [])
+                if idx_out < len(rh):
+                    rank_hint = max(0, int(rh[idx_out]))
             if nm in tr.alloc_reals or kind_hint == "alloc_real":
-                rr = max(1, tr.alloc_real_rank.get(nm, 1))
+                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_real_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_ints or kind_hint == "alloc_int":
-                rr = max(1, tr.alloc_int_rank.get(nm, 1))
+                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_int_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"integer, allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_logs or kind_hint == "alloc_log":
-                rr = max(1, tr.alloc_log_rank.get(nm, 1))
+                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_log_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_complexes or kind_hint == "alloc_complex":
-                rr = max(1, tr.alloc_complex_rank.get(nm, 1))
+                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_complex_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"complex(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_chars or kind_hint == "alloc_char":
-                rr = max(1, tr.alloc_char_rank.get(nm, 1))
+                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_char_rank.get(nm, 1))
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"character(len=:), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.reals or kind_hint == "real":
@@ -17159,6 +17381,26 @@ def _emit_local_function(
             o.w(f"{alias} = {dflt_expr}")
             o.pop()
             o.w("end if")
+    for arg, alias, decl_kind, arr_rank, dflt_expr, intent_txt in optional_none_aliases:
+        o.w(f"if (present({arg})) then")
+        o.push()
+        o.w(f"{alias} = {arg}")
+        o.pop()
+        o.w("else")
+        o.push()
+        if int(arr_rank) > 0:
+            zext = ",".join("0" for _ in range(int(arr_rank)))
+            lk = str(decl_kind).lower()
+            if "character" in lk:
+                o.w(f"allocate(character(len=1) :: {alias}({zext}))")
+            else:
+                o.w(f"allocate({alias}({zext}))")
+        else:
+            o.w(f"{alias} = {dflt_expr}")
+        o.pop()
+        o.w("end if")
+        if intent_txt in {"inout", "out"}:
+            optional_none_copyback.append((arg, alias))
     if keep_decl_blank:
         o.w("")
     for i, s in enumerate(fn.body):
@@ -17182,8 +17424,32 @@ def _emit_local_function(
                 if tuple_return:
                     if not isinstance(s.value, ast.Tuple) or len(s.value.elts) != len(out_names):
                         raise NotImplementedError("inconsistent tuple return shape")
+                    def _maybe_rank_stable_ifexp_expr_local(n):
+                        if not isinstance(n, ast.IfExp):
+                            return None
+                        b = n.body
+                        orelse = n.orelse
+                        def _ravel_base(z):
+                            if (
+                                isinstance(z, ast.Call)
+                                and isinstance(z.func, ast.Attribute)
+                                and z.func.attr in {"ravel", "flatten"}
+                                and len(z.args) == 0
+                            ):
+                                return z.func.value
+                            return None
+                        bb = _ravel_base(b)
+                        ob = _ravel_base(orelse)
+                        if bb is not None and isinstance(orelse, ast.Name) and isinstance(bb, ast.Name) and bb.id == orelse.id:
+                            return tr.expr(bb)
+                        if ob is not None and isinstance(b, ast.Name) and isinstance(ob, ast.Name) and ob.id == b.id:
+                            return tr.expr(ob)
+                        return None
                     for j, e in enumerate(s.value.elts):
-                        o.w(f"{out_names[j]} = {tr.expr(e)}")
+                        rhs = _maybe_rank_stable_ifexp_expr_local(e)
+                        if rhs is None:
+                            rhs = tr.expr(e)
+                        o.w(f"{out_names[j]} = {rhs}")
                 else:
                     if dict_return and isinstance(s.value, ast.Dict):
                         for cname, ckind, vv, _ in dict_return_spec["components"]:
@@ -17235,6 +17501,8 @@ def _emit_local_function(
                 o.w("return")
             continue
         tr.visit(s)
+    for arg, alias in optional_none_copyback:
+        o.w(f"if (present({arg})) {arg} = {alias}")
     tr.close_type_rebind_blocks()
     o.pop()
     if tuple_return or void_return:
