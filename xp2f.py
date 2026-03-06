@@ -7302,7 +7302,10 @@ class translator(ast.NodeVisitor):
                     return f"[{a0}, {b0}]"
                 raise NotImplementedError("list concatenation currently supports only rank-1 lists")
             if op is ast.MatMult:
-                # Fortran MATMUL already handles rank-1/rank-2 combinations.
+                lr = self._rank_expr(node.left)
+                rr = self._rank_expr(node.right)
+                if lr == 1 and rr == 1:
+                    return f"dot_product({a0}, {b0})"
                 return f"matmul({a0}, {b0})"
             a = a0
             b = b0
@@ -15188,6 +15191,7 @@ def _emit_local_function(
     local_func_arg_kinds=None,
     local_func_arg_names=None,
     local_func_defaults=None,
+    local_func_callback_params=None,
     local_void_funcs=None,
     local_generic_overloads=None,
     local_overload_dispatch=None,
@@ -15202,6 +15206,33 @@ def _emit_local_function(
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
     args = [a.arg for a in arg_nodes]
+    callback_args = set()
+    for _st in fn.body:
+        for _n in ast.walk(_st):
+            if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and (_n.func.id in args):
+                callback_args.add(_n.func.id)
+    callback_passthrough_args = set()
+    if local_func_callback_params and local_func_arg_names:
+        for _st in fn.body:
+            for _n in ast.walk(_st):
+                if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)):
+                    continue
+                _callee = _n.func.id
+                cb_params = set(local_func_callback_params.get(_callee, set()))
+                if not cb_params:
+                    continue
+                callee_args = list(local_func_arg_names.get(_callee, []))
+                for _i, _a in enumerate(_n.args):
+                    if _i >= len(callee_args):
+                        break
+                    if (callee_args[_i] in cb_params) and isinstance(_a, ast.Name) and (_a.id in args):
+                        callback_passthrough_args.add(_a.id)
+                for _kw in getattr(_n, "keywords", []):
+                    if _kw.arg is None:
+                        continue
+                    if (_kw.arg in cb_params) and isinstance(_kw.value, ast.Name) and (_kw.value.id in args):
+                        callback_passthrough_args.add(_kw.value.id)
+    callback_args = set(callback_args).union(callback_passthrough_args)
     proc_name = proc_name_override or fn.name
     ret_name = f"{proc_name}_result"
     defaults_map = {}
@@ -15382,9 +15413,50 @@ def _emit_local_function(
         tr.alloc_logs.discard(anm)
         tr.alloc_chars.discard(anm)
     def _pre_arg_rank(nm):
+        def _node_uses_name(node, name):
+            def _rec(x):
+                if isinstance(x, ast.Name) and x.id == name:
+                    return True
+                for _fld, _val in ast.iter_fields(x):
+                    if isinstance(x, ast.Call) and _fld == "keywords":
+                        continue
+                    if isinstance(_val, ast.AST):
+                        if _rec(_val):
+                            return True
+                    elif isinstance(_val, list):
+                        for _it in _val:
+                            if isinstance(_it, ast.AST) and _rec(_it):
+                                return True
+                return False
+            return _rec(node)
+
+        def _name_in_matmul(name):
+            for _st in fn.body:
+                for _n in ast.walk(_st):
+                    if (
+                        isinstance(_n, ast.BinOp)
+                        and isinstance(_n.op, ast.MatMult)
+                        and (_node_uses_name(_n.left, name) or _node_uses_name(_n.right, name))
+                    ):
+                        return True
+            return False
+
         rr = 0
         for st in fn.body:
             for n in ast.walk(st):
+                if (
+                    isinstance(n, ast.BinOp)
+                    and isinstance(n.op, ast.MatMult)
+                    and (_node_uses_name(n.left, nm) or _node_uses_name(n.right, nm))
+                ):
+                    rr = max(rr, 1)
+                if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                    left_has = _node_uses_name(n.left, nm)
+                    right_has = _node_uses_name(n.right, nm)
+                    if left_has and isinstance(n.right, ast.Name) and _name_in_matmul(n.right.id):
+                        rr = max(rr, 1)
+                    if right_has and isinstance(n.left, ast.Name) and _name_in_matmul(n.left.id):
+                        rr = max(rr, 1)
                 if (
                     isinstance(n, ast.Assign)
                     and len(n.targets) == 1
@@ -15411,10 +15483,25 @@ def _emit_local_function(
                 ):
                     axis_present = any(kw.arg == "axis" for kw in n.keywords)
                     rr = max(rr, 2 if axis_present else 1)
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Attribute)
+                    and isinstance(n.func.value.value, ast.Name)
+                    and n.func.value.value.id == "np"
+                    and n.func.value.attr == "linalg"
+                    and n.func.attr == "norm"
+                    and len(n.args) >= 1
+                    and isinstance(n.args[0], ast.Name)
+                    and n.args[0].id == nm
+                ):
+                    rr = max(rr, 1)
         return rr
 
     dict_arg_names = set((dict_arg_types or {}).keys())
     for a in arg_nodes:
+        if a.arg in callback_args:
+            continue
         if a.arg in dict_arg_names:
             continue
         rr = 0 if is_elemental_fn else _pre_arg_rank(a.arg)
@@ -15456,6 +15543,83 @@ def _emit_local_function(
     tr.prescan(fn.body)
     tr.validate_unsafe_if_type_merges(fn.body)
     tr.apply_type_rebind_declaration_pruning()
+
+    # Infer callback dummy interfaces (argument rank and return rank) from local
+    # call/assignment usage to avoid scalar fallback for procedure dummies.
+    callback_specs = {}
+    callback_assign_targets = {}
+    for cb in callback_args:
+        in_rank = 0
+        ret_rank = 0
+        saw_direct_cb_call = False
+        for _n in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
+            if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == cb):
+                continue
+            saw_direct_cb_call = True
+            if _n.args:
+                try:
+                    in_rank = max(in_rank, int(tr._rank_expr(_n.args[0])))
+                except Exception:
+                    pass
+                if isinstance(_n.args[0], ast.Name):
+                    tnm0 = _n.args[0].id
+                    in_rank = max(in_rank, int(_pre_arg_rank(tnm0)))
+                    in_rank = max(
+                        in_rank,
+                        int(tr.alloc_real_rank.get(tnm0, 0)),
+                        int(tr.alloc_int_rank.get(tnm0, 0)),
+                        int(tr.alloc_log_rank.get(tnm0, 0)),
+                        int(tr.alloc_complex_rank.get(tnm0, 0)),
+                        int(tr.alloc_char_rank.get(tnm0, 0)),
+                    )
+        for _a in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
+            if not (isinstance(_a, ast.Assign) and len(_a.targets) == 1 and isinstance(_a.targets[0], ast.Name)):
+                continue
+            _v = _a.value
+            if not (isinstance(_v, ast.Call) and isinstance(_v.func, ast.Name) and _v.func.id == cb):
+                continue
+            tnm = _a.targets[0].id
+            rr = 0
+            rr = max(rr, int(_pre_arg_rank(tnm)))
+            rr = max(
+                rr,
+                int(tr.alloc_real_rank.get(tnm, 0)),
+                int(tr.alloc_int_rank.get(tnm, 0)),
+                int(tr.alloc_log_rank.get(tnm, 0)),
+                int(tr.alloc_complex_rank.get(tnm, 0)),
+                int(tr.alloc_char_rank.get(tnm, 0)),
+            )
+            ret_rank = max(ret_rank, rr)
+            callback_assign_targets.setdefault(cb, set()).add(tnm)
+        if (not saw_direct_cb_call) and (cb in callback_passthrough_args):
+            in_rank = max(in_rank, 1)
+        callback_specs[cb] = {"in_rank": in_rank, "ret_rank": ret_rank, "ret_kind": "real"}
+
+    # Propagate inferred callback return shape/kind to assigned locals.
+    for cb, info in callback_specs.items():
+        for tnm in callback_assign_targets.get(cb, set()):
+            rr = int(info.get("ret_rank", 0))
+            if rr > 0:
+                tr.alloc_ints.discard(tnm)
+                tr.alloc_logs.discard(tnm)
+                tr.alloc_complexes.discard(tnm)
+                tr.alloc_chars.discard(tnm)
+                tr.reals.discard(tnm)
+                tr.ints.discard(tnm)
+                tr.logs.discard(tnm)
+                tr.complexes.discard(tnm)
+                tr.chars.discard(tnm)
+                tr._mark_alloc_real(tnm, rank=rr)
+            else:
+                tr.alloc_ints.discard(tnm)
+                tr.alloc_logs.discard(tnm)
+                tr.alloc_complexes.discard(tnm)
+                tr.alloc_chars.discard(tnm)
+                tr.ints.discard(tnm)
+                tr.logs.discard(tnm)
+                tr.complexes.discard(tnm)
+                tr.chars.discard(tnm)
+                tr._mark_real(tnm)
     if is_elemental_fn:
         for _a in args:
             if _pre_arg_rank(_a) > 0:
@@ -15525,6 +15689,91 @@ def _emit_local_function(
             else:
                 tr._mark_alloc_int(ret_name, rank=rr0)
     void_return = (not tuple_return) and (not dict_return) and (len(returns) == 0)
+
+    # Local rank/kind correction for common vector algebra patterns where
+    # prescan can over-approximate rank:
+    #   scalar = matmul(vec, vec)
+    #   vec    = vec +/- vec
+    def _rank_now(nm):
+        return max(
+            int(tr.alloc_real_rank.get(nm, 0)),
+            int(tr.alloc_int_rank.get(nm, 0)),
+            int(tr.alloc_log_rank.get(nm, 0)),
+            int(tr.alloc_complex_rank.get(nm, 0)),
+            int(tr.alloc_char_rank.get(nm, 0)),
+            int(_pre_arg_rank(nm)) if nm in args else 0,
+        )
+
+    def _force_scalar_real(nm):
+        tr.alloc_reals.discard(nm)
+        tr.alloc_ints.discard(nm)
+        tr.alloc_logs.discard(nm)
+        tr.alloc_complexes.discard(nm)
+        tr.alloc_chars.discard(nm)
+        tr.alloc_real_rank.pop(nm, None)
+        tr.alloc_int_rank.pop(nm, None)
+        tr.alloc_log_rank.pop(nm, None)
+        tr.alloc_complex_rank.pop(nm, None)
+        tr.alloc_char_rank.pop(nm, None)
+        tr.ints.discard(nm)
+        tr.logs.discard(nm)
+        tr.complexes.discard(nm)
+        tr.chars.discard(nm)
+        tr._mark_real(nm)
+
+    def _force_vector_real(nm):
+        tr.alloc_ints.discard(nm)
+        tr.alloc_logs.discard(nm)
+        tr.alloc_complexes.discard(nm)
+        tr.alloc_chars.discard(nm)
+        tr.ints.discard(nm)
+        tr.logs.discard(nm)
+        tr.complexes.discard(nm)
+        tr.chars.discard(nm)
+        tr.reals.discard(nm)
+        tr._mark_alloc_real(nm, rank=1)
+
+    def _unwrap_real_cast(v):
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in {"real", "float"}
+            and len(v.args) >= 1
+        ):
+            return v.args[0]
+        return v
+
+    for _ in range(3):
+        _changed = False
+        for st in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
+            if not (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)):
+                continue
+            tnm = st.targets[0].id
+            v = _unwrap_real_cast(st.value)
+            if (
+                isinstance(v, ast.BinOp)
+                and isinstance(v.op, ast.MatMult)
+                and isinstance(v.left, ast.Name)
+                and isinstance(v.right, ast.Name)
+            ):
+                if _rank_now(v.left.id) == 1 and _rank_now(v.right.id) == 1:
+                    if _rank_now(tnm) != 0:
+                        _force_scalar_real(tnm)
+                        _changed = True
+                    continue
+            if (
+                isinstance(v, ast.BinOp)
+                and isinstance(v.op, (ast.Add, ast.Sub))
+                and isinstance(v.left, ast.Name)
+                and isinstance(v.right, ast.Name)
+            ):
+                if _rank_now(v.left.id) > 0 and _rank_now(v.right.id) > 0:
+                    if _rank_now(tnm) == 0:
+                        _force_vector_real(tnm)
+                        _changed = True
+                    continue
+        if not _changed:
+            break
 
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints - {ret_name})
@@ -15617,6 +15866,18 @@ def _emit_local_function(
         return rec(node)
 
     def _arg_real_context(nm):
+        def _is_np_linalg_norm_call(n):
+            return (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Attribute)
+                and isinstance(n.func.value.value, ast.Name)
+                and n.func.value.value.id == "np"
+                and n.func.value.attr == "linalg"
+                and n.func.attr == "norm"
+                and len(n.args) >= 1
+            )
+
         def _name_real_context(name):
             for st in fn.body:
                 for n in ast.walk(st):
@@ -15635,6 +15896,8 @@ def _emit_local_function(
                         and len(n.args) >= 1
                         and _name_used(n.args[0], name)
                     ):
+                        return True
+                    if _is_np_linalg_norm_call(n) and _name_used(n.args[0], name):
                         return True
             return False
 
@@ -15656,6 +15919,8 @@ def _emit_local_function(
                     and _name_used(n.args[0], nm)
                 ):
                     return True
+                if _is_np_linalg_norm_call(n) and _name_used(n.args[0], nm):
+                    return True
                 if (
                     isinstance(n, ast.Assign)
                     and len(n.targets) == 1
@@ -15672,6 +15937,19 @@ def _emit_local_function(
         rr = 0
         for st in fn.body:
             for n in ast.walk(st):
+                if (
+                    isinstance(n, ast.BinOp)
+                    and isinstance(n.op, ast.MatMult)
+                    and (_name_used(n.left, nm) or _name_used(n.right, nm))
+                ):
+                    rr = max(rr, 1)
+                if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                    left_has = _name_used(n.left, nm)
+                    right_has = _name_used(n.right, nm)
+                    if left_has and isinstance(n.right, ast.Name) and _pre_arg_rank(n.right.id) > 0:
+                        rr = max(rr, 1)
+                    if right_has and isinstance(n.left, ast.Name) and _pre_arg_rank(n.left.id) > 0:
+                        rr = max(rr, 1)
                 if (
                     isinstance(n, ast.Assign)
                     and len(n.targets) == 1
@@ -15699,6 +15977,19 @@ def _emit_local_function(
                     # axis reduction calls imply at least rank-2 source in this subset.
                     axis_present = any(kw.arg == "axis" for kw in n.keywords)
                     rr = max(rr, 2 if axis_present else 1)
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Attribute)
+                    and isinstance(n.func.value.value, ast.Name)
+                    and n.func.value.value.id == "np"
+                    and n.func.value.attr == "linalg"
+                    and n.func.attr == "norm"
+                    and len(n.args) >= 1
+                    and isinstance(n.args[0], ast.Name)
+                    and n.args[0].id == nm
+                ):
+                    rr = max(rr, 1)
         return rr
 
     def _arg_is_assigned(nm):
@@ -15776,6 +16067,33 @@ def _emit_local_function(
 
     optional_default_aliases = []
     for arg in args:
+        if arg in callback_specs:
+            cb = callback_specs[arg]
+            cb_in_rank = max(0, int(cb.get("in_rank", 0)))
+            cb_ret_rank = max(0, int(cb.get("ret_rank", 0)))
+            iface_name = f"{proc_name}_{arg}_cb_if"
+            o.w("interface")
+            o.push()
+            o.w(f"function {iface_name}(x) result(r)")
+            o.push()
+            o.w("import dp")
+            if cb_in_rank <= 0:
+                o.w("real(kind=dp), intent(in) :: x")
+            else:
+                dims = ",".join(":" for _ in range(cb_in_rank))
+                o.w(f"real(kind=dp), intent(in) :: x({dims})")
+            if cb_ret_rank <= 0:
+                o.w("real(kind=dp) :: r")
+            else:
+                dims = ",".join(":" for _ in range(cb_ret_rank))
+                o.w(f"real(kind=dp), allocatable :: r({dims})")
+            o.pop()
+            o.w(f"end function {iface_name}")
+            o.pop()
+            o.w("end interface")
+            arg_decl = f"procedure({iface_name}) :: {arg}"
+            o.w(arg_decl + (f" ! {argument_comment(arg, 'in')}" if not no_comment else ""))
+            continue
         intent_txt = "inout" if _arg_is_assigned(arg) else "in"
         dflt = defaults_map.get(arg, None)
         ann = ann_map.get(arg, "")
@@ -15806,6 +16124,19 @@ def _emit_local_function(
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 arr_rank = max(arr_rank, int(local_func_arg_ranks[fn.name][idx]))
+        for _st in fn.body:
+            for _n in ast.walk(_st):
+                if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and (_n.func.id in callback_specs)):
+                    continue
+                if _n.args and isinstance(_n.args[0], ast.Name) and (_n.args[0].id == arg):
+                    arr_rank = max(arr_rank, int(callback_specs[_n.func.id].get("in_rank", 0)))
+        if (
+            arg in defaults_map
+            and isinstance(defaults_map[arg], ast.Constant)
+            and isinstance(defaults_map[arg].value, (bool, int, float, str))
+            and _pre_arg_rank(arg) == 0
+        ):
+            arr_rank = 0
         if arg in (dict_arg_types or {}):
             tnm = (dict_arg_types or {})[arg]
             arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg}"
@@ -15865,7 +16196,7 @@ def _emit_local_function(
             ):
                 arg_kind = "real(kind=dp)"
             else:
-                arg_kind = "integer"
+                arg_kind = "real(kind=dp)"
             dims = ",".join(":" for _ in range(arr_rank))
             arg_decl = f"{arg_kind}, intent({intent_txt}) :: {arg}({dims})"
             decl_kind = arg_kind
@@ -16405,6 +16736,15 @@ def generate_flat(
         fn.name: [a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))]
         for fn in (local_funcs or [])
     }
+    local_func_callback_params = {}
+    for fn in (local_funcs or []):
+        fn_arg_names = [a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))]
+        cb_args = set()
+        for st in fn.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and (n.func.id in fn_arg_names):
+                    cb_args.add(n.func.id)
+        local_func_callback_params[fn.name] = cb_args
     # Gather call-site rank/kind hints for local function arguments.
     call_rank_hints = {fn.name: [0 for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_hints = {fn.name: [None for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
@@ -16924,6 +17264,7 @@ def generate_flat(
                         local_func_arg_kinds=local_func_arg_kinds,
                         local_func_arg_names=local_func_arg_names,
                         local_func_defaults=local_func_defaults,
+                        local_func_callback_params=local_func_callback_params,
                         local_void_funcs=local_void_funcs,
                         local_generic_overloads=local_generic_overloads,
                         local_overload_dispatch=local_overload_dispatch,
@@ -16955,6 +17296,7 @@ def generate_flat(
                     local_func_arg_kinds=local_func_arg_kinds,
                     local_func_arg_names=local_func_arg_names,
                     local_func_defaults=local_func_defaults,
+                    local_func_callback_params=local_func_callback_params,
                     local_void_funcs=local_void_funcs,
                     local_generic_overloads=local_generic_overloads,
                     local_overload_dispatch=local_overload_dispatch,
@@ -17127,6 +17469,7 @@ def generate_flat(
                 local_func_arg_kinds=local_func_arg_kinds,
                 local_func_arg_names=local_func_arg_names,
                 local_func_defaults=local_func_defaults,
+                local_func_callback_params=local_func_callback_params,
                 local_void_funcs=local_void_funcs,
                 local_generic_overloads=local_generic_overloads,
                 local_overload_dispatch=local_overload_dispatch,
