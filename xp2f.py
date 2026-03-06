@@ -503,6 +503,27 @@ def _strict_type_rebind_diagnostics(src_text):
     return out
 
 
+def _strict_lambda_diagnostics(src_text):
+    diags = []
+    tree = ast.parse(src_text)
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Lambda):
+            continue
+        ln = getattr(n, "lineno", 1)
+        col = getattr(n, "col_offset", 0) + 1
+        seg = ast.get_source_segment(src_text, n)
+        diags.append({
+            "line": ln,
+            "col": col,
+            "rule": "lambda_expr",
+            "message": "lambda expression used; strict mode prefers named functions for stable transpilation",
+            "snippet": seg.strip() if isinstance(seg, str) else "lambda ...",
+            "suggestion": "replace lambda with a named def function",
+        })
+    diags.sort(key=lambda d: (d["line"], d["col"]))
+    return diags
+
+
 def _strict_expr_family(node):
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bool):
@@ -692,6 +713,7 @@ def _run_strict_check(src_text, path_label):
     diags.extend(_strict_mixed_numeric_literal_diagnostics(src_text))
     diags.extend(_strict_polymorphic_function_diagnostics(src_text))
     diags.extend(_strict_type_rebind_diagnostics(src_text))
+    diags.extend(_strict_lambda_diagnostics(src_text))
     diags.sort(key=lambda d: (d["line"], d["col"]))
     if not diags:
         print(f"Strict: PASS ({path_label})")
@@ -4187,6 +4209,158 @@ def rewrite_print_after_mixed_if_merges(stmts, env=None):
             _collect_top_level_assign_kinds([st], env)
         i += 1
 
+
+def _subst_lambda_expr_body(lam_node, call_node):
+    """Inline lambda body for a direct call. Returns AST expr or None."""
+    if not isinstance(lam_node, ast.Lambda) or not isinstance(call_node, ast.Call):
+        return None
+    # Conservative: no varargs/kw-only/defaults.
+    if lam_node.args.vararg is not None or lam_node.args.kwarg is not None:
+        return None
+    if lam_node.args.kwonlyargs or lam_node.args.defaults or lam_node.args.kw_defaults:
+        return None
+    pnames = [a.arg for a in lam_node.args.args]
+    amap = {nm: None for nm in pnames}
+    if len(call_node.args) > len(pnames):
+        return None
+    for i, a in enumerate(call_node.args):
+        amap[pnames[i]] = a
+    for kw in getattr(call_node, "keywords", []):
+        if kw.arg is None or kw.arg not in amap or amap[kw.arg] is not None:
+            return None
+        amap[kw.arg] = kw.value
+    if any(v is None for v in amap.values()):
+        return None
+
+    class _Repl(ast.NodeTransformer):
+        def visit_Name(self, n):
+            if isinstance(n.ctx, ast.Load) and n.id in amap:
+                return copy.deepcopy(amap[n.id])
+            return n
+
+    out = _Repl().visit(copy.deepcopy(lam_node.body))
+    ast.fix_missing_locations(out)
+    return out
+
+
+def _specialize_local_fn_with_lambda(fn_node, arg_index, lam_node, new_name):
+    """Clone fn_node, remove arg_index, and inline calls to removed callable arg."""
+    if not isinstance(fn_node, ast.FunctionDef):
+        return None
+    if not (0 <= arg_index < len(fn_node.args.args)):
+        return None
+    param = fn_node.args.args[arg_index].arg
+    # Ensure removed parameter is only used as call target.
+    for n in ast.walk(fn_node):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == param:
+            p = None
+            for q in ast.walk(fn_node):
+                for ch in ast.iter_child_nodes(q):
+                    if ch is n:
+                        p = q
+                        break
+                if p is not None:
+                    break
+            if not (isinstance(p, ast.Call) and p.func is n):
+                return None
+
+    new_fn = copy.deepcopy(fn_node)
+    new_fn.name = new_name
+    del new_fn.args.args[arg_index]
+    if new_fn.args.defaults:
+        narg_old = len(fn_node.args.args)
+        nd = len(fn_node.args.defaults)
+        first_def = narg_old - nd
+        if arg_index >= first_def:
+            del new_fn.args.defaults[arg_index - first_def]
+
+    class _InlineParamCalls(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Name) and node.func.id == param:
+                repl = _subst_lambda_expr_body(lam_node, node)
+                if repl is None:
+                    raise NotImplementedError("lambda specialization failed for call shape")
+                return repl
+            return node
+
+    try:
+        new_fn = _InlineParamCalls().visit(new_fn)
+    except NotImplementedError:
+        return None
+    ast.fix_missing_locations(new_fn)
+    return new_fn
+
+
+def specialize_lambda_function_args(exec_body, local_funcs):
+    """
+    Specialize calls like f = lambda ...; y = rk4(f, ...)
+    into specialized local procedures with callable arg removed and lambda inlined.
+    """
+    if not exec_body or not local_funcs:
+        return
+    fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
+    if not fn_map:
+        return
+    lambda_env = {}
+    specialized = []
+    counter = 0
+    total_calls = {nm: 0 for nm in fn_map}
+    rewritten_calls = {nm: 0 for nm in fn_map}
+    for st in exec_body:
+        for n in ast.walk(st):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in total_calls:
+                total_calls[n.func.id] += 1
+
+    class _CallSpecializer(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if not (isinstance(node.func, ast.Name) and node.func.id in fn_map):
+                return node
+            fn = fn_map[node.func.id]
+            args = list(node.args)
+            for i, a in enumerate(args):
+                if isinstance(a, ast.Name) and a.id in lambda_env:
+                    lam = lambda_env[a.id]
+                    if i >= len(fn.args.args):
+                        continue
+                    nonlocal counter
+                    counter += 1
+                    new_name = f"{fn.name}_lam_{counter}"
+                    new_fn = _specialize_local_fn_with_lambda(fn, i, lam, new_name)
+                    if new_fn is None:
+                        continue
+                    fn_map[new_name] = new_fn
+                    specialized.append(new_fn)
+                    rewritten_calls[fn.name] = rewritten_calls.get(fn.name, 0) + 1
+                    node.func = ast.Name(id=new_name, ctx=ast.Load())
+                    del node.args[i]
+                    # Remove keyword for removed param if used.
+                    pname = fn.args.args[i].arg
+                    node.keywords = [kw for kw in node.keywords if kw.arg != pname]
+                    break
+            return node
+
+    tx = _CallSpecializer()
+    for i, st in enumerate(list(exec_body)):
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            nm = st.targets[0].id
+            if isinstance(st.value, ast.Lambda):
+                lambda_env[nm] = st.value
+                # Keep assignment only if symbol is used outside call position.
+                exec_body[i] = ast.Pass()
+            else:
+                lambda_env.pop(nm, None)
+        exec_body[i] = tx.visit(exec_body[i])
+    removable = {
+        nm for nm, tot in total_calls.items()
+        if tot > 0 and rewritten_calls.get(nm, 0) == tot
+    }
+    if removable:
+        local_funcs[:] = [f for f in local_funcs if not (isinstance(f, ast.FunctionDef) and f.name in removable)]
+    if specialized:
+        local_funcs.extend(specialized)
+
 class emit:
     def __init__(self):
         self.lines = []
@@ -4305,6 +4479,7 @@ class translator(ast.NodeVisitor):
         self.list_aliases = {}
         self.python_set_vars = set()
         self.none_vars = set()
+        self.lambda_vars = {}
 
     def _resolve_list_alias(self, name):
         cur = name
@@ -5266,6 +5441,10 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "diag" and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Name):
+                if node.func.id in self.lambda_vars:
+                    repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
+                    if repl is not None:
+                        return self.expr(repl)
                 if node.func.id in self.user_class_types:
                     return None
                 if node.func.id in self.local_func_arg_ranks:
@@ -7494,6 +7673,72 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("ListComp currently supports only single-generator form")
 
         if isinstance(node, ast.Call):
+            def _is_rng_expr_source(src):
+                if (
+                    isinstance(src, ast.Attribute)
+                    and isinstance(src.value, ast.Name)
+                    and src.value.id == "np"
+                    and src.attr == "random"
+                ):
+                    return True
+                if isinstance(src, ast.Name) and (src.id == "random" or src.id in self.rng_vars):
+                    return True
+                return False
+
+            def _rng_size_expr(size_node, *, fn_name: str):
+                if size_node is None:
+                    return f"{fn_name}()"
+                if isinstance(size_node, (ast.Tuple, ast.List)):
+                    if len(size_node.elts) == 2:
+                        return f"{fn_name}({self.expr(size_node.elts[0])}, {self.expr(size_node.elts[1])})"
+                    if len(size_node.elts) == 1:
+                        return f"{fn_name}({self.expr(size_node.elts[0])})"
+                    raise NotImplementedError(f"{fn_name} size tuple rank > 2 not supported")
+                return f"{fn_name}({self.expr(size_node)})"
+
+            if (
+                isinstance(node.func, ast.Attribute)
+                and _is_rng_expr_source(node.func.value)
+                and node.func.attr in {"random", "normal", "standard_normal"}
+            ):
+                if node.func.attr == "random":
+                    size_node = node.args[0] if node.args else None
+                    for kw in node.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                    return _rng_size_expr(size_node, fn_name="runif")
+
+                if node.func.attr == "standard_normal":
+                    size_node = node.args[0] if node.args else None
+                    for kw in node.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                    return _rng_size_expr(size_node, fn_name="rnorm")
+
+                # normal(loc=0.0, scale=1.0, size=None)
+                size_node = None
+                loc_node = None
+                scale_node = None
+                if len(node.args) >= 1:
+                    loc_node = node.args[0]
+                if len(node.args) >= 2:
+                    scale_node = node.args[1]
+                if len(node.args) >= 3:
+                    size_node = node.args[2]
+                for kw in node.keywords:
+                    if kw.arg == "loc":
+                        loc_node = kw.value
+                    elif kw.arg == "scale":
+                        scale_node = kw.value
+                    elif kw.arg == "size":
+                        size_node = kw.value
+                base = _rng_size_expr(size_node, fn_name="rnorm")
+                if scale_node is not None:
+                    base = f"({self.expr(scale_node)}) * ({base})"
+                if loc_node is not None:
+                    base = f"({self.expr(loc_node)}) + ({base})"
+                return base
+
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 args_nodes = list(node.args)
                 for kw in getattr(node, "keywords", []):
@@ -11191,6 +11436,10 @@ class translator(ast.NodeVisitor):
                 self.none_vars.add(t.id)
             else:
                 self.none_vars.discard(t.id)
+            if isinstance(v, ast.Lambda):
+                self.lambda_vars[t.id] = v
+                return
+            self.lambda_vars.pop(t.id, None)
         if isinstance(t, ast.Name):
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
             if rk is not None:
@@ -11770,6 +12019,35 @@ class translator(ast.NodeVisitor):
             and len(v.args) == 0
         ):
             self.o.w(f"{t.id} = runif()")
+            return
+
+        # x = random.random(size=...) / np.random.random(size=...) / rng.random(size=...)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and _is_rng_source(v.func.value)
+            and v.func.attr == "random"
+        ):
+            size_node = v.args[0] if v.args else None
+            for kw in v.keywords:
+                if kw.arg == "size":
+                    size_node = kw.value
+            if size_node is None:
+                self.o.w(f"{t.id} = runif()")
+                return
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 2:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    self.o.w(f"{t.id} = runif({n0}, {n1})")
+                    return
+                if len(size_node.elts) == 1:
+                    n0 = self.expr(size_node.elts[0])
+                    self.o.w(f"{t.id} = runif({n0})")
+                    return
+                raise NotImplementedError("random size tuple rank > 2 not supported")
+            self.o.w(f"{t.id} = runif({self.expr(size_node)})")
             return
 
         # x = np.random.random() -> call random_number(x)
@@ -13123,7 +13401,49 @@ class translator(ast.NodeVisitor):
                 elif kw.arg == "replace" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
                     replace_false = True
             if size_node is None:
-                raise NotImplementedError("rng.choice requires size=... in this transpiler")
+                # scalar choice
+                if p_node is not None:
+                    p_expr = self.expr(p_node)
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("integer :: z_choice(1)")
+                    if (
+                        isinstance(npop_node, ast.Constant)
+                        and isinstance(npop_node.value, int)
+                        and npop_node.value == 2
+                    ):
+                        self.o.w(f"call random_choice2({p_expr}, 1, z_choice)")
+                    else:
+                        self.o.w(f"call random_choice_prob({p_expr}, 1, z_choice)")
+                    self.o.w(f"{t.id} = z_choice(1)")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
+                if npop_node is not None and self._rank_expr(npop_node) > 0:
+                    arr_expr = self.expr(npop_node)
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("integer :: j_ch")
+                    self.o.w("real(kind=dp) :: u_ch")
+                    self.o.w("call random_number(u_ch)")
+                    self.o.w(f"j_ch = 1 + int(u_ch * real(size({arr_expr}), kind=dp))")
+                    self.o.w("if (j_ch < 1) j_ch = 1")
+                    self.o.w(f"if (j_ch > size({arr_expr})) j_ch = size({arr_expr})")
+                    self.o.w(f"{t.id} = {arr_expr}(j_ch)")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
+                if npop_node is not None:
+                    npop_expr = self.expr(npop_node)
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp) :: u_ch")
+                    self.o.w("call random_number(u_ch)")
+                    self.o.w(f"{t.id} = int(u_ch * real(max(1, int({npop_expr})), kind=dp))")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
+                raise NotImplementedError("unsupported rng.choice form")
             n_expr = self.expr(size_node)
             if p_node is not None:
                 p_expr = self.expr(p_node)
@@ -15017,6 +15337,12 @@ def _emit_local_function(
     tr.prescan(fn.body)
     tr.validate_unsafe_if_type_merges(fn.body)
     tr.apply_type_rebind_declaration_pruning()
+    if is_elemental_fn:
+        for _a in args:
+            if _pre_arg_rank(_a) > 0:
+                is_elemental_fn = False
+                tr.local_elemental_funcs.discard(fn.name)
+                break
 
     returns = [s for s in ast.walk(fn) if isinstance(s, ast.Return) and s.value is not None]
     tuple_return = False
@@ -15285,6 +15611,33 @@ def _emit_local_function(
                     if isinstance(n.target, ast.Name) and n.target.id == nm:
                         return True
         return False
+
+    # Elemental procedures require scalar dummy arguments and scalar results.
+    # If body analysis shows array-style dummy usage, downgrade to non-elemental.
+    if is_elemental_fn:
+        _elem_conflict = False
+        for _a in args:
+            if _arg_array_rank(_a) > 0:
+                _elem_conflict = True
+                break
+            if int(tr.alloc_real_rank.get(_a, 0)) > 0:
+                _elem_conflict = True
+                break
+            if int(tr.alloc_int_rank.get(_a, 0)) > 0:
+                _elem_conflict = True
+                break
+            if int(tr.alloc_log_rank.get(_a, 0)) > 0:
+                _elem_conflict = True
+                break
+            if int(tr.alloc_complex_rank.get(_a, 0)) > 0:
+                _elem_conflict = True
+                break
+            if int(tr.alloc_char_rank.get(_a, 0)) > 0:
+                _elem_conflict = True
+                break
+        if _elem_conflict:
+            is_elemental_fn = False
+            tr.local_elemental_funcs.discard(fn.name)
 
     # Keep internal rank metadata for dummy array arguments consistent with
     # the declared argument rank used below.
@@ -17051,6 +17404,9 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     rewrite_print_after_mixed_if_merges(effective_tree.body, env={})
     for _fn in local_funcs:
         rewrite_print_after_mixed_if_merges(_fn.body, env={})
+    # Lower simple lambda-as-callable argument patterns by specializing local
+    # procedures and inlining lambda bodies where safe.
+    specialize_lambda_function_args(effective_tree.body, local_funcs)
 
     params = find_parameters(effective_tree)
     translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
