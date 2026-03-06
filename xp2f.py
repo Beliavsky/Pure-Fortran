@@ -25,6 +25,7 @@ import difflib
 import copy
 import io
 import tokenize
+import keyword
 from datetime import datetime
 import fortran_output as fout
 from fortran_scan import (
@@ -238,6 +239,469 @@ def find_parameters(tree):
 
 def const_comment(name, tree):
     return "constant from python source"
+
+
+def _line_starts(src_text):
+    starts = [0]
+    for i, ch in enumerate(src_text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def _lc_to_off(starts, line, col):
+    if line <= 0:
+        return 0
+    idx = min(line - 1, len(starts) - 1)
+    return starts[idx] + max(0, col)
+
+
+def _numeric_literal_kind(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return "int"
+    if isinstance(node, ast.Constant) and isinstance(node.value, float):
+        return "real"
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return _numeric_literal_kind(node.operand)
+    return None
+
+
+def _strict_mixed_numeric_literal_diagnostics(src_text):
+    """
+    Strict rule:
+    - In list/tuple constructors, mixing integer and real element kinds is rejected.
+      (Matches transpiler array-constructor kind checks, not just raw literals.)
+    """
+    diags = []
+    tree = ast.parse(src_text)
+    parent = {}
+    for pn in ast.walk(tree):
+        for ch in ast.iter_child_nodes(pn):
+            parent[id(ch)] = pn
+    # Reuse transpiler kind inference so strict diagnostics align with real
+    # transpilation behavior.
+    tr = translator(
+        emit(),
+        params=find_parameters(tree),
+        context="flat",
+        list_counts=build_list_count_map(tree),
+    )
+    tr.prescan(tree.body)
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef):
+            tr.prescan(st.body)
+
+    for n in ast.walk(tree):
+        if not isinstance(n, (ast.List, ast.Tuple)):
+            continue
+        if isinstance(n, ast.Tuple) and isinstance(getattr(n, "ctx", None), ast.Store):
+            # Tuple unpacking targets are not value constructors.
+            continue
+        p = parent.get(id(n))
+        if isinstance(n, ast.Tuple):
+            # Tuple return packing and call argument tuples (e.g., shape tuples)
+            # are not lowered via array constructors.
+            if isinstance(p, ast.Return) and getattr(p, "value", None) is n:
+                continue
+            if isinstance(p, ast.Call):
+                continue
+            if isinstance(p, ast.keyword):
+                continue
+            if isinstance(p, ast.Subscript):
+                continue
+        kinds = {tr._expr_kind(e) for e in n.elts}
+        kinds.discard(None)
+        if not ("int" in kinds and "real" in kinds):
+            continue
+        ln = getattr(n, "lineno", 1)
+        col = getattr(n, "col_offset", 0) + 1
+        seg = ast.get_source_segment(src_text, n)
+        seg_txt = seg.strip() if isinstance(seg, str) else "<list/tuple literal>"
+        is_literal_only = all(_numeric_literal_kind(e) in {"int", "real"} for e in n.elts)
+        sugg = (
+            "rewrite integer literals as floats, e.g. [1.0, 2.5, 3.0]"
+            if is_literal_only
+            else "make element kinds explicit (e.g., float(...) or np.asarray(..., dtype=float))"
+        )
+        diags.append({
+            "line": ln,
+            "col": col,
+            "rule": "mixed_numeric_literal",
+            "message": "mixed int/real list/tuple constructor; strict mode requires explicit homogeneous type",
+            "snippet": seg_txt,
+            "suggestion": sugg,
+        })
+    diags.sort(key=lambda d: (d["line"], d["col"]))
+    return diags
+
+
+def _strict_polymorphic_function_diagnostics(src_text):
+    """
+    Strict rule:
+    - Warn/fail when a local function is called with heterogeneous argument
+      kinds/ranks across call sites (dynamic polymorphism pattern).
+    """
+    diags = []
+    tree = ast.parse(src_text)
+    local_defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if not local_defs:
+        return diags
+
+    tr = translator(
+        emit(),
+        params=find_parameters(tree),
+        context="flat",
+        list_counts=build_list_count_map(tree),
+    )
+    tr.prescan(tree.body)
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef):
+            tr.prescan(st.body)
+
+    # fn -> arg_index -> set(descriptors)
+    seen = {}
+    call_lines = {}
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in local_defs):
+            continue
+        fn = n.func.id
+        if fn not in seen:
+            seen[fn] = {}
+            call_lines[fn] = []
+        call_lines[fn].append(getattr(n, "lineno", 1))
+        for i, a in enumerate(n.args):
+            k = tr._expr_kind(a) or "unknown"
+            r = int(tr._rank_expr(a))
+            is_list = bool(tr._is_python_list_expr(a))
+            desc = f"{k}:r{r}" + (":list" if is_list else "")
+            seen[fn].setdefault(i, set()).add(desc)
+        # Keyword args: map by local function signature where possible.
+        fdef = local_defs.get(fn)
+        if fdef is not None:
+            arg_names = [aa.arg for aa in fdef.args.args]
+            for kw in getattr(n, "keywords", []):
+                if kw.arg is None:
+                    continue
+                if kw.arg not in arg_names:
+                    continue
+                i = arg_names.index(kw.arg)
+                a = kw.value
+                k = tr._expr_kind(a) or "unknown"
+                r = int(tr._rank_expr(a))
+                is_list = bool(tr._is_python_list_expr(a))
+                desc = f"{k}:r{r}" + (":list" if is_list else "")
+                seen[fn].setdefault(i, set()).add(desc)
+
+    for fn, per_arg in seen.items():
+        bad = []
+        for i, kinds in sorted(per_arg.items()):
+            if len(kinds) > 1:
+                bad.append((i, sorted(kinds)))
+        if not bad:
+            continue
+        fdef = local_defs[fn]
+        line = getattr(fdef, "lineno", 1)
+        col = getattr(fdef, "col_offset", 0) + 1
+        parts = []
+        for i, ks in bad:
+            parts.append(f"arg#{i + 1}: " + ", ".join(ks))
+        msg = (
+            f"function '{fn}' is called with heterogeneous argument kinds/ranks "
+            f"({'; '.join(parts)})"
+        )
+        diags.append({
+            "line": line,
+            "col": col,
+            "rule": "polymorphic_local_function",
+            "message": msg,
+            "snippet": f"def {fn}(...)",
+            "suggestion": (
+                f"split '{fn}' into explicit typed versions (e.g., {fn}_int/{fn}_real/{fn}_char/...) "
+                "or make call-site argument types uniform"
+            ),
+        })
+
+    diags.sort(key=lambda d: (d["line"], d["col"]))
+    return diags
+
+
+def _strict_type_rebind_diagnostics(src_text):
+    """
+    Strict rule:
+    - Rebinding the same variable name to different type families/ranks is flagged.
+    """
+    diags = []
+    tree = ast.parse(src_text)
+    tr = translator(
+        emit(),
+        params=find_parameters(tree),
+        context="flat",
+        list_counts=build_list_count_map(tree),
+    )
+    tr.prescan(tree.body)
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef):
+            tr.prescan(st.body)
+
+    def _walk_scope(stmts, scope_label):
+        seen = {}
+
+        def _record(name, node, kind, rank):
+            if kind is None:
+                return
+            fam = kind
+            ln = getattr(node, "lineno", 1)
+            prev = seen.get(name)
+            if prev is None:
+                seen[name] = (fam, int(rank), ln)
+                return
+            pf, pr, pln = prev
+            rank_changed = (pr != int(rank)) and (pr > 0 or int(rank) > 0)
+            if pf != fam or rank_changed:
+                msg = f"variable '{name}' changes type/rank in {scope_label} ({pf}, rank {pr} at line {pln} -> {fam}, rank {int(rank)} at line {ln})"
+                diags.append({
+                    "line": ln,
+                    "col": 1,
+                    "rule": "variable_rebind",
+                    "message": msg,
+                    "snippet": f"{name} = ...",
+                    "suggestion": "use distinct variable names per type/rank or refactor with explicit blocks/type-specific variables",
+                })
+                # Keep latest to avoid duplicate noise cascade.
+                seen[name] = (fam, int(rank), ln)
+
+        for st in stmts:
+            nodes = [st]
+            # Check nested assignment nodes in this statement.
+            for n in ast.walk(st):
+                if isinstance(n, ast.Assign):
+                    if len(n.targets) != 1:
+                        continue
+                    t = n.targets[0]
+                    if isinstance(t, ast.Name):
+                        _record(t.id, n, tr._expr_kind(n.value), tr._rank_expr(n.value))
+                elif isinstance(n, ast.AnnAssign):
+                    if isinstance(n.target, ast.Name) and n.value is not None:
+                        _record(n.target.id, n, tr._expr_kind(n.value), tr._rank_expr(n.value))
+                elif isinstance(n, ast.AugAssign):
+                    if isinstance(n.target, ast.Name):
+                        k = tr._expr_kind(n.target) or tr._expr_kind(n.value)
+                        r = tr._rank_expr(n.target)
+                        _record(n.target.id, n, k, r)
+            # Recurse into function scopes separately.
+            if isinstance(st, ast.FunctionDef):
+                _walk_scope(st.body, f"function '{st.name}'")
+
+    _walk_scope(tree.body, "module scope")
+    # Deduplicate by (line,message)
+    uniq = {}
+    for d in diags:
+        uniq[(d["line"], d["message"])] = d
+    out = sorted(uniq.values(), key=lambda d: (d["line"], d["col"]))
+    return out
+
+
+def _strict_expr_family(node):
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool):
+            return None
+        if isinstance(node.value, int):
+            return "int_s"
+        if isinstance(node.value, float):
+            return "real_s"
+        if isinstance(node.value, str):
+            return "char_s"
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return _strict_expr_family(node.operand)
+    if isinstance(node, ast.List):
+        kinds = {_strict_expr_family(e) for e in node.elts}
+        kinds.discard(None)
+        if not kinds:
+            return None
+        if kinds <= {"int_s"}:
+            return "int_list_r1"
+        if kinds <= {"real_s", "int_s"}:
+            return "real_list_r1"
+        if kinds <= {"char_s"}:
+            return "char_list_r1"
+        return None
+    return None
+
+
+def _strict_fix_overloads(src_text):
+    """Create typed variants for eligible polymorphic top-level one-arg functions."""
+    tree = ast.parse(src_text)
+    top_fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    fn_map = {f.name: f for f in top_fns}
+    if not fn_map:
+        return src_text, 0
+
+    call_data = {name: {"families": set(), "unknown": False} for name in fn_map}
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in fn_map):
+            continue
+        fn = n.func.id
+        fdef = fn_map[fn]
+        if len(fdef.args.args) != 1 or fdef.args.vararg is not None or fdef.args.kwarg is not None:
+            call_data[fn]["unknown"] = True
+            continue
+        arg_node = None
+        if len(n.args) == 1 and not n.keywords:
+            arg_node = n.args[0]
+        elif len(n.args) == 0 and len(n.keywords) == 1 and n.keywords[0].arg == fdef.args.args[0].arg:
+            arg_node = n.keywords[0].value
+        else:
+            call_data[fn]["unknown"] = True
+            continue
+        fam = _strict_expr_family(arg_node)
+        if fam is None:
+            call_data[fn]["unknown"] = True
+            continue
+        call_data[fn]["families"].add(fam)
+
+    suffix = {
+        "int_s": "int",
+        "real_s": "real",
+        "char_s": "char",
+        "int_list_r1": "int_list",
+        "real_list_r1": "real_list",
+        "char_list_r1": "char_list",
+    }
+
+    targets = {}
+    for fn, info in call_data.items():
+        fams = sorted(info["families"])
+        if len(fams) < 2 or info["unknown"]:
+            continue
+        if any(f not in suffix for f in fams):
+            continue
+        targets[fn] = fams
+    if not targets:
+        return src_text, 0
+
+    existing_names = {n.name for n in top_fns}
+    rename_by_fn = {}
+    generated = 0
+    for fn, fams in targets.items():
+        fam_map = {}
+        for fam in fams:
+            base = f"{fn}_{suffix[fam]}"
+            cand = base
+            k = 2
+            while cand in existing_names or keyword.iskeyword(cand):
+                cand = f"{base}_{k}"
+                k += 1
+            existing_names.add(cand)
+            fam_map[fam] = cand
+            generated += 1
+        rename_by_fn[fn] = fam_map
+
+    class _CallRewriter(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Name) and node.func.id in rename_by_fn:
+                fn = node.func.id
+                fdef = fn_map[fn]
+                arg_node = None
+                if len(node.args) == 1 and not node.keywords:
+                    arg_node = node.args[0]
+                elif len(node.args) == 0 and len(node.keywords) == 1 and node.keywords[0].arg == fdef.args.args[0].arg:
+                    arg_node = node.keywords[0].value
+                if arg_node is None:
+                    return node
+                fam = _strict_expr_family(arg_node)
+                new_name = rename_by_fn[fn].get(fam)
+                if new_name:
+                    node.func = ast.Name(id=new_name, ctx=ast.Load())
+            return node
+
+    tree = _CallRewriter().visit(tree)
+    ast.fix_missing_locations(tree)
+
+    new_body = []
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef) and st.name in rename_by_fn:
+            fam_map = rename_by_fn[st.name]
+            for fam in sorted(fam_map.keys()):
+                clone = copy.deepcopy(st)
+                clone.name = fam_map[fam]
+                new_body.append(clone)
+            continue
+        new_body.append(st)
+    tree.body = new_body
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n", generated
+
+
+def _strict_fix_mixed_numeric_literals(src_text):
+    tree = ast.parse(src_text)
+    starts = _line_starts(src_text)
+    edits = []
+
+    def _add_edit(node, repl):
+        if not (hasattr(node, "lineno") and hasattr(node, "col_offset") and hasattr(node, "end_lineno") and hasattr(node, "end_col_offset")):
+            return
+        s = _lc_to_off(starts, node.lineno, node.col_offset)
+        e = _lc_to_off(starts, node.end_lineno, node.end_col_offset)
+        if s < e:
+            edits.append((s, e, repl))
+
+    def _float_text_for_int_node(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return f"{int(node.value)}.0"
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, int) and not isinstance(node.operand.value, bool):
+                sign = "-" if isinstance(node.op, ast.USub) else "+"
+                return f"{sign}{int(node.operand.value)}.0"
+        return None
+
+    for n in ast.walk(tree):
+        if not isinstance(n, (ast.List, ast.Tuple)):
+            continue
+        kinds = {_numeric_literal_kind(e) for e in n.elts}
+        kinds.discard(None)
+        if not ("int" in kinds and "real" in kinds):
+            continue
+        for e in n.elts:
+            if _numeric_literal_kind(e) != "int":
+                continue
+            repl = _float_text_for_int_node(e)
+            if repl is not None:
+                _add_edit(e, repl)
+
+    if not edits:
+        return src_text, 0
+    # Apply from right to left to keep offsets stable.
+    edits.sort(key=lambda t: t[0], reverse=True)
+    out = src_text
+    used = []
+    for s, e, repl in edits:
+        # Skip overlaps (can occur with malformed/duplicate spans).
+        if any(not (e <= us or s >= ue) for us, ue in used):
+            continue
+        out = out[:s] + repl + out[e:]
+        used.append((s, e))
+    return out, len(used)
+
+
+def _run_strict_check(src_text, path_label):
+    diags = []
+    diags.extend(_strict_mixed_numeric_literal_diagnostics(src_text))
+    diags.extend(_strict_polymorphic_function_diagnostics(src_text))
+    diags.extend(_strict_type_rebind_diagnostics(src_text))
+    diags.sort(key=lambda d: (d["line"], d["col"]))
+    if not diags:
+        print(f"Strict: PASS ({path_label})")
+        return True
+    print(f"Strict: FAIL ({len(diags)} issue(s) in {path_label})")
+    for d in diags:
+        print(f"{path_label}:{d['line']}:{d['col']}: {d['message']}")
+        print(f"  snippet: {d['snippet']}")
+        print(f"  suggestion: {d['suggestion']}")
+    return False
 
 
 def extract_python_comments(src_text):
@@ -6374,10 +6838,7 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError(
                     "mixed-type list/tuple literals are unsupported (logical mixed with non-logical)"
                 )
-            if "int" in kinds and "real" in kinds:
-                raise NotImplementedError(
-                    "mixed-type list/tuple literals are unsupported (real mixed with integer)"
-                )
+            mixed_real_int = ("int" in kinds and "real" in kinds)
             if kinds == {"char"}:
                 if elts and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in elts):
                     max_len = max(len(e.value) for e in elts)
@@ -6391,6 +6852,12 @@ class translator(ast.NodeVisitor):
                 max_len = max(len(e.value) for e in elts)
                 vals = ", ".join(self.expr(e) for e in elts)
                 return f"[character(len={max_len}) :: {vals}]"
+            if mixed_real_int:
+                vals = ", ".join(
+                    (f"real({self.expr(e)}, kind=dp)" if self._expr_kind(e) == "int" else self.expr(e))
+                    for e in elts
+                )
+                return f"[{vals}]"
             vals = ", ".join(self.expr(e) for e in elts)
             return f"[{vals}]"
 
@@ -9287,7 +9754,18 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.targets[0], (ast.Tuple, ast.List))
                     and isinstance(node.value, ast.Name)
                 ):
-                    ksrc = self._expr_kind(node.value)
+                    src = node.value.id
+                    ksrc = None
+                    if src in self.alloc_reals or src in self.reals:
+                        ksrc = "real"
+                    elif src in self.alloc_ints or src in self.ints:
+                        ksrc = "int"
+                    elif src in self.alloc_logs or src in self.logs:
+                        ksrc = "logical"
+                    elif src in self.alloc_complexes or src in self.complexes:
+                        ksrc = "complex"
+                    elif src in self.alloc_chars or src in self.chars:
+                        ksrc = "char"
                     for e in node.targets[0].elts:
                         if not isinstance(e, ast.Name):
                             continue
@@ -14468,6 +14946,14 @@ def _emit_local_function(
         rr = 0
         for st in fn.body:
             for n in ast.walk(st):
+                if (
+                    isinstance(n, ast.Assign)
+                    and len(n.targets) == 1
+                    and isinstance(n.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == nm
+                ):
+                    rr = max(rr, 1)
                 if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == nm:
                     if isinstance(n.slice, ast.Tuple):
                         has_none_axis = any(is_none(e) for e in n.slice.elts)
@@ -14677,6 +15163,27 @@ def _emit_local_function(
         return rec(node)
 
     def _arg_real_context(nm):
+        def _name_real_context(name):
+            for st in fn.body:
+                for n in ast.walk(st):
+                    if isinstance(n, ast.BinOp):
+                        if _name_used(n.left, name) or _name_used(n.right, name):
+                            if _name_used(n.left, name) and any(isinstance(t, ast.Constant) and isinstance(t.value, float) for t in ast.walk(n.right)):
+                                return True
+                            if _name_used(n.right, name) and any(isinstance(t, ast.Constant) and isinstance(t.value, float) for t in ast.walk(n.left)):
+                                return True
+                    if (
+                        isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Attribute)
+                        and isinstance(n.func.value, ast.Name)
+                        and n.func.value.id == "np"
+                        and n.func.attr in {"log", "exp", "sqrt", "maximum", "max", "sum"}
+                        and len(n.args) >= 1
+                        and _name_used(n.args[0], name)
+                    ):
+                        return True
+            return False
+
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.BinOp):
@@ -14695,12 +15202,30 @@ def _emit_local_function(
                     and _name_used(n.args[0], nm)
                 ):
                     return True
+                if (
+                    isinstance(n, ast.Assign)
+                    and len(n.targets) == 1
+                    and isinstance(n.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == nm
+                ):
+                    tnames = [e.id for e in n.targets[0].elts if isinstance(e, ast.Name)]
+                    if any(_name_real_context(tn) for tn in tnames):
+                        return True
         return False
 
     def _arg_array_rank(nm):
         rr = 0
         for st in fn.body:
             for n in ast.walk(st):
+                if (
+                    isinstance(n, ast.Assign)
+                    and len(n.targets) == 1
+                    and isinstance(n.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == nm
+                ):
+                    rr = max(rr, 1)
                 if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == nm:
                     if isinstance(n.slice, ast.Tuple):
                         has_none_axis = any(is_none(e) for e in n.slice.elts)
@@ -16645,6 +17170,11 @@ def main():
     ap.add_argument("input_py", help="input python source")
     ap.add_argument("helpers", nargs="*", help="zero or more helper .f90 module files")
     ap.add_argument("--out", help="output .f90 path (default: input basename with _p.f90)")
+    ap.add_argument("--strict", action="store_true", help="strict Python-source validation mode (no transpilation)")
+    ap.add_argument("--strict-fix", action="store_true", help="write a strict-friendly Python source (non-inplace by default)")
+    ap.add_argument("--strict-fix-overloads", action="store_true", help="with --strict-fix, generate typed overload variants for eligible polymorphic local functions")
+    ap.add_argument("--strict-fix-inplace", action="store_true", help="overwrite input file when used with --strict-fix")
+    ap.add_argument("--out-python", help="output path for --strict-fix (default: <input>_strict.py)")
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
     ap.add_argument("--compile", action="store_true", help="compile transpiled source with helper files")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
@@ -16674,6 +17204,48 @@ def main():
         args.time = True
     if args.time:
         args.run = True
+
+    if args.strict_fix_inplace and (not args.strict_fix):
+        print("Strict-fix: FAIL (--strict-fix-inplace requires --strict-fix)")
+        return 1
+    if args.strict_fix_overloads and (not args.strict_fix):
+        print("Strict-fix: FAIL (--strict-fix-overloads requires --strict-fix)")
+        return 1
+    if args.out_python and (not args.strict_fix):
+        print("Strict-fix: FAIL (--out-python requires --strict-fix)")
+        return 1
+
+    src_path = Path(args.input_py)
+    src_text = src_path.read_text(encoding="utf-8-sig")
+    if args.strict_fix:
+        fixed_text, nfix = _strict_fix_mixed_numeric_literals(src_text)
+        nover = 0
+        if args.strict_fix_overloads:
+            fixed_text, nover = _strict_fix_overloads(fixed_text)
+        ntotal = int(nfix) + int(nover)
+        if ntotal <= 0:
+            if args.strict_fix_inplace:
+                print(f"Strict-fix: no changes needed ({src_path} unchanged)")
+                out_label = str(src_path)
+            else:
+                print(f"Strict-fix: no changes needed ({src_path}); no output file created")
+                out_label = str(src_path)
+            ok = _run_strict_check(src_text, out_label)
+            return 0 if ok else 1
+        if args.strict_fix_inplace:
+            out_py = src_path
+        elif args.out_python:
+            out_py = Path(args.out_python)
+        else:
+            out_py = src_path.with_name(f"{src_path.stem}_strict{src_path.suffix or '.py'}")
+        out_py.write_text(fixed_text, encoding="utf-8")
+        print(f"Strict-fix: wrote {out_py} ({nfix} literal edit(s), {nover} overload(s))")
+        ok = _run_strict_check(fixed_text, str(out_py))
+        return 0 if ok else 1
+
+    if args.strict:
+        ok = _run_strict_check(src_text, args.input_py)
+        return 0 if ok else 1
 
     def _pretty_text(text):
         return fout.pretty_output_text(text, float_digits=None, trim=True) if args.pretty else text
