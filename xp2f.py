@@ -4569,6 +4569,7 @@ class translator(ast.NodeVisitor):
         self.python_set_vars = set()
         self.none_vars = set()
         self.lambda_vars = {}
+        self.tuple_loop_literals = {}
 
     def _resolve_list_alias(self, name):
         cur = name
@@ -10113,6 +10114,21 @@ class translator(ast.NodeVisitor):
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
                 ):
+                    # Track literal tuple/list containers used by tuple-target for loops.
+                    tnm = node.targets[0].id
+                    if isinstance(node.value, ast.Name):
+                        if node.value.id in self.tuple_loop_literals:
+                            self.tuple_loop_literals[tnm] = self.tuple_loop_literals[node.value.id]
+                        else:
+                            self.tuple_loop_literals.pop(tnm, None)
+                    elif (
+                        isinstance(node.value, (ast.List, ast.Tuple))
+                        and node.value.elts
+                        and all(isinstance(e, (ast.Tuple, ast.List)) for e in node.value.elts)
+                    ):
+                        self.tuple_loop_literals[tnm] = node.value
+                    else:
+                        self.tuple_loop_literals.pop(tnm, None)
                     if (
                         isinstance(node.value, ast.Call)
                         and isinstance(node.value.func, ast.Attribute)
@@ -11497,6 +11513,37 @@ class translator(ast.NodeVisitor):
                         self._mark_int(node.target.id)
                 elif (
                     isinstance(node.target, (ast.Tuple, ast.List))
+                    and (
+                        isinstance(node.iter, (ast.List, ast.Tuple))
+                        or (isinstance(node.iter, ast.Name) and node.iter.id in self.tuple_loop_literals)
+                    )
+                ):
+                    # tuple-target literal loop, e.g. for (i,j) in [(0,1), ...]
+                    self._mark_int(f"i_tup_{getattr(node, 'lineno', 0)}")
+                    iter_node = node.iter if isinstance(node.iter, (ast.List, ast.Tuple)) else self.tuple_loop_literals.get(node.iter.id)
+                    if all(isinstance(t, ast.Name) for t in node.target.elts):
+                        for j, tnm in enumerate(node.target.elts):
+                            if tnm.id == "_":
+                                continue
+                            kk = None
+                            for it in (iter_node.elts if iter_node is not None else []):
+                                if not isinstance(it, (ast.Tuple, ast.List)):
+                                    continue
+                                if j >= len(it.elts):
+                                    continue
+                                kk = self._expr_kind(it.elts[j])
+                                if kk is not None:
+                                    break
+                            if kk == "real":
+                                self._mark_real(tnm.id)
+                            elif kk == "logical":
+                                self._mark_log(tnm.id)
+                            elif kk == "char":
+                                self._mark_char(tnm.id)
+                            else:
+                                self._mark_int(tnm.id)
+                elif (
+                    isinstance(node.target, (ast.Tuple, ast.List))
                     and len(node.target.elts) == 2
                     and isinstance(node.iter, ast.Call)
                     and isinstance(node.iter.func, ast.Name)
@@ -11661,12 +11708,24 @@ class translator(ast.NodeVisitor):
                 else:
                     self.list_aliases.pop(t.id, None)
                 self.python_list_vars.add(t.id)
+                if v.id in self.tuple_loop_literals:
+                    self.tuple_loop_literals[t.id] = self.tuple_loop_literals[v.id]
+                else:
+                    self.tuple_loop_literals.pop(t.id, None)
                 return
             self.list_aliases.pop(t.id, None)
             if self._is_python_list_expr(v):
                 self.python_list_vars.add(t.id)
             else:
                 self.python_list_vars.discard(t.id)
+            if (
+                isinstance(v, (ast.List, ast.Tuple))
+                and v.elts
+                and all(isinstance(e, (ast.Tuple, ast.List)) for e in v.elts)
+            ):
+                self.tuple_loop_literals[t.id] = v
+            else:
+                self.tuple_loop_literals.pop(t.id, None)
             if self._is_python_set_expr(v):
                 self.python_set_vars.add(t.id)
             else:
@@ -14674,6 +14733,63 @@ class translator(ast.NodeVisitor):
             for s in node.body:
                 self.visit(s)
             self.o.w(f"{idx_var} = {idx_var} + 1")
+            self.o.pop()
+            self.o.w("end do")
+            return
+
+        # tuple-target loops over literal tuple/list containers, e.g.
+        # for (i, j) in [(0, 1), (3, 7)]:
+        tuple_iter_node = None
+        if isinstance(node.iter, (ast.List, ast.Tuple)):
+            tuple_iter_node = node.iter
+        elif isinstance(node.iter, ast.Name) and node.iter.id in self.tuple_loop_literals:
+            tuple_iter_node = self.tuple_loop_literals[node.iter.id]
+        if (
+            isinstance(node.target, (ast.Tuple, ast.List))
+            and tuple_iter_node is not None
+        ):
+            tgt_elts = list(node.target.elts)
+            if not tgt_elts:
+                return
+            if not all(isinstance(t, ast.Name) for t in tgt_elts):
+                raise NotImplementedError("tuple-target for loops require name targets")
+            items = list(tuple_iter_node.elts)
+            if not items:
+                return
+            arity = len(tgt_elts)
+            row_elts = []
+            for it in items:
+                if not isinstance(it, (ast.Tuple, ast.List)) or len(it.elts) != arity:
+                    raise NotImplementedError("tuple-target literal loops require homogeneous tuple/list elements")
+                row_elts.append(list(it.elts))
+
+            iv = f"i_tup_{node.lineno}"
+            self._mark_int(iv)
+            self.o.w(f"do {iv} = 1, {len(row_elts)}")
+            self.o.push()
+            self.o.w(f"select case ({iv})")
+            self.o.push()
+            for k, row in enumerate(row_elts, start=1):
+                self.o.w(f"case ({k})")
+                self.o.push()
+                for t, v in zip(tgt_elts, row):
+                    if t.id == "_":
+                        continue
+                    knd = self._expr_kind(v)
+                    if knd == "real":
+                        self._mark_real(t.id)
+                    elif knd == "logical":
+                        self._mark_log(t.id)
+                    elif knd == "char":
+                        self._mark_char(t.id)
+                    else:
+                        self._mark_int(t.id)
+                    self.o.w(f"{t.id} = {self.expr(v)}")
+                for s in node.body:
+                    self.visit(s)
+                self.o.pop()
+            self.o.pop()
+            self.o.w("end select")
             self.o.pop()
             self.o.w("end do")
             return
