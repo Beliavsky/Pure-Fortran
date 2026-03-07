@@ -18271,19 +18271,20 @@ def _emit_local_function(
         return rr
 
     def _arg_used_as_index_or_range(nm):
+        def _uses_name(node):
+            for _k in ast.walk(node):
+                if isinstance(_k, ast.Name) and _k.id == nm:
+                    return True
+            return False
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.Subscript):
                     sl = n.slice
-                    if isinstance(sl, ast.Name) and sl.id == nm:
+                    if _uses_name(sl):
                         return True
-                    if isinstance(sl, ast.Tuple):
-                        for e in sl.elts:
-                            if isinstance(e, ast.Name) and e.id == nm:
-                                return True
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "range":
                     for a in n.args:
-                        if isinstance(a, ast.Name) and a.id == nm:
+                        if _uses_name(a):
                             return True
         return False
 
@@ -18318,6 +18319,10 @@ def _emit_local_function(
         if rk_hint is None:
             if _arg_used_in_numeric_arith(a.arg) and (not _arg_used_as_index_or_range(a.arg)):
                 rk_hint = "real"
+        # Python range/index operands are integer by semantics.
+        # Keep this as a hard preference over arithmetic-based real hints.
+        if _arg_used_as_index_or_range(a.arg):
+            rk_hint = "int"
         if (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
@@ -19063,6 +19068,8 @@ def _emit_local_function(
             if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
                 if hint_kind is None:
                     hint_kind = local_func_arg_kinds[fn.name][idx]
+        if _arg_used_as_index_or_range(arg):
+            hint_kind = "int"
         arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
         if force_arg_ranks is not None and arg in force_arg_ranks:
             arr_rank = int(force_arg_ranks[arg])
