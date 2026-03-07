@@ -1061,6 +1061,16 @@ def function_is_pure(fn_node, known_pure_calls=None):
                 return
             self.generic_visit(node)
 
+        def visit_Attribute(self, node):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "sys"
+                and node.attr == "argv"
+            ):
+                needed.add("sys_argv_init")
+                needed.add("sys_argv_delete")
+            self.generic_visit(node)
+
     s = scan()
     for st in fn_node.body:
         s.visit(st)
@@ -2986,6 +2996,10 @@ def detect_needed_helpers(tree):
                     and node.func.attr == "pprint"
                 )
             )
+            if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr"}:
+                needed.add("py_str")
+            if isinstance(node.func, ast.Name) and node.func.id == "float":
+                needed.add("py_float")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -4939,6 +4953,111 @@ def specialize_lambda_function_args(exec_body, local_funcs):
     if specialized:
         local_funcs.extend(specialized)
 
+
+def normalize_if_scalar_array_merges(stmts):
+    """Make simple if-branch scalar/array rebinds rank-stable.
+
+    Pattern handled (conservative):
+    - same target name assigned in both branches at top statement level
+    - one side is clearly array-like (e.g. np.linspace(...), list/tuple literal)
+    - other side is scalar-like
+    Rewrites scalar side to a length-1 list constructor so lowering can emit
+    a rank-stable array variable.
+    """
+    if not isinstance(stmts, list):
+        return
+
+    def _is_np_name(node):
+        return isinstance(node, ast.Name) and node.id in {"np", "numpy"}
+
+    def _is_arrayish_expr(node):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return True
+        if isinstance(node, ast.Subscript):
+            return True
+        if isinstance(node, ast.Call):
+            f = node.func
+            if (
+                isinstance(f, ast.Attribute)
+                and _is_np_name(f.value)
+                and f.attr in {
+                    "array", "asarray", "zeros", "ones", "empty", "full",
+                    "linspace", "arange", "copy", "empty_like", "ones_like",
+                    "zeros_like", "concatenate", "stack", "vstack", "hstack",
+                    "column_stack", "row_stack", "where",
+                }
+            ):
+                return True
+        return False
+
+    def _branch_simple_assigns(branch):
+        out = {}
+        for st in branch:
+            if (
+                isinstance(st, ast.Assign)
+                and len(st.targets) == 1
+                and isinstance(st.targets[0], ast.Name)
+            ):
+                out[st.targets[0].id] = st
+        return out
+
+    for st in stmts:
+        if isinstance(st, ast.If):
+            bmap = _branch_simple_assigns(st.body)
+            omap = _branch_simple_assigns(st.orelse)
+            for nm in (set(bmap.keys()) & set(omap.keys())):
+                b_asg = bmap[nm]
+                o_asg = omap[nm]
+                b_arr = _is_arrayish_expr(b_asg.value)
+                o_arr = _is_arrayish_expr(o_asg.value)
+                if b_arr and (not o_arr):
+                    o_asg.value = ast.List(elts=[copy.deepcopy(o_asg.value)], ctx=ast.Load())
+                    ast.fix_missing_locations(o_asg)
+                elif o_arr and (not b_arr):
+                    b_asg.value = ast.List(elts=[copy.deepcopy(b_asg.value)], ctx=ast.Load())
+                    ast.fix_missing_locations(b_asg)
+            normalize_if_scalar_array_merges(st.body)
+            normalize_if_scalar_array_merges(st.orelse)
+        elif isinstance(st, (ast.For, ast.While)):
+            normalize_if_scalar_array_merges(st.body)
+            normalize_if_scalar_array_merges(st.orelse)
+
+
+def lower_vararg_functions(exec_body, local_funcs):
+    """Conservative fallback for Python *args local functions.
+
+    For now, make vararg local functions callable with no arguments and stub
+    their bodies, so transpilation can proceed for scripts that use varargs
+    primarily for diagnostic printing.
+    """
+    if not local_funcs:
+        return
+    vararg_names = set()
+    for fn in local_funcs:
+        if isinstance(fn, ast.FunctionDef) and fn.args.vararg is not None:
+            vararg_names.add(fn.name)
+            fn.args.vararg = None
+            fn.body = [ast.Return(value=None)]
+            ast.fix_missing_locations(fn)
+    if not vararg_names:
+        return
+
+    class _StripVarargCalls(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Name) and node.func.id in vararg_names:
+                node.args = []
+                node.keywords = []
+            return node
+
+    tx = _StripVarargCalls()
+    for i, st in enumerate(list(exec_body or [])):
+        exec_body[i] = tx.visit(st)
+    for fn in local_funcs:
+        if isinstance(fn, ast.FunctionDef):
+            for i, st in enumerate(list(fn.body)):
+                fn.body[i] = tx.visit(st)
+
 class emit:
     def __init__(self):
         self.lines = []
@@ -5052,6 +5171,7 @@ class translator(ast.NodeVisitor):
         self.synthetic_slices = dict(translator.global_synthetic_slices)
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
         self.promoted_colvec_results = set()
+        self.uses_sys_argv = False
         self.var_type_first_seen = {}
         self.var_type_initial_spec = {}
         self.type_rebind_events = {}
@@ -5920,6 +6040,8 @@ class translator(ast.NodeVisitor):
                 return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in {"pi", "nan", "inf", "NINF"}:
                 return "real"
+            if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
+                return "char"
             return None
         if isinstance(node, ast.UnaryOp):
             return self._expr_kind(node.operand)
@@ -6190,7 +6312,7 @@ class translator(ast.NodeVisitor):
                     return "complex"
                 if node.func.id in {"int", "isqrt", "size", "len"}:
                     return "int"
-                if node.func.id in {"str"}:
+                if node.func.id in {"str", "repr"}:
                     return "char"
                 if node.func.id == "set":
                     if len(node.args) == 0:
@@ -7294,6 +7416,13 @@ class translator(ast.NodeVisitor):
             return self._rank_expr(node.operand)
         if isinstance(node, ast.Attribute) and node.attr in {"T", "real", "imag"}:
             return self._rank_expr(node.value)
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+            and node.attr == "argv"
+        ):
+            return 1
         if isinstance(node, ast.Call):
             if (
                 isinstance(node.func, ast.Attribute)
@@ -8198,6 +8327,10 @@ class translator(ast.NodeVisitor):
                 rr = self._rank_expr(node.right)
                 if lk == "char" and rk == "char" and lr == 0 and rr == 0:
                     return f"({a0} // {b0})"
+                if lr == 0 and rr == 0 and (lk == "char" or rk == "char"):
+                    la = a0 if lk == "char" else f"py_str({a0})"
+                    rb = b0 if rk == "char" else f"py_str({b0})"
+                    return f"({la} // {rb})"
             # Python list repetition semantics: n * list or list * n.
             if op is ast.Mult:
                 left_list = self._is_python_list_expr(node.left)
@@ -9215,7 +9348,18 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "float" and len(node.args) == 1:
                 if is_const_str(node.args[0]) and str(node.args[0].value).lower() == "nan":
                     return "ieee_value(0.0_dp, ieee_quiet_nan)"
-                return f"real({self.expr(node.args[0])}, kind=dp)"
+                a0 = node.args[0]
+                if (
+                    isinstance(a0, ast.Subscript)
+                    and isinstance(a0.value, ast.Attribute)
+                    and isinstance(a0.value.value, ast.Name)
+                    and a0.value.value.id == "sys"
+                    and a0.value.attr == "argv"
+                ):
+                    return f"py_float({self.expr(a0)})"
+                if self._expr_kind(a0) == "char":
+                    return f"py_float({self.expr(a0)})"
+                return f"real({self.expr(a0)}, kind=dp)"
             if isinstance(node.func, ast.Name) and node.func.id == "complex":
                 if len(node.args) == 2:
                     return f"cmplx(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp), kind=dp)"
@@ -9223,6 +9367,8 @@ class translator(ast.NodeVisitor):
                     return f"cmplx(real({self.expr(node.args[0])}, kind=dp), 0.0_dp, kind=dp)"
                 raise NotImplementedError("complex() expects one or two arguments")
             if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
+                return f"py_str({self.expr(node.args[0])})"
+            if isinstance(node.func, ast.Name) and node.func.id == "repr" and len(node.args) == 1:
                 return f"py_str({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id == "bool" and len(node.args) == 1:
                 a0 = node.args[0]
@@ -11666,6 +11812,10 @@ class translator(ast.NodeVisitor):
                 return "huge(1.0_dp)"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "NINF":
                 return "(-huge(1.0_dp))"
+            if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
+                self.uses_sys_argv = True
+                self._mark_alloc_char("sys_argv", rank=1)
+                return "sys_argv"
             if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.dict_typed_vars
@@ -11686,6 +11836,15 @@ class translator(ast.NodeVisitor):
             return None
 
         for node in nodes:
+            for _a in ast.walk(node):
+                if (
+                    isinstance(_a, ast.Attribute)
+                    and isinstance(_a.value, ast.Name)
+                    and _a.value.id == "sys"
+                    and _a.attr == "argv"
+                ):
+                    self.uses_sys_argv = True
+                    self._mark_alloc_char("sys_argv", rank=1)
             # Propagate known local function dict-typed dummy arguments to
             # call-site variables (e.g., foo(a) where foo expects foo_dict_t).
             for c in ast.walk(node):
@@ -13547,6 +13706,23 @@ class translator(ast.NodeVisitor):
             return
         fake = ast.Assign(targets=[node.target], value=node.value)
         self.visit_Assign(fake)
+
+    def visit_Delete(self, node):
+        self._emit_comments_for(node)
+        for t in node.targets:
+            if (
+                isinstance(t, ast.Subscript)
+                and isinstance(t.value, ast.Attribute)
+                and isinstance(t.value.value, ast.Name)
+                and t.value.value.id == "sys"
+                and t.value.attr == "argv"
+            ):
+                self.uses_sys_argv = True
+                self._mark_alloc_char("sys_argv", rank=1)
+                idx0 = self.expr(t.slice)
+                self.o.w(f"call sys_argv_delete(sys_argv, int({idx0}) + 1)")
+                continue
+            raise NotImplementedError("unsupported delete target")
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
@@ -16679,6 +16855,21 @@ class translator(ast.NodeVisitor):
                     expr_txt = self.expr(node.value)
             else:
                 expr_txt = self.expr(node.value)
+            # When a branch returns a higher-rank array but the function result
+            # is rank-1, flatten conservatively to keep generated Fortran valid.
+            if isinstance(node.value, ast.Name):
+                res_nm = self.function_result_name
+                res_rank = max(
+                    int(self.alloc_real_rank.get(res_nm, 0)),
+                    int(self.alloc_int_rank.get(res_nm, 0)),
+                    int(self.alloc_log_rank.get(res_nm, 0)),
+                    int(self.alloc_complex_rank.get(res_nm, 0)),
+                    int(self.alloc_char_rank.get(res_nm, 0)),
+                )
+                rhs_rank = self._rank_expr(node.value)
+                if res_rank == 1 and rhs_rank > 1:
+                    rhs_txt = self.expr(node.value)
+                    expr_txt = f"reshape({rhs_txt}, [size({rhs_txt})])"
             if expr_txt.strip().lower() != self.function_result_name.lower():
                 self.o.w(f"{self.function_result_name} = {expr_txt}")
         self.o.w("return")
@@ -18351,6 +18542,56 @@ def _emit_local_function(
                 tr._mark_char(a.arg)
 
     tr.prescan(fn.body)
+    # Lift local variable ranks from call-site requirements of known local
+    # procedures, e.g. `y = f(x)` then `g(y)` where `g` expects rank-1.
+    if local_func_arg_ranks is not None and local_func_arg_names is not None:
+        def _promote_name_rank(_nm, _rr):
+            _rr = int(_rr)
+            if _rr <= 0:
+                return
+            if _nm in tr.alloc_ints or _nm in tr.ints:
+                tr._mark_alloc_int(_nm, rank=_rr)
+                return
+            if _nm in tr.alloc_logs or _nm in tr.logs:
+                tr._mark_alloc_log(_nm, rank=_rr)
+                return
+            if _nm in tr.alloc_complexes or _nm in tr.complexes:
+                tr._mark_alloc_complex(_nm, rank=_rr)
+                return
+            if _nm in tr.alloc_chars or _nm in tr.chars:
+                tr._mark_alloc_char(_nm, rank=_rr)
+                return
+            # Default numeric promotion for unknown/mixed numeric locals.
+            tr._mark_alloc_real(_nm, rank=_rr)
+
+        for _n in ast.walk(fn):
+            if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)):
+                continue
+            _callee = _n.func.id
+            if _callee not in local_func_arg_ranks:
+                continue
+            _ranks = local_func_arg_ranks.get(_callee, [])
+            _argn = local_func_arg_names.get(_callee, [])
+            _name_to_idx = {nm: i for i, nm in enumerate(_argn)}
+            for _j, _a in enumerate(_n.args):
+                if _j >= len(_ranks):
+                    break
+                _want = int(_ranks[_j])
+                if _want <= 0 or (not isinstance(_a, ast.Name)):
+                    continue
+                _nm = tr._aliased_name(tr._resolve_list_alias(_a.id))
+                _promote_name_rank(_nm, _want)
+            for _kw in getattr(_n, "keywords", []):
+                if _kw.arg is None or _kw.arg not in _name_to_idx:
+                    continue
+                _j = _name_to_idx[_kw.arg]
+                if _j >= len(_ranks):
+                    continue
+                _want = int(_ranks[_j])
+                if _want <= 0 or (not isinstance(_kw.value, ast.Name)):
+                    continue
+                _nm = tr._aliased_name(tr._resolve_list_alias(_kw.value.id))
+                _promote_name_rank(_nm, _want)
     tr.validate_unsafe_if_type_merges(fn.body)
     tr.apply_type_rebind_declaration_pruning()
 
@@ -19562,6 +19803,11 @@ def _emit_local_function(
         rr = max(1, tr.alloc_char_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"character(len=:), allocatable :: {nm}({dims})")
+    if tr.uses_sys_argv:
+        if needed_helpers is not None:
+            needed_helpers.add("sys_argv_init")
+            needed_helpers.add("sys_argv_delete")
+        o.w("sys_argv = sys_argv_init()")
     for arg, alias, dflt_expr, arr_rank in optional_default_inits:
         if int(arr_rank) == 0:
             if needed_helpers is not None:
@@ -20255,7 +20501,11 @@ def generate_flat(
             tuple_return_out_ranks=_prov_tuple_out_ranks,
             local_return_specs=_prov_scalar_specs,
         )
-        tr_seed.prescan(tree.body)
+        _scan_nodes = list(tree.body) + list(local_funcs or [])
+        tr_seed.prescan(_scan_nodes)
+        for _fn_scan in (local_funcs or []):
+            if isinstance(_fn_scan, ast.FunctionDef):
+                tr_seed.prescan(_fn_scan.body)
         def _promote_kind_hint(cur, newk):
             if newk is None:
                 return cur
@@ -20281,7 +20531,7 @@ def generate_flat(
                     if _en == _nm and _ek is not None:
                         specs.add((_ek, max(0, int(_er))))
             return specs
-        for st in tree.body:
+        for st in _scan_nodes:
             for n in ast.walk(st):
                 if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
                     continue
@@ -20393,6 +20643,92 @@ def generate_flat(
             else:
                 merged_kinds.append(bk)
         local_func_arg_kinds[fn.name] = merged_kinds
+    # Propagate callback-parameter signatures from callees to passed-in local
+    # function actuals. Example:
+    #   def arclength_x(..., dydx, ...): fx = dydx(t)   ! t rank-1
+    #   arclength_x(..., dydx1, ...)
+    # => infer dydx1 takes rank-1 and returns rank-1.
+    if local_funcs:
+        fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
+        cb_sig = {}  # (callee_name, cb_param_name) -> (in_rank, ret_rank)
+        for _callee in local_funcs:
+            if not isinstance(_callee, ast.FunctionDef):
+                continue
+            _cb_params = set(local_func_callback_params.get(_callee.name, set()))
+            if not _cb_params:
+                continue
+            for _cbp in _cb_params:
+                _inr = 0
+                _outr = 0
+                for _n in ast.walk(_callee):
+                    if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == _cbp):
+                        continue
+                    if _n.args:
+                        _a0 = _n.args[0]
+                        try:
+                            _inr = max(_inr, int(tr_seed._rank_expr(_a0)))
+                        except Exception:
+                            pass
+                        if isinstance(_a0, ast.Name):
+                            _inr = max(_inr, int(_infer_arg_rank_in_fn(_callee, _a0.id)))
+                for _st in _callee.body:
+                    if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name)):
+                        continue
+                    _has_cb = False
+                    for _vn in ast.walk(_st.value):
+                        if isinstance(_vn, ast.Call) and isinstance(_vn.func, ast.Name) and _vn.func.id == _cbp:
+                            _has_cb = True
+                            break
+                    if not _has_cb:
+                        continue
+                    _tn = _st.targets[0].id
+                    _outr = max(_outr, int(_infer_arg_rank_in_fn(_callee, _tn)))
+                    try:
+                        _outr = max(_outr, int(tr_seed._rank_expr(_st.targets[0])))
+                    except Exception:
+                        pass
+                cb_sig[(_callee.name, _cbp)] = (_inr, _outr)
+        for _caller in local_funcs:
+            if not isinstance(_caller, ast.FunctionDef):
+                continue
+            for _n in ast.walk(_caller):
+                if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)):
+                    continue
+                _callee_name = _n.func.id
+                if _callee_name not in local_func_arg_names:
+                    continue
+                _arg_names = local_func_arg_names.get(_callee_name, [])
+                _name_to_idx = {nm: i for i, nm in enumerate(_arg_names)}
+                # Positional actuals
+                for _j, _a in enumerate(_n.args):
+                    if _j >= len(_arg_names):
+                        break
+                    if not (isinstance(_a, ast.Name) and _a.id in local_func_arg_ranks):
+                        continue
+                    _cbp = _arg_names[_j]
+                    _sig = cb_sig.get((_callee_name, _cbp), None)
+                    if _sig is None:
+                        continue
+                    _inr, _outr = _sig
+                    if local_func_arg_ranks[_a.id]:
+                        local_func_arg_ranks[_a.id][0] = max(int(local_func_arg_ranks[_a.id][0]), int(_inr))
+                    if _a.id in local_return_ranks:
+                        local_return_ranks[_a.id] = max(int(local_return_ranks[_a.id]), int(_outr))
+                # Keyword actuals
+                for _kw in getattr(_n, "keywords", []):
+                    if _kw.arg is None or _kw.arg not in _name_to_idx:
+                        continue
+                    if not (isinstance(_kw.value, ast.Name) and _kw.value.id in local_func_arg_ranks):
+                        continue
+                    _cbp = _kw.arg
+                    _sig = cb_sig.get((_callee_name, _cbp), None)
+                    if _sig is None:
+                        continue
+                    _inr, _outr = _sig
+                    if local_func_arg_ranks[_kw.value.id]:
+                        local_func_arg_ranks[_kw.value.id][0] = max(int(local_func_arg_ranks[_kw.value.id][0]), int(_inr))
+                    if _kw.value.id in local_return_ranks:
+                        local_return_ranks[_kw.value.id] = max(int(local_return_ranks[_kw.value.id]), int(_outr))
     # Propagate argument-rank requirements across local wrapper calls, e.g.:
     #   def outer(x): return inner(x, ...)
     # so inner's dummy rank can be learned from outer's call-site rank.
@@ -20804,6 +21140,24 @@ def generate_flat(
     pure_local_calls = set(known_pure_calls or set()) | set((user_class_types or {}).keys())
 
     elemental_targets = set(translator.global_vectorize_aliases.values())
+    # A non-intrinsic ELEMENTAL procedure cannot be passed as an actual
+    # procedure argument in standard Fortran. Keep such local callbacks
+    # non-elemental to preserve compilability.
+    passed_as_actual = set()
+    local_fn_names = {f.name for f in (local_funcs or []) if isinstance(f, ast.FunctionDef)}
+    _scan_for_actuals = list(tree.body) + list(local_funcs or [])
+    for _st in _scan_for_actuals:
+        for _n in ast.walk(_st):
+            if not isinstance(_n, ast.Call):
+                continue
+            for _a in getattr(_n, "args", []):
+                if isinstance(_a, ast.Name) and _a.id in local_fn_names:
+                    passed_as_actual.add(_a.id)
+            for _kw in getattr(_n, "keywords", []):
+                if _kw.arg is None:
+                    continue
+                if isinstance(_kw.value, ast.Name) and _kw.value.id in local_fn_names:
+                    passed_as_actual.add(_kw.value.id)
     for fn in (local_funcs or []):
         if fn.name in tuple_return_funcs:
             continue
@@ -20844,6 +21198,8 @@ def generate_flat(
                 break
         if assigns_dummy:
             continue
+        if fn.name in passed_as_actual:
+            continue
         elemental_targets.add(fn.name)
     for gname in local_generic_overloads:
         elemental_targets.discard(gname)
@@ -20852,6 +21208,16 @@ def generate_flat(
     proc_mod_name = f"{stem}_proc_mod"
     proc_public_syms = []
     helper_uses_proc = {}
+    def _tree_uses_sys_argv(_tree):
+        for _n in ast.walk(_tree):
+            if (
+                isinstance(_n, ast.Attribute)
+                and isinstance(_n.value, ast.Name)
+                and _n.value.id == "sys"
+                and _n.attr == "argv"
+            ):
+                return True
+        return False
     if use_proc_module:
         proc_tree = ast.Module(body=list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
@@ -20859,6 +21225,11 @@ def generate_flat(
             keep = sorted([s for s in syms if s in proc_needed])
             if keep:
                 helper_uses_proc[mod] = keep
+        if _tree_uses_sys_argv(proc_tree):
+            helper_uses_proc.setdefault("python_mod", [])
+            for _sym in ("sys_argv_init", "sys_argv_delete"):
+                if _sym not in helper_uses_proc["python_mod"]:
+                    helper_uses_proc["python_mod"].append(_sym)
 
     def _emit_type_defs(target_o):
         emitted = set()
@@ -21188,6 +21559,11 @@ def generate_flat(
         rr = max(1, tr.alloc_char_rank.get(name, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"character(len=:), allocatable :: {name}({dims})")
+    if tr.uses_sys_argv:
+        if needed_helpers is not None:
+            needed_helpers.add("sys_argv_init")
+            needed_helpers.add("sys_argv_delete")
+        o.w("sys_argv = sys_argv_init()")
 
     o.w("")
     for stmt in tree.body:
@@ -21717,9 +22093,17 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     rewrite_print_after_mixed_if_merges(effective_tree.body, env={})
     for _fn in local_funcs:
         rewrite_print_after_mixed_if_merges(_fn.body, env={})
+    lower_vararg_functions(effective_tree.body, local_funcs)
+    normalize_if_scalar_array_merges(effective_tree.body)
+    for _fn in local_funcs:
+        if isinstance(_fn, ast.FunctionDef):
+            normalize_if_scalar_array_merges(_fn.body)
     # Lower simple lambda-as-callable argument patterns by specializing local
     # procedures and inlining lambda bodies where safe.
     specialize_lambda_function_args(effective_tree.body, local_funcs)
+    for _fn in local_funcs:
+        if isinstance(_fn, ast.FunctionDef):
+            specialize_lambda_function_args(_fn.body, local_funcs)
 
     params = find_parameters(effective_tree)
     translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
@@ -21736,6 +22120,21 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     if list_counts:
         needed.add("print_int_list")
     helper_uses, missing_helpers, pure_helpers = resolve_helper_uses(helper_paths, needed)
+    def _tree_uses_sys_argv(_tree):
+        for _n in ast.walk(_tree):
+            if (
+                isinstance(_n, ast.Attribute)
+                and isinstance(_n.value, ast.Name)
+                and _n.value.id == "sys"
+                and _n.attr == "argv"
+            ):
+                return True
+        return False
+    if _tree_uses_sys_argv(helper_scan_tree):
+        helper_uses.setdefault("python_mod", [])
+        for _sym in ("sys_argv_init", "sys_argv_delete"):
+            if _sym not in helper_uses["python_mod"]:
+                helper_uses["python_mod"].append(_sym)
     if missing_helpers:
         print("warning: missing helper symbols:", ", ".join(sorted(missing_helpers)))
 
@@ -21760,13 +22159,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
         used_flat_fallback = False
     else:
         used_flat_fallback = False
-        try:
-            f90 = generate_structured(
-                effective_tree, stem, helper_uses, params, needed, list_counts, no_comment=no_comment, comment_map=comment_map
-            )
-        except NotImplementedError:
-            # Structured mode currently targets a specific top-level pattern.
-            # Fallback to flat translation for general inputs.
+        if _tree_uses_sys_argv(helper_scan_tree):
             f90 = generate_flat(
                 effective_tree,
                 stem,
@@ -21784,6 +22177,31 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
                 user_class_types=user_class_types,
             )
             used_flat_fallback = True
+        else:
+            try:
+                f90 = generate_structured(
+                    effective_tree, stem, helper_uses, params, needed, list_counts, no_comment=no_comment, comment_map=comment_map
+                )
+            except NotImplementedError:
+                # Structured mode currently targets a specific top-level pattern.
+                # Fallback to flat translation for general inputs.
+                f90 = generate_flat(
+                    effective_tree,
+                    stem,
+                    helper_uses,
+                    params,
+                    needed,
+                    list_counts,
+                    local_funcs=local_funcs,
+                    no_comment=no_comment,
+                    known_pure_calls=pure_helpers,
+                    comment_map=comment_map,
+                    structured_type_components=structured_type_components,
+                    structured_array_types=structured_array_types,
+                    structured_dtype_strings=structured_dtype_strings,
+                    user_class_types=user_class_types,
+                )
+                used_flat_fallback = True
 
     f90 = remove_redundant_tail_returns(f90)
     f90 = simplify_size_dim_for_rank1_arrays(f90)
