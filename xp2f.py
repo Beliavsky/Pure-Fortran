@@ -1124,6 +1124,8 @@ def rename_conflicting_identifiers(src_text):
         "tiny", "transpose", "trim", "ubound", "lbound",
         # RNG names
         "random_number", "random_seed",
+        # helper procedures from python_mod
+        "eye",
     }
     callable_forbidden = {
         # intrinsic/procedure names that can validly appear as calls
@@ -1132,16 +1134,52 @@ def rename_conflicting_identifiers(src_text):
         "mean", "merge", "min", "minval", "mod", "modulo", "nint", "pack", "present",
         "product", "real", "reshape", "sign", "sin", "size", "spread", "sqrt", "sum",
         "tiny", "transpose", "trim", "ubound", "lbound", "random_number", "random_seed",
+        # helper procedures from python_mod commonly imported with ONLY
+        "eye",
     }
 
     decl_re = re.compile(
         r"^\s*(?:integer|real|logical|complex|character|type\s*\([^)]+\))\b[^!]*::\s*([^!]*)(.*)$",
         flags=re.IGNORECASE,
     )
+    use_only_re = re.compile(
+        r"^\s*use\b[^!]*\bonly\s*:\s*([^!]+)$",
+        flags=re.IGNORECASE,
+    )
     name_tok_re = re.compile(r"\b([A-Za-z_]\w*)\b")
     rename_map = {}
     lines = src_text.splitlines()
     declared = set()
+    unit_start_re = re.compile(
+        r"^\s*(?:pure\s+|elemental\s+|impure\s+|recursive\s+|module\s+)*"
+        r"(?:program|module|subroutine|function)\b",
+        flags=re.IGNORECASE,
+    )
+
+    def _scope_use_only_names(upto_idx):
+        start = 0
+        i = upto_idx
+        while i >= 0:
+            if unit_start_re.match(lines[i]):
+                start = i
+                break
+            i -= 1
+        out = set()
+        for j in range(start, upto_idx + 1):
+            m = use_only_re.match(lines[j])
+            if not m:
+                continue
+            rhs = m.group(1)
+            for part in rhs.split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                if "=>" in p:
+                    p = p.split("=>", 1)[0].strip()
+                mm = re.match(r"^([A-Za-z_]\w*)$", p)
+                if mm:
+                    out.add(mm.group(1).lower())
+        return out
 
     # Collect declared identifiers first.
     for ln in lines:
@@ -1185,10 +1223,12 @@ def rename_conflicting_identifiers(src_text):
         return cand
 
     # Discover declared names that must be renamed.
-    for ln in lines:
+    for idx, ln in enumerate(lines):
         m = decl_re.match(ln)
         if not m:
             continue
+        local_forbidden = {x.lower() for x in forbidden}
+        local_forbidden.update(_scope_use_only_names(idx))
         rhs = m.group(1)
         for part in rhs.split(","):
             p = part.strip()
@@ -1198,7 +1238,7 @@ def rename_conflicting_identifiers(src_text):
             if not mm:
                 continue
             nm = mm.group(1)
-            if nm.lower() in forbidden or not nm[0].isalpha():
+            if nm.lower() in local_forbidden or not nm[0].isalpha():
                 if nm not in rename_map:
                     rename_map[nm] = _fresh_name(nm)
 
@@ -1208,6 +1248,9 @@ def rename_conflicting_identifiers(src_text):
     # Rewrite all non-call identifier references; preserve intrinsic/procedure calls.
     out_lines = []
     for ln in lines:
+        if re.match(r"^\s*use\b", ln, flags=re.IGNORECASE):
+            out_lines.append(ln)
+            continue
         code, bang, comment = ln.partition("!")
 
         def _repl(m):
@@ -4752,7 +4795,7 @@ class translator(ast.NodeVisitor):
         self.type_rebind_targets = set()
         self.open_type_rebind_stack = []
         self.open_type_rebind_meta = []
-        self.reserved_names = {"dp"}
+        self.reserved_names = {"dp", "eye"}
         self.name_aliases = {}
         self.fortran_name_owner = {}
         self.synthetic_alias_names = set()
@@ -18649,8 +18692,23 @@ def generate_flat(
     call_rank_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_pairs = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_islist = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    _prov_scalar_specs, _prov_scalar_ranks, _prov_tuple_out, _prov_tuple_out_ranks = _local_return_maps(
+        local_funcs,
+        params,
+        arg_rank_hints={},
+        arg_kind_hints={},
+    )
     if local_funcs:
-        tr_seed = translator(emit(), params=params, context="flat", list_counts=list_counts)
+        tr_seed = translator(
+            emit(),
+            params=params,
+            context="flat",
+            list_counts=list_counts,
+            tuple_return_funcs=set(_prov_tuple_out.keys()),
+            tuple_return_out_kinds=_prov_tuple_out,
+            tuple_return_out_ranks=_prov_tuple_out_ranks,
+            local_return_specs=_prov_scalar_specs,
+        )
         tr_seed.prescan(tree.body)
         def _promote_kind_hint(cur, newk):
             if newk is None:
