@@ -6875,6 +6875,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "eye":
                 return 2
             if isinstance(node.func, ast.Name):
+                if node.func.id in {"float", "int", "real", "dble", "cmplx", "complex"}:
+                    return 0
                 if node.func.id in {"log_normal_pdf_1d", "normal_logpdf_1d"}:
                     return 2
                 if node.func.id in {"runif", "rnorm"}:
@@ -8021,13 +8023,26 @@ class translator(ast.NodeVisitor):
                 return f"{base}({trip})"
             if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
                 a0, a1 = node.slice.elts
+                def _idx1_expr(a, dim_size_expr):
+                    if (
+                        isinstance(a, ast.UnaryOp)
+                        and isinstance(a.op, ast.USub)
+                        and isinstance(a.operand, ast.Constant)
+                        and isinstance(a.operand.value, int)
+                        and a.operand.value >= 1
+                    ):
+                        k = a.operand.value
+                        if k == 1:
+                            return dim_size_expr
+                        return f"({dim_size_expr} - {k - 1})"
+                    return f"({self.expr(a)} + 1)"
                 # 3D ellipsis indexing, e.g. b[..., 0] or b[0, ...]
                 if isinstance(a0, ast.Constant) and a0.value is Ellipsis:
                     if self._rank_expr(node.value) == 3:
-                        return f"{base}(:,:,({self.expr(a1)} + 1))"
+                        return f"{base}(:,:,{_idx1_expr(a1, f'size({base_name},3)')})"
                 if isinstance(a1, ast.Constant) and a1.value is Ellipsis:
                     if self._rank_expr(node.value) == 3:
-                        return f"{base}(({self.expr(a0)} + 1),:,:)"
+                        return f"{base}({_idx1_expr(a0, f'size({base_name},1)')},:,:)"
                 full0 = isinstance(a0, ast.Slice) and a0.lower is None and a0.upper is None and a0.step is None
                 full1 = isinstance(a1, ast.Slice) and a1.lower is None and a1.upper is None and a1.step is None
                 none0 = is_none(a0)
@@ -8041,17 +8056,17 @@ class translator(ast.NodeVisitor):
                     return base
                 # General 2D slicing/indexing with Python 0-based to Fortran 1-based mapping.
                 if isinstance(a0, ast.Slice) or isinstance(a1, ast.Slice):
-                    d0 = self._slice_triplet(a0, f"size({base_name},1)") if isinstance(a0, ast.Slice) else f"({self.expr(a0)} + 1)"
-                    d1 = self._slice_triplet(a1, f"size({base_name},2)") if isinstance(a1, ast.Slice) else f"({self.expr(a1)} + 1)"
+                    d0 = self._slice_triplet(a0, f"size({base_name},1)") if isinstance(a0, ast.Slice) else _idx1_expr(a0, f"size({base_name},1)")
+                    d1 = self._slice_triplet(a1, f"size({base_name},2)") if isinstance(a1, ast.Slice) else _idx1_expr(a1, f"size({base_name},2)")
                     return f"{base}({d0}, {d1})"
                 # 2D indexing with explicit index/vector.
                 if full0 and (not full1) and (not none1):
-                    return f"{base}(:, ({self.expr(a1)} + 1))"
+                    return f"{base}(:, {_idx1_expr(a1, f'size({base_name},2)')})"
                 if full1 and (not full0) and (not none0):
-                    return f"{base}(({self.expr(a0)} + 1), :)"
+                    return f"{base}({_idx1_expr(a0, f'size({base_name},1)')}, :)"
                 # Scalar 2D indexing: a[i, j] -> a(i+1, j+1)
                 if (not isinstance(a0, ast.Slice)) and (not isinstance(a1, ast.Slice)) and (not none0) and (not none1):
-                    return f"{base}(({self.expr(a0)} + 1), ({self.expr(a1)} + 1))"
+                    return f"{base}({_idx1_expr(a0, f'size({base_name},1)')}, {_idx1_expr(a1, f'size({base_name},2)')})"
                 raise NotImplementedError("only [None,:] and [:,None] tuple subscripts are supported")
             if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 3:
                 a0, a1, a2 = node.slice.elts
@@ -12408,6 +12423,8 @@ class translator(ast.NodeVisitor):
             self.lambda_vars.pop(t.id, None)
         if isinstance(t, ast.Name):
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
+            if rk is not None and t.id in set(self.tuple_return_out_names or []):
+                rk = None
             if rk is not None:
                 # Prefer sequential non-nested rebinding blocks for repeated
                 # type changes of the same variable.
@@ -17040,6 +17057,11 @@ def _emit_local_function(
                         _force_scalar_real(tnm)
                         _changed = True
                     continue
+            if isinstance(v, ast.BinOp) and isinstance(v.op, ast.MatMult):
+                if tr._rank_expr(v) == 0 and _rank_now(tnm) != 0:
+                    _force_scalar_real(tnm)
+                    _changed = True
+                    continue
             if (
                 isinstance(v, ast.BinOp)
                 and isinstance(v.op, (ast.Add, ast.Sub))
@@ -19642,7 +19664,7 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
             missing_modules.append((mod, ""))
 
     # LAPACK linkage support for numpy.linalg wrappers in python_mod.
-    if re.search(r"\b(linalg_(solve|cholesky|det|inv|eig|svd)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
+    if re.search(r"\b(linalg_(solve|cholesky|det|inv|eig|eigh|svd|qr)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
         lapack_src = Path("lapack_d.f90")
         lapack_s = str(lapack_src)
         if lapack_src.exists():
