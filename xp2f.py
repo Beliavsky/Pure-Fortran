@@ -2964,6 +2964,8 @@ def detect_needed_helpers(tree):
             ):
                 if node.func.attr == "solve":
                     needed.add("linalg_solve")
+                elif node.func.attr == "lstsq":
+                    needed.add("linalg_solve")
                 elif node.func.attr == "cholesky":
                     needed.add("linalg_cholesky")
                 elif node.func.attr == "det":
@@ -10700,6 +10702,9 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(outs[1], rank=1)
                         self._mark_alloc_real(outs[2], rank=2)
                         continue
+                    if node.value.func.attr == "lstsq" and len(outs) >= 1:
+                        self._mark_alloc_real(outs[0], rank=1)
+                        continue
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
@@ -10827,6 +10832,15 @@ class translator(ast.NodeVisitor):
                     and len(v.args) >= 1
                     and isinstance(v.args[0], ast.Name)
                     and v.args[0].id == t.id
+                ):
+                    continue
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "reshape"
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id == t.id
                 ):
                     continue
                 if (
@@ -12140,6 +12154,18 @@ class translator(ast.NodeVisitor):
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "reshape"
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == t.id
+        ):
+            # Preserve rank-intent metadata from prescan, but avoid assigning back
+            # into a dummy that may be INTENT(IN); downstream expressions use the
+            # inferred rank/kind for this name.
+            return
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
             and v.func.attr in {"ravel", "flatten"}
             and isinstance(v.func.value, ast.Call)
             and isinstance(v.func.value.func, ast.Attribute)
@@ -12460,9 +12486,12 @@ class translator(ast.NodeVisitor):
         ):
             outs = []
             for e in t.elts:
-                if not isinstance(e, ast.Name):
-                    raise NotImplementedError("tuple assignment targets must be names")
-                outs.append(e.id)
+                if isinstance(e, ast.Name):
+                    outs.append(e.id)
+                elif isinstance(e, ast.Starred):
+                    outs.append("_")
+                else:
+                    raise NotImplementedError("tuple assignment targets must be names or starred ignores")
             args = [self.expr(a) for a in list(v.args)]
             saw_named = False
             for kw in getattr(v, "keywords", []):
@@ -12549,9 +12578,12 @@ class translator(ast.NodeVisitor):
         ):
             outs = []
             for e in t.elts:
-                if not isinstance(e, ast.Name):
-                    raise NotImplementedError("tuple assignment targets must be names")
-                outs.append(e.id)
+                if isinstance(e, ast.Name):
+                    outs.append(e.id)
+                elif isinstance(e, ast.Starred):
+                    outs.append("_")
+                else:
+                    raise NotImplementedError("tuple assignment targets must be names or starred ignores")
             if v.func.attr == "eig" and len(v.args) >= 1 and len(outs) >= 2:
                 self.o.w(f"call linalg_eig({self.expr(v.args[0])}, {outs[0]}, {outs[1]})")
                 return
@@ -12584,6 +12616,32 @@ class translator(ast.NodeVisitor):
                 return
             if v.func.attr == "svd" and len(v.args) >= 1 and len(outs) >= 3:
                 self.o.w(f"call linalg_svd({self.expr(v.args[0])}, {outs[0]}, {outs[1]}, {outs[2]})")
+                return
+            if v.func.attr == "lstsq" and len(v.args) >= 2 and len(t.elts) >= 1:
+                first_t = t.elts[0]
+                if not isinstance(first_t, ast.Name):
+                    raise NotImplementedError("np.linalg.lstsq first tuple target must be a name")
+                a0 = self.expr(v.args[0])
+                b0 = self.expr(v.args[1])
+                # NumPy lstsq returns (x, residuals, rank, s); lower x for this subset
+                # via normal equations and ignore remaining tuple items.
+                self.o.w(
+                    f"{first_t.id} = linalg_solve(matmul(transpose({a0}), {a0}), "
+                    f"matmul(transpose({a0}), {b0}))"
+                )
+                return
+            if v.func.attr == "lstsq" and len(v.args) >= 2 and len(t.elts) >= 1:
+                first_t = t.elts[0]
+                if not isinstance(first_t, ast.Name):
+                    raise NotImplementedError("np.linalg.lstsq first tuple target must be a name")
+                a0 = self.expr(v.args[0])
+                b0 = self.expr(v.args[1])
+                # NumPy lstsq returns (x, residuals, rank, s); for current subset
+                # lower x via normal equations and ignore the remaining tuple items.
+                self.o.w(
+                    f"{first_t.id} = linalg_solve(matmul(transpose({a0}), {a0}), "
+                    f"matmul(transpose({a0}), {b0}))"
+                )
                 return
         # tuple unpacking from np.meshgrid(x, y, indexing='xy'/'ij')
         if (
