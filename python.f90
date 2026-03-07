@@ -172,6 +172,7 @@ public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:
 public :: linalg_cholesky !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="lower-triangular Cholesky factor using LAPACK DPOTRF"
 public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="determinant of square matrix using LAPACK DGETRF"
 public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="matrix inverse using LAPACK DGETRF/DGETRI"
+public :: linalg_cond !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="2-norm condition number using SVD singular values"
 public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="right eigenpairs of real square matrix using LAPACK DGEEV (real-spectrum only)"
 public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
 public :: linalg_qr_reduced !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),q:real(dp)(:,:):intent(out),r:real(dp)(:,:):intent(out) desc="reduced QR factorization using LAPACK DGEQRF/DORGQR"
@@ -218,6 +219,7 @@ public :: nanargmin !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(
 public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmax ignoring NaN values; -1 when all NaN"
 public :: optval !@pyapi kind=function ret=scalar args=x:scalar:intent(in):optional,default:scalar:intent(in) desc="return x when present, otherwise default"
 public :: py_time !@pyapi kind=function ret=real args= desc="wall-clock seconds from system_clock (Python time.time approximation)"
+public :: py_ctime !@pyapi kind=function ret=character args=t:real(dp):intent(in):optional desc="string timestamp approximation for Python time.ctime"
 public :: cumsum
 public :: cumprod
 public :: eye
@@ -516,6 +518,22 @@ contains
             t = 0.0_dp
          end if
       end function py_time
+
+      function py_ctime(t) result(s)
+         real(kind=dp), intent(in), optional :: t
+         character(len=:), allocatable :: s
+         integer :: vals(8)
+         character(len=32) :: buf
+         call date_and_time(values=vals)
+         if (present(t)) then
+            write(buf, '(a,i0,a,i4.4,a,i2.2,a,i2.2,a,i2.2,a,i2.2,a,i2.2,a)') &
+               't=', int(t), ' [', vals(1), '-', vals(2), '-', vals(3), ' ', vals(5), ':', vals(6), ':', vals(7), ']'
+         else
+            write(buf, '(i4.4,a,i2.2,a,i2.2,a,i2.2,a,i2.2,a,i2.2)') &
+               vals(1), '-', vals(2), '-', vals(3), ' ', vals(5), ':', vals(6), ':', vals(7)
+         end if
+         s = trim(buf)
+      end function py_ctime
 
       function loadtxt_real_2d(path, skiprows) result(x)
          character(len=*), intent(in) :: path
@@ -3448,6 +3466,26 @@ contains
          allocate(ai(1:n,1:n))
          ai = ac
       end function linalg_inv
+
+      function linalg_cond(a) result(cnd)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp) :: cnd
+         real(kind=dp), allocatable :: u(:,:), s(:), vt(:,:)
+         real(kind=dp) :: smax, smin
+
+         call linalg_svd(a, u, s, vt)
+         if (size(s) <= 0) then
+            cnd = huge(1.0_dp)
+            return
+         end if
+         smax = maxval(abs(s))
+         smin = minval(abs(s))
+         if (smin <= tiny(1.0_dp)) then
+            cnd = huge(1.0_dp)
+         else
+            cnd = smax / smin
+         end if
+      end function linalg_cond
 
       subroutine linalg_eig(a, w, v)
          real(kind=dp), intent(in) :: a(:,:)

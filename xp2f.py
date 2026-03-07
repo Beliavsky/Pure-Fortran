@@ -2867,6 +2867,10 @@ def is_main_guard_if(node):
     return False
 
 
+def is_numpy_name_node(node):
+    return isinstance(node, ast.Name) and node.id in {"np", "numpy"}
+
+
 def detect_needed_helpers(tree):
     needed = set()
     np_helper_map = {
@@ -3277,8 +3281,7 @@ def detect_needed_helpers(tree):
                 needed.add("argsort")
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr in np_helper_map
             ):
                 needed.update(np_helper_map[node.func.attr])
@@ -3325,8 +3328,7 @@ def detect_needed_helpers(tree):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
+                and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
             ):
                 if node.func.attr == "solve":
@@ -3339,6 +3341,8 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_det")
                 elif node.func.attr == "inv":
                     needed.add("linalg_inv")
+                elif node.func.attr == "cond":
+                    needed.add("linalg_cond")
                 elif node.func.attr == "eig":
                     needed.add("linalg_eig")
                 elif node.func.attr == "svd":
@@ -5488,8 +5492,7 @@ class translator(ast.NodeVisitor):
                 return "real64"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
             ):
                 if node.func.attr in {"array", "asarray", "zeros", "ones", "full", "empty"}:
                     dtype_txt = self._np_dtype_text(node)
@@ -6032,6 +6035,42 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             if (
                 isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"tanh", "arcsinh", "arccosh"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"copy", "empty_like", "flipud"}
+                and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and is_numpy_name_node(node.func.value.value)
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "cond"
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and (
+                    (
+                        isinstance(node.func.value, ast.Attribute)
+                        and is_numpy_name_node(node.func.value.value)
+                        and node.func.value.attr == "random"
+                        and node.func.attr == "randint"
+                    )
+                    or node.func.attr in {"randint", "integers"}
+                )
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "platform"
                 and node.func.attr == "python_version"
@@ -6193,8 +6232,7 @@ class translator(ast.NodeVisitor):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "append"
                 and len(node.args) >= 2
             ):
@@ -6211,16 +6249,14 @@ class translator(ast.NodeVisitor):
                 return "int"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"loadtxt", "genfromtxt"}
                 and len(node.args) >= 1
             ):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "where"
             ):
                 if len(node.args) == 1:
@@ -7249,6 +7285,29 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Attribute) and node.attr in {"T", "real", "imag"}:
             return self._rank_expr(node.value)
         if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"copy", "empty_like", "flipud"}
+                and len(node.args) >= 1
+            ):
+                return self._rank_expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"tanh", "arcsinh", "arccosh"}
+                and len(node.args) >= 1
+            ):
+                return self._rank_expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and is_numpy_name_node(node.func.value.value)
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "cond"
+                and len(node.args) >= 1
+            ):
+                return 0
             if isinstance(node.func, ast.Name) and node.func.id in self.lambda_vars:
                 repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
                 if repl is not None:
@@ -7268,12 +7327,15 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and _is_rng_rank_source(node.func.value)
-                and node.func.attr in {"random", "normal", "standard_normal"}
+                and node.func.attr in {"random", "normal", "standard_normal", "randint", "integers"}
             ):
                 size_node = None
                 if node.func.attr in {"random", "standard_normal"}:
                     if len(node.args) >= 1:
                         size_node = node.args[0]
+                elif node.func.attr in {"randint", "integers"}:
+                    if len(node.args) >= 3:
+                        size_node = node.args[2]
                 else:
                     if len(node.args) >= 3:
                         size_node = node.args[2]
@@ -7367,7 +7429,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
             ):
-                if node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "array"} and len(node.args) >= 1:
+                if node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "array", "tanh", "arcsinh", "arccosh"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "polyval" and len(node.args) >= 2:
                     return self._rank_expr(node.args[1])
@@ -7407,7 +7469,7 @@ class translator(ast.NodeVisitor):
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"log1p", "nan_to_num"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr in {"pad", "roll", "flip"} and len(node.args) >= 1:
+                if node.func.attr in {"pad", "roll", "flip", "flipud", "copy", "empty_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "take" and len(node.args) >= 2:
                     return self._rank_expr(node.args[1])
@@ -7642,8 +7704,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
+                and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
             ):
                 if node.func.attr == "solve" and len(node.args) >= 2:
@@ -7654,6 +7715,8 @@ class translator(ast.NodeVisitor):
                     return 0
                 if node.func.attr == "inv" and len(node.args) >= 1:
                     return 2
+                if node.func.attr == "cond" and len(node.args) >= 1:
+                    return 0
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -9545,24 +9608,21 @@ class translator(ast.NodeVisitor):
                 return f"polyder(real({self.expr(node.args[0])}, kind=dp))"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "maximum"
                 and len(node.args) == 2
             ):
                 return f"max({self.expr(node.args[0])}, {self.expr(node.args[1])})"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "minimum"
                 and len(node.args) == 2
             ):
                 return f"min({self.expr(node.args[0])}, {self.expr(node.args[1])})"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "reshape"
                 and len(node.args) >= 2
             ):
@@ -9577,8 +9637,7 @@ class translator(ast.NodeVisitor):
                 return f"reshape({a0}, [{dims}])"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"zeros", "ones"}
                 and len(node.args) >= 1
             ):
@@ -9593,8 +9652,7 @@ class translator(ast.NodeVisitor):
                 return f"{fn}(int({n_expr}))"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"zeros_like", "ones_like"}
                 and len(node.args) >= 1
             ):
@@ -9784,8 +9842,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
+                and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
                 and node.func.attr == "solve"
                 and len(node.args) >= 2
@@ -9794,8 +9851,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
+                and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
                 and node.func.attr == "cholesky"
                 and len(node.args) >= 1
@@ -9804,8 +9860,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
+                and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
                 and node.func.attr == "det"
                 and len(node.args) >= 1
@@ -9814,8 +9869,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
+                and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
                 and node.func.attr == "inv"
                 and len(node.args) >= 1
@@ -9824,8 +9878,16 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
+                and is_numpy_name_node(node.func.value.value)
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "cond"
+                and len(node.args) >= 1
+            ):
+                return f"linalg_cond({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
                 and node.func.attr == "norm"
                 and len(node.args) >= 1
@@ -10879,13 +10941,38 @@ class translator(ast.NodeVisitor):
                 return f"cshift({a0}, int({sh}))"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "copy"
+                and len(node.args) >= 1
+            ):
+                return self.expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "empty_like"
+                and len(node.args) >= 1
+            ):
+                # Shape-preserving placeholder; assignment lowering handles proper allocation.
+                return self.expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "flip"
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
                 return f"{a0}(size({a0}):1:-1)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "flipud"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                r0 = self._rank_expr(node.args[0])
+                if r0 <= 1:
+                    return f"{a0}(size({a0}):1:-1)"
+                return f"{a0}(size({a0},1):1:-1, :)"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -11067,16 +11154,14 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("np.where supports one-arg or three-arg forms")
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "ndim"
                 and len(node.args) >= 1
             ):
                 return str(max(0, int(self._rank_expr(node.args[0]))))
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "size"
                 and len(node.args) >= 1
             ):
@@ -11247,8 +11332,50 @@ class translator(ast.NodeVisitor):
                 return f"runif(int({n1}))"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and (
+                    (
+                        isinstance(node.func.value, ast.Attribute)
+                        and is_numpy_name_node(node.func.value.value)
+                        and node.func.value.attr == "random"
+                        and node.func.attr == "randint"
+                    )
+                    or node.func.attr in {"randint", "integers"}
+                )
+            ):
+                low_node = None
+                high_node = None
+                size_node = None
+                if len(node.args) >= 1:
+                    low_node = node.args[0]
+                if len(node.args) >= 2:
+                    high_node = node.args[1]
+                if len(node.args) >= 3:
+                    size_node = node.args[2]
+                for kw in node.keywords:
+                    if kw.arg == "low":
+                        low_node = kw.value
+                    elif kw.arg == "high":
+                        high_node = kw.value
+                    elif kw.arg == "size":
+                        size_node = kw.value
+                # NumPy randint(low, high=None) => [0, low)
+                if node.func.attr == "randint" and high_node is None:
+                    high_node = low_node
+                    low_node = ast.Constant(value=0)
+                if low_node is None:
+                    low_node = ast.Constant(value=0)
+                if high_node is None:
+                    raise NotImplementedError("randint/integers requires 'high' in expression context")
+                if size_node is not None:
+                    raise NotImplementedError("randint/integers expression form currently supports only scalar output")
+                low_expr = self.expr(low_node)
+                high_expr = self.expr(high_node)
+                return (
+                    f"(int({low_expr}) + int(runif() * real(max(1, int({high_expr}) - int({low_expr})), kind=dp)))"
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "sqrt"
                 and len(node.args) == 1
             ):
@@ -11259,8 +11386,7 @@ class translator(ast.NodeVisitor):
                 return f"sqrt({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos"}
                 and len(node.args) == 1
             ):
@@ -11269,6 +11395,18 @@ class translator(ast.NodeVisitor):
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 fmap = {"sin": "sin", "cos": "cos", "tan": "tan", "arctan": "atan", "arcsin": "asin", "arccos": "acos"}
+                return f"{fmap[node.func.attr]}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"tanh", "arcsinh", "arccosh"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                fmap = {"tanh": "tanh", "arcsinh": "asinh", "arccosh": "acosh"}
                 return f"{fmap[node.func.attr]}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -12392,8 +12530,7 @@ class translator(ast.NodeVisitor):
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
                     and isinstance(v.func, ast.Attribute)
-                    and isinstance(v.func.value, ast.Name)
-                    and v.func.value.id == "np"
+                    and is_numpy_name_node(v.func.value)
                     and v.func.attr in {"zeros", "ones", "zeros_like", "ones_like"}
                 ):
                     dtype_txt = self._np_dtype_text(v)
@@ -12423,8 +12560,28 @@ class translator(ast.NodeVisitor):
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
                     and isinstance(v.func, ast.Attribute)
-                    and isinstance(v.func.value, ast.Name)
-                    and v.func.value.id == "np"
+                    and is_numpy_name_node(v.func.value)
+                    and v.func.attr in {"copy", "empty_like", "flipud"}
+                    and len(v.args) >= 1
+                ):
+                    k0 = self._expr_kind(v.args[0])
+                    r0 = max(1, self._rank_expr(v.args[0]))
+                    if k0 == "int":
+                        self._mark_alloc_int(t.id, rank=r0)
+                    elif k0 == "logical":
+                        self._mark_alloc_log(t.id, rank=r0)
+                    elif k0 == "char":
+                        self._mark_alloc_char(t.id, rank=r0)
+                    elif k0 == "complex":
+                        self._mark_alloc_complex(t.id, rank=r0)
+                    else:
+                        self._mark_alloc_real(t.id, rank=r0)
+
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and is_numpy_name_node(v.func.value)
                     and v.func.attr in {"triu", "tril"}
                     and len(v.args) >= 1
                 ):
@@ -13033,6 +13190,36 @@ class translator(ast.NodeVisitor):
                     if size_node is None:
                         self._mark_int(t.id)
                     elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) >= 2:
+                        self._mark_alloc_int(t.id, rank=2)
+                    else:
+                        self._mark_alloc_int(t.id, rank=1)
+                    continue
+
+                # rng.integers(...) / np.random.randint(...)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and (
+                        v.func.attr in {"integers", "randint"}
+                        or (
+                            v.func.attr == "randint"
+                            and isinstance(v.func.value, ast.Attribute)
+                            and is_numpy_name_node(v.func.value.value)
+                            and v.func.value.attr == "random"
+                        )
+                    )
+                ):
+                    size_node = None
+                    if len(v.args) >= 3:
+                        size_node = v.args[2]
+                    for kw in v.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if size_node is None:
+                        self._mark_int(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
                         self._mark_alloc_int(t.id, rank=2)
                     else:
                         self._mark_alloc_int(t.id, rank=1)
@@ -15326,12 +15513,20 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{t.id} = ({low_expr}) + (({high_expr}) - ({low_expr})) * {t.id}")
             return
 
-        # z = rng.integers(low, high, size=...)
+        # z = rng.integers(low, high, size=...) / np.random.randint(...)
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and v.func.attr == "integers"
+            and (
+                v.func.attr in {"integers", "randint"}
+                or (
+                    v.func.attr == "randint"
+                    and isinstance(v.func.value, ast.Attribute)
+                    and is_numpy_name_node(v.func.value.value)
+                    and v.func.value.attr == "random"
+                )
+            )
         ):
             low_node = None
             high_node = None
@@ -15349,6 +15544,9 @@ class translator(ast.NodeVisitor):
                     high_node = kw.value
                 elif kw.arg == "size":
                     size_node = kw.value
+            if v.func.attr == "randint" and high_node is None:
+                high_node = low_node
+                low_node = ast.Constant(value=0)
             if low_node is None:
                 low_node = ast.Constant(value=0)
             if high_node is None:
@@ -15631,8 +15829,7 @@ class translator(ast.NodeVisitor):
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Name)
-            and v.func.value.id == "np"
+            and is_numpy_name_node(v.func.value)
             and v.func.attr == "empty"
             and len(v.args) >= 1
         ):
@@ -15649,8 +15846,7 @@ class translator(ast.NodeVisitor):
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Name)
-            and v.func.value.id == "np"
+            and is_numpy_name_node(v.func.value)
             and v.func.attr in {"zeros", "ones"}
             and len(v.args) >= 1
         ):
@@ -15681,8 +15877,7 @@ class translator(ast.NodeVisitor):
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Name)
-            and v.func.value.id == "np"
+            and is_numpy_name_node(v.func.value)
             and v.func.attr in {"zeros_like", "ones_like"}
             and len(v.args) >= 1
         ):
@@ -15710,6 +15905,29 @@ class translator(ast.NodeVisitor):
             else:
                 raise NotImplementedError("zeros_like/ones_like supports rank up to 2")
             self.o.w(f"{name} = {fill_expr}")
+            return
+
+        # np.empty_like(a) / np.copy(a)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and is_numpy_name_node(v.func.value)
+            and v.func.attr in {"empty_like", "copy"}
+            and len(v.args) >= 1
+        ):
+            name = t.id
+            a0 = self.expr(v.args[0])
+            r0 = self._rank_expr(v.args[0])
+            self.o.w(f"if (allocated({name})) deallocate({name})")
+            if r0 <= 1:
+                self.o.w(f"allocate({name}(1:size({a0})))")
+            elif r0 == 2:
+                self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)))")
+            else:
+                raise NotImplementedError("empty_like/copy currently supports rank up to 2 in assignment form")
+            if v.func.attr == "copy":
+                self.o.w(f"{name} = {a0}")
             return
 
         # np.full(shape, value, dtype=...)
@@ -17162,6 +17380,21 @@ class translator(ast.NodeVisitor):
                 if SHOW_NOOP_NOTES:
                     call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
                     print(f"note: no-op standalone call: {call_txt}")
+                return
+            # Non-numeric utility calls often used for plotting/data export in
+            # examples; ignore when used as standalone statements.
+            if root in {"Image", "PIL", "ET", "ElementTree", "xml"} and attr in {
+                "open", "parse", "show", "save", "write", "dump", "close",
+            }:
+                if SHOW_NOOP_NOTES:
+                    call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+                    print(f"note: no-op standalone utility call: {call_txt}")
+                return
+            # Generic terminal/file-like cleanup calls as statements.
+            if attr in {"close", "flush"} and len(c.args) == 0 and len(getattr(c, "keywords", [])) == 0:
+                if SHOW_NOOP_NOTES:
+                    call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+                    print(f"note: no-op standalone cleanup call: {call_txt}")
                 return
 
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
@@ -21076,7 +21309,7 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
             missing_modules.append((mod, ""))
 
     # LAPACK linkage support for numpy.linalg wrappers in python_mod.
-    if re.search(r"\b(linalg_(solve|cholesky|det|inv|eig|eigh|svd|qr)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
+    if re.search(r"\b(linalg_(solve|cholesky|det|inv|cond|eig|eigh|svd|qr)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
         lapack_src = Path("lapack_d.f90")
         lapack_s = str(lapack_src)
         if lapack_src.exists():
