@@ -568,6 +568,121 @@ def _strict_ifexp_diagnostics(src_text):
     return diags
 
 
+def _strict_tuple_output_rank_mismatch_diagnostics(src_text):
+    diags = []
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError:
+        return diags
+
+    def _simple_rank(expr, env):
+        if isinstance(expr, ast.Name):
+            return int(env.get(expr.id, 0))
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            return 1
+        if isinstance(expr, ast.Subscript):
+            return max(0, _simple_rank(expr.value, env) - 1)
+        if isinstance(expr, ast.BinOp):
+            return max(_simple_rank(expr.left, env), _simple_rank(expr.right, env))
+        if isinstance(expr, ast.UnaryOp):
+            return _simple_rank(expr.operand, env)
+        if isinstance(expr, ast.Call):
+            # Common NumPy constructors/generators that return arrays.
+            if isinstance(expr.func, ast.Attribute) and isinstance(expr.func.value, ast.Name) and expr.func.value.id == "np":
+                if expr.func.attr in {"array", "asarray", "arange", "zeros", "ones", "empty", "full"}:
+                    return 1
+                if expr.func.attr in {"exp", "sqrt", "abs", "sin", "cos", "tan"} and expr.args:
+                    return _simple_rank(expr.args[0], env)
+            if isinstance(expr.func, ast.Name):
+                if expr.func.id in {"list", "set", "sorted"}:
+                    return 1
+                if expr.func.id in {"range", "len", "int", "float", "str", "bool", "abs", "max", "min"}:
+                    return 0
+            return 0
+        return 0
+
+    def _scan_stmts(stmts, env, seen):
+        for st in stmts:
+            if isinstance(st, ast.Assign):
+                # Track simple name assignments for rank hints.
+                if len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                    env[st.targets[0].id] = _simple_rank(st.value, env)
+                # Capture tuple-unpack from function call.
+                if (
+                    len(st.targets) == 1
+                    and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(st.value, ast.Call)
+                    and isinstance(st.value.func, ast.Name)
+                ):
+                    callee = st.value.func.id
+                    out_vars = [e.id for e in st.targets[0].elts if isinstance(e, ast.Name)]
+                    if out_vars:
+                        arg_rank_hint = 0
+                        arg_sig = []
+                        for a in list(getattr(st.value, "args", [])):
+                            ar = int(_simple_rank(a, env))
+                            arg_rank_hint = max(arg_rank_hint, ar)
+                            arg_sig.append(ar)
+                        for kw in getattr(st.value, "keywords", []):
+                            if kw.arg is None:
+                                continue
+                            ar = int(_simple_rank(kw.value, env))
+                            arg_rank_hint = max(arg_rank_hint, ar)
+                            arg_sig.append(ar)
+                        arg_sig = tuple(arg_sig)
+                        ln = getattr(st, "lineno", 1)
+                        col = getattr(st, "col_offset", 0) + 1
+                        for ov in out_vars:
+                            key = (callee, ov)
+                            rec = seen.get(key)
+                            if rec is None:
+                                seen[key] = {"ranks": {arg_rank_hint}, "sigs": {arg_sig}, "line": ln}
+                            else:
+                                rec["ranks"].add(arg_rank_hint)
+                                rec["sigs"].add(arg_sig)
+                                if ((0 in rec["ranks"]) and any(r > 0 for r in rec["ranks"])) or (len(rec["sigs"]) > 1):
+                                    diags.append({
+                                        "line": ln,
+                                        "col": col,
+                                        "snippet": ast.get_source_segment(src_text, st) or "",
+                                        "message": (
+                                            f"tuple output variable '{ov}' from '{callee}' is assigned from rank-varying call signatures; "
+                                            "strict mode requires rank-stable outputs (use separate variables or split procedures)"
+                                        ),
+                                        "suggestion": (
+                                            f"use separate names for scalar vs array outputs from '{callee}' "
+                                            "(for example, p_scalar/dp_scalar and p_vec/dp_vec)"
+                                        ),
+                                    })
+                                    rec["ranks"] = {0, 1}
+                                    rec["sigs"] = {arg_sig}
+            elif isinstance(st, ast.For):
+                _scan_stmts(st.body, dict(env), seen)
+                _scan_stmts(st.orelse, dict(env), seen)
+            elif isinstance(st, ast.While):
+                _scan_stmts(st.body, dict(env), seen)
+                _scan_stmts(st.orelse, dict(env), seen)
+            elif isinstance(st, ast.If):
+                _scan_stmts(st.body, dict(env), seen)
+                _scan_stmts(st.orelse, dict(env), seen)
+
+    # Track rank signatures for tuple-unpack outputs from the same callee.
+    # key: (callee, out_var) -> set(rank_hint), first line
+    seen = {}
+    # module-level
+    _scan_stmts(tree.body, {}, seen)
+    # function-level
+    for fn in [n for n in tree.body if isinstance(n, ast.FunctionDef)]:
+        _scan_stmts(fn.body, {}, seen)
+
+    # Deduplicate exact repeats.
+    uniq = {}
+    for d in diags:
+        uniq[(d["line"], d["col"], d["message"])] = d
+    out = sorted(uniq.values(), key=lambda d: (d["line"], d["col"]))
+    return out
+
+
 def _strict_expr_family(node):
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bool):
@@ -768,6 +883,7 @@ def _run_strict_check(src_text, path_label):
     diags.extend(_strict_type_rebind_diagnostics(src_text))
     diags.extend(_strict_lambda_diagnostics(src_text))
     diags.extend(_strict_ifexp_diagnostics(src_text))
+    diags.extend(_strict_tuple_output_rank_mismatch_diagnostics(src_text))
     diags.sort(key=lambda d: (d["line"], d["col"]))
     if not diags:
         print(f"Strict: PASS ({path_label})")
@@ -19427,8 +19543,26 @@ def generate_flat(
                 local_tuple_return_out_names[fn.name] = out_names
                 break
     local_void_funcs = set()
+    def _has_value_return_in_body(stmts):
+        for st in stmts:
+            if isinstance(st, ast.Return):
+                if st.value is not None:
+                    return True
+                continue
+            # Do not inspect nested scopes when classifying this function.
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            for _fld, _val in ast.iter_fields(st):
+                if isinstance(_val, list):
+                    nodes = [x for x in _val if isinstance(x, ast.stmt)]
+                    if nodes and _has_value_return_in_body(nodes):
+                        return True
+                elif isinstance(_val, ast.stmt):
+                    if _has_value_return_in_body([_val]):
+                        return True
+        return False
     for fn in (local_funcs or []):
-        has_value_return = any(isinstance(st, ast.Return) and (st.value is not None) for st in ast.walk(fn))
+        has_value_return = _has_value_return_in_body(list(fn.body))
         if (not has_value_return) and (fn.name not in tuple_return_funcs) and (fn.name not in dict_return_specs):
             local_void_funcs.add(fn.name)
 
@@ -20386,6 +20520,24 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
 def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None):
     src = Path(py_path).read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
+    def _find_scipy_import(t):
+        for n in ast.walk(t):
+            if isinstance(n, ast.Import):
+                for al in n.names:
+                    mod = (al.name or "").strip()
+                    if mod == "scipy" or mod.startswith("scipy."):
+                        return n, mod
+            elif isinstance(n, ast.ImportFrom):
+                mod = (n.module or "").strip()
+                if mod == "scipy" or mod.startswith("scipy."):
+                    return n, (mod or "scipy")
+        return None, ""
+    scipy_node, scipy_mod = _find_scipy_import(tree)
+    if scipy_node is not None:
+        raise NotImplementedError(
+            f"SciPy is currently unsupported by xp2f.py (found import of '{scipy_mod}')",
+            scipy_node,
+        )
     translator.global_synthetic_slices = {}
     translator.global_vectorize_aliases = {}
     comment_map = extract_python_comments(src)
@@ -20694,6 +20846,11 @@ def main():
             if args.strict_fix_inplace:
                 print(f"Strict-fix: no changes needed ({src_path} unchanged)")
                 out_label = str(src_path)
+            elif args.out_python:
+                out_py = Path(args.out_python)
+                out_py.write_text(src_text, encoding="utf-8")
+                print(f"Strict-fix: no changes needed; wrote unchanged copy to {out_py}")
+                out_label = str(out_py)
             else:
                 print(f"Strict-fix: no changes needed ({src_path}); no output file created")
                 out_label = str(src_path)
@@ -20746,7 +20903,13 @@ def main():
         py_run = subprocess.CompletedProcess(py_cmd, py_rc, py_out, py_err)
 
     def _format_transpile_error(exc, src_text):
-        msg = str(exc)
+        if getattr(exc, "args", None):
+            if isinstance(exc.args[0], str):
+                msg = exc.args[0]
+            else:
+                msg = str(exc)
+        else:
+            msg = str(exc)
         src_lines = src_text.splitlines()
         tb = exc.__traceback__
         frames = []
