@@ -192,6 +192,8 @@ public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)
 public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D convolution with mode full/same/valid"
 public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional desc="1D integer convolution with mode full/same/valid"
 public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional desc="load whitespace-delimited real matrix text file"
+public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in) desc="write whitespace-delimited real matrix text file"
+public :: print_matrix !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),label:character:intent(in):optional desc="print 2D real matrix with aligned columns"
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
 public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
 public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional desc="m-th derivative coefficients for descending-order polynomial"
@@ -331,6 +333,11 @@ interface convolve
    module procedure convolve_int
 end interface convolve
 
+interface print_matrix
+   module procedure print_matrix_real_2d
+   module procedure print_matrix_label_real_2d
+end interface print_matrix
+
 interface fft_fft
    module procedure fft_fft_real
    module procedure fft_fft_complex
@@ -374,6 +381,42 @@ contains
          end do
          write(*,'(a)') ']'
       end subroutine print_int_list
+
+      subroutine print_matrix_real_2d(a)
+         real(kind=dp), intent(in) :: a(:,:)
+         integer :: i, j, pad
+         integer, allocatable :: w(:)
+         character(len=64) :: buf
+
+         allocate(w(size(a,2)))
+         w = 1
+         do j = 1, size(a,2)
+            do i = 1, size(a,1)
+               write(buf, "(g0)") a(i, j)
+               w(j) = max(w(j), len_trim(adjustl(buf)))
+            end do
+         end do
+
+         do i = 1, size(a,1)
+            write(*, "(a)", advance="no") "["
+            do j = 1, size(a,2)
+               if (j > 1) write(*, "(a)", advance="no") " "
+               write(buf, "(g0)") a(i, j)
+               buf = adjustl(buf)
+               pad = w(j) - len_trim(buf)
+               if (pad > 0) write(*, "(a)", advance="no") repeat(" ", pad)
+               write(*, "(a)", advance="no") trim(buf)
+            end do
+            write(*, "(a)") "]"
+         end do
+      end subroutine print_matrix_real_2d
+
+      subroutine print_matrix_label_real_2d(label, a)
+         character(len=*), intent(in) :: label
+         real(kind=dp), intent(in) :: a(:,:)
+         write(*, "(a)") trim(label)
+         call print_matrix_real_2d(a)
+      end subroutine print_matrix_label_real_2d
 
       function py_str_int(x) result(s)
          integer, intent(in) :: x
@@ -532,6 +575,22 @@ contains
             end do
          end function count_tokens
       end function loadtxt_real_2d
+
+      subroutine savetxt_real_2d(path, x)
+         character(len=*), intent(in) :: path
+         real(kind=dp), intent(in) :: x(:,:)
+         integer :: u, i, j
+
+         open(newunit=u, file=trim(path), status="replace", action="write")
+         do i = 1, size(x,1)
+            do j = 1, size(x,2)
+               if (j > 1) write(u, "(a)", advance="no") " "
+               write(u, "(g0)", advance="no") x(i, j)
+            end do
+            write(u, *)
+         end do
+         close(u)
+      end subroutine savetxt_real_2d
 
       pure integer function optval_int(x, default) result(v)
          integer, intent(in), optional :: x

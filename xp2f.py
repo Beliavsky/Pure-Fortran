@@ -2703,6 +2703,7 @@ def detect_needed_helpers(tree):
         "corrcoef": {"corrcoef2_real"},
         "convolve": {"convolve_real", "convolve_int"},
         "loadtxt": {"loadtxt_real_2d"},
+        "savetxt": {"savetxt_real_2d"},
         "pad": {"pad2d_int", "pad2d_real"},
         "allclose": {"allclose"},
         "polyval": {"polyval"},
@@ -15887,6 +15888,18 @@ class translator(ast.NodeVisitor):
             self.o.w("end do")
             self.o.pop()
             self.o.w("end block")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Name)
+            and c.func.value.id == "np"
+            and c.func.attr == "savetxt"
+            and len(c.args) >= 2
+        ):
+            path_txt = self.expr(c.args[0])
+            arr_txt = self.expr(c.args[1])
+            self.o.w(f"call savetxt_real_2d({path_txt}, {arr_txt})")
             return
 
         if (
