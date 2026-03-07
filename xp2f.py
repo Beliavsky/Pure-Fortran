@@ -2902,7 +2902,7 @@ def detect_needed_helpers(tree):
         "histogram": {"histogram"},
         "setdiff1d": {"setdiff1d_int"},
         "intersect1d": {"intersect1d_int"},
-        "lexsort": {"lexsort2_int"},
+        "lexsort": {"lexsort2_int", "lexsort2_real"},
         "ravel_multi_index": {"ravel_multi_index_2d"},
         "unravel_index": {"unravel_index_2d"},
         "kron": {"kron_2d"},
@@ -5929,6 +5929,10 @@ class translator(ast.NodeVisitor):
                 rk = self._expr_kind(node.right)
                 if lk == "char" and rk == "char" and self._rank_expr(node.left) == 0 and self._rank_expr(node.right) == 0:
                     return "char"
+            if isinstance(node.op, ast.Mod):
+                lk = self._expr_kind(node.left)
+                if lk == "char" and self._rank_expr(node.left) == 0:
+                    return "char"
             if isinstance(node.op, ast.Div):
                 lk = self._expr_kind(node.left)
                 rk = self._expr_kind(node.right)
@@ -6036,9 +6040,12 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"tanh", "arcsinh", "arccosh"}
+                and node.func.attr in {"sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"}
                 and len(node.args) >= 1
             ):
+                k0 = self._expr_kind(node.args[0])
+                if k0 == "complex":
+                    return "complex"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -7279,6 +7286,9 @@ class translator(ast.NodeVisitor):
                 if (r1 == 2 and r2 == 1) or (r1 == 1 and r2 == 2):
                     return 1
                 return 0
+            if isinstance(node.op, ast.Mod):
+                if self._expr_kind(node.left) == "char" and self._rank_expr(node.left) == 0:
+                    return 0
             return max(self._rank_expr(node.left), self._rank_expr(node.right))
         if isinstance(node, ast.UnaryOp):
             return self._rank_expr(node.operand)
@@ -7295,7 +7305,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"tanh", "arcsinh", "arccosh"}
+                and node.func.attr in {"sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"}
                 and len(node.args) >= 1
             ):
                 return self._rank_expr(node.args[0])
@@ -7429,7 +7439,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
             ):
-                if node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "array", "tanh", "arcsinh", "arccosh"} and len(node.args) >= 1:
+                if node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "array", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "polyval" and len(node.args) >= 2:
                     return self._rank_expr(node.args[1])
@@ -7587,7 +7597,7 @@ class translator(ast.NodeVisitor):
                     return 2 if r0 <= 1 else r0
                 if node.func.attr == "unravel_index" and len(node.args) >= 2:
                     return 1
-                if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 1:
+                if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "angle", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "arctan2" and len(node.args) >= 2:
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
@@ -8398,6 +8408,46 @@ class translator(ast.NodeVisitor):
                 if self._is_col2_expr(node.right):
                     b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
             if op is ast.Mod:
+                # Python old-style string formatting: "x=%g" % (v,)
+                if self._expr_kind(node.left) == "char" and self._rank_expr(node.left) == 0 and is_const_str(node.left):
+                    fmt_text = str(node.left.value)
+                    if isinstance(node.right, (ast.Tuple, ast.List)):
+                        arg_nodes = list(node.right.elts)
+                    else:
+                        arg_nodes = [node.right]
+                    conv_chars = set("diouxXeEfFgGcrs")
+                    parts = []
+                    arg_i = 0
+                    i = 0
+                    nfmt = len(fmt_text)
+                    ok = True
+                    while i < nfmt:
+                        if fmt_text[i] != "%":
+                            j = i
+                            while j < nfmt and fmt_text[j] != "%":
+                                j += 1
+                            lit = fmt_text[i:j]
+                            if lit:
+                                parts.append(fstr(lit))
+                            i = j
+                            continue
+                        if i + 1 < nfmt and fmt_text[i + 1] == "%":
+                            parts.append(fstr("%"))
+                            i += 2
+                            continue
+                        j = i + 1
+                        while j < nfmt and fmt_text[j] not in conv_chars:
+                            j += 1
+                        if j >= nfmt or arg_i >= len(arg_nodes):
+                            ok = False
+                            break
+                        parts.append(f"py_str({self.expr(arg_nodes[arg_i])})")
+                        arg_i += 1
+                        i = j + 1
+                    if ok and arg_i == len(arg_nodes):
+                        if not parts:
+                            return fstr("")
+                        return " // ".join(parts)
                 return f"mod({a}, {b})"
             if op is ast.LShift:
                 return f"ishft({a}, int({b}))"
@@ -9900,15 +9950,48 @@ class translator(ast.NodeVisitor):
                         ord_node = kw.value
                     elif kw.arg == "axis":
                         axis_node = kw.value
+                ord_is_fro = bool(is_const_str(ord_node) and str(ord_node.value).lower() in {"fro", "f"})
+                ord_is_two = bool(
+                    isinstance(ord_node, ast.Constant)
+                    and isinstance(ord_node.value, (int, float))
+                    and abs(float(ord_node.value) - 2.0) <= 0.0
+                )
+                ord_is_one = bool(
+                    isinstance(ord_node, ast.Constant)
+                    and isinstance(ord_node.value, (int, float))
+                    and abs(float(ord_node.value) - 1.0) <= 0.0
+                )
+                ord_is_posinf = bool(
+                    isinstance(ord_node, ast.Attribute)
+                    and isinstance(ord_node.value, ast.Name)
+                    and node.func.value.value.id in {"np", "numpy"}
+                    and ord_node.attr == "inf"
+                )
+                ord_is_neginf = bool(
+                    isinstance(ord_node, ast.UnaryOp)
+                    and isinstance(ord_node.op, ast.USub)
+                    and isinstance(ord_node.operand, ast.Attribute)
+                    and isinstance(ord_node.operand.value, ast.Name)
+                    and node.func.value.value.id in {"np", "numpy"}
+                    and ord_node.operand.attr == "inf"
+                )
                 if axis_node is not None:
                     dim_expr = f"({self.expr(axis_node)} + 1)"
-                    if ord_node is None or (is_const_str(ord_node) and str(ord_node.value).lower() in {"fro", "f"}):
+                    if ord_node is None or ord_is_fro or ord_is_two:
                         return f"sqrt(sum(({a0})**2, dim={dim_expr}))"
+                    if ord_is_posinf:
+                        return f"maxval(abs({a0}), dim={dim_expr})"
+                    if ord_is_neginf:
+                        return f"minval(abs({a0}), dim={dim_expr})"
+                    if ord_is_one:
+                        return f"sum(abs({a0}), dim={dim_expr})"
                     return f"sum(abs({a0}), dim={dim_expr})"
-                if ord_node is None:
+                if ord_node is None or ord_is_fro or ord_is_two:
                     return f"sqrt(sum(({a0})**2))"
-                if is_const_str(ord_node) and str(ord_node.value).lower() in {"fro", "f"}:
-                    return f"sqrt(sum(({a0})**2))"
+                if ord_is_posinf:
+                    return f"maxval(abs({a0}))"
+                if ord_is_neginf:
+                    return f"minval(abs({a0}))"
                 return f"sum(abs({a0}))"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -10818,16 +10901,31 @@ class translator(ast.NodeVisitor):
                 return f"unique_int([{self.expr(node.args[0])}, {self.expr(node.args[1])}])"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "lexsort"
                 and len(node.args) >= 1
-                and isinstance(node.args[0], (ast.Tuple, ast.List))
-                and len(node.args[0].elts) == 2
             ):
-                ky = self.expr(node.args[0].elts[0])
-                kx = self.expr(node.args[0].elts[1])
-                return f"lexsort2_int({ky}, {kx})"
+                k0_node = None
+                k1_node = None
+                if isinstance(node.args[0], (ast.Tuple, ast.List)) and len(node.args[0].elts) == 2:
+                    k0_node = node.args[0].elts[0]
+                    k1_node = node.args[0].elts[1]
+                elif self._rank_expr(node.args[0]) == 2:
+                    keys_expr = self.expr(node.args[0])
+                    k0_txt = f"{keys_expr}(1, :)"
+                    k1_txt = f"{keys_expr}(2, :)"
+                    kk = self._expr_kind(node.args[0])
+                    if kk == "int":
+                        return f"lexsort2_int({k0_txt}, {k1_txt})"
+                    return f"lexsort2_real({k0_txt}, {k1_txt})"
+                else:
+                    raise NotImplementedError("np.lexsort currently expects two keys")
+                ky = self.expr(k0_node)
+                kx = self.expr(k1_node)
+                kk = self._expr_kind(k0_node)
+                if kk == "int":
+                    return f"lexsort2_int({ky}, {kx})"
+                return f"lexsort2_real({ky}, {kx})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -11399,14 +11497,35 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"tanh", "arcsinh", "arccosh"}
+                and node.func.attr == "angle"
+                and len(node.args) >= 1
+            ):
+                z0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 == "complex":
+                    return f"atan2(aimag({z0}), real({z0}, kind=dp))"
+                r0 = z0
+                if k0 in {"int", "logical"}:
+                    r0 = f"real({z0}, kind=dp)"
+                return f"atan2(0.0_dp, {r0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"}
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
-                fmap = {"tanh": "tanh", "arcsinh": "asinh", "arccosh": "acosh"}
+                fmap = {
+                    "sinh": "sinh",
+                    "cosh": "cosh",
+                    "tanh": "tanh",
+                    "arcsinh": "asinh",
+                    "arccosh": "acosh",
+                    "arctanh": "atanh",
+                }
                 return f"{fmap[node.func.attr]}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -14231,14 +14350,14 @@ class translator(ast.NodeVisitor):
                 if len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
-                    self.o.w(f"{t.id} = runif({n0}, {n1})")
+                    self.o.w(f"{t.id} = runif(int({n0}), int({n1}))")
                     return
                 if len(size_node.elts) == 1:
                     n0 = self.expr(size_node.elts[0])
-                    self.o.w(f"{t.id} = runif({n0})")
+                    self.o.w(f"{t.id} = runif(int({n0}))")
                     return
                 raise NotImplementedError("random size tuple rank > 2 not supported")
-            self.o.w(f"{t.id} = runif({self.expr(size_node)})")
+            self.o.w(f"{t.id} = runif(int({self.expr(size_node)}))")
             return
 
         # x = np.random.random() -> call random_number(x)
@@ -14578,17 +14697,17 @@ class translator(ast.NodeVisitor):
                 if len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
-                    self.o.w(f"{t.id} = rnorm({n0}, {n1})")
+                    self.o.w(f"{t.id} = rnorm(int({n0}), int({n1}))")
                 elif len(size_node.elts) == 1:
                     n_expr = self.expr(size_node.elts[0])
-                    self.o.w(f"{t.id} = rnorm({n_expr})")
+                    self.o.w(f"{t.id} = rnorm(int({n_expr}))")
                 else:
                     if is_standard:
                         raise NotImplementedError("np.random.standard_normal size tuple rank > 2 not supported")
                     raise NotImplementedError("np.random.normal size tuple rank > 2 not supported")
             else:
                 n_expr = self.expr(size_node)
-                self.o.w(f"{t.id} = rnorm({n_expr})")
+                self.o.w(f"{t.id} = rnorm(int({n_expr}))")
 
             # Special case: gather parameters by class labels, e.g.
             # rng.normal(loc=mu[z], scale=sigma[z], size=n)
@@ -15448,17 +15567,17 @@ class translator(ast.NodeVisitor):
             if len(dims) == 1:
                 n0 = self.expr(dims[0])
                 if v.func.attr == "rand":
-                    self.o.w(f"{t.id} = runif({n0})")
+                    self.o.w(f"{t.id} = runif(int({n0}))")
                 else:
-                    self.o.w(f"{t.id} = rnorm({n0})")
+                    self.o.w(f"{t.id} = rnorm(int({n0}))")
                 return
             if len(dims) == 2:
                 n0 = self.expr(dims[0])
                 n1 = self.expr(dims[1])
                 if v.func.attr == "rand":
-                    self.o.w(f"{t.id} = runif({n0}, {n1})")
+                    self.o.w(f"{t.id} = runif(int({n0}), int({n1}))")
                 else:
-                    self.o.w(f"{t.id} = rnorm({n0}, {n1})")
+                    self.o.w(f"{t.id} = rnorm(int({n0}), int({n1}))")
                 return
             raise NotImplementedError("np.random.rand/randn supports up to 2 dimensions")
 
@@ -17061,6 +17180,20 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("only call expressions supported")
         c = node.value
 
+        # Common side-effect-only calls in Burkardt-style drivers.
+        # Keep as no-ops in transpiled Fortran.
+        if isinstance(c.func, ast.Name) and c.func.id == "timestamp":
+            return
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Attribute)
+            and isinstance(c.func.value.value, ast.Name)
+            and c.func.value.value.id == "sys"
+            and c.func.value.attr == "path"
+            and c.func.attr == "insert"
+        ):
+            return
+
         # random.seed(...)
         if (
             isinstance(c.func, ast.Attribute)
@@ -17354,7 +17487,7 @@ class translator(ast.NodeVisitor):
                 "figure", "subplots", "subplot", "show", "savefig", "close", "clf",
                 "cla", "grid", "legend", "xlabel", "ylabel", "title", "xlim", "ylim",
                 "xticks", "yticks", "suptitle", "tight_layout", "pause", "axis",
-                "plot_surface",
+                "plot_surface", "view_init", "quiver",
                 # graphviz-like builder/render calls
                 "node", "edge", "attr", "render", "view",
             }
@@ -17395,6 +17528,12 @@ class translator(ast.NodeVisitor):
                 if SHOW_NOOP_NOTES:
                     call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
                     print(f"note: no-op standalone cleanup call: {call_txt}")
+                return
+            # File-like standalone writes are non-numeric side effects.
+            if attr in {"write", "writelines"}:
+                if SHOW_NOOP_NOTES:
+                    call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+                    print(f"note: no-op standalone write call: {call_txt}")
                 return
 
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
@@ -20026,6 +20165,30 @@ def generate_flat(
                         for kw in n.keywords:
                             if kw.arg == "num" and isinstance(kw.value, ast.Name) and kw.value.id == nm:
                                 return "int"
+                    # NumPy RNG size arguments are integer-valued.
+                    if (
+                        isinstance(n.func, ast.Attribute)
+                        and (
+                            (
+                                isinstance(n.func.value, ast.Attribute)
+                                and isinstance(n.func.value.value, ast.Name)
+                                and n.func.value.value.id == "np"
+                                and n.func.value.attr == "random"
+                                and n.func.attr in {"random", "standard_normal", "normal", "uniform", "rand", "randn", "randint"}
+                            )
+                            or (
+                                isinstance(n.func.value, ast.Name)
+                                and n.func.attr in {"random", "standard_normal", "normal", "uniform", "integers", "randint"}
+                            )
+                        )
+                    ):
+                        if len(n.args) >= 1 and isinstance(n.args[0], ast.Name) and n.args[0].id == nm and n.func.attr in {"random", "standard_normal", "rand", "randn"}:
+                            return "int"
+                        if len(n.args) >= 3 and isinstance(n.args[2], ast.Name) and n.args[2].id == nm:
+                            return "int"
+                        for kw in n.keywords:
+                            if kw.arg == "size" and isinstance(kw.value, ast.Name) and kw.value.id == nm:
+                                return "int"
         # Usage-based fallback: infer from arithmetic partners in this function.
         for st in fn.body:
             for n in ast.walk(st):
@@ -20216,12 +20379,12 @@ def generate_flat(
         for i in range(len(base_ranks)):
             hk = hint_kinds[i] if i < len(hint_kinds) else None
             bk = _infer_arg_kind_in_fn(fn, local_func_arg_names[fn.name][i])
-            # Index/shape usage must remain integer even if call-site kind
-            # heuristics drifted to real from weak evidence.
-            if bk == "int" and hk in {None, "real"}:
-                merged_kinds.append("int")
+            # Prefer explicit call-site kind evidence when available.
+            # Keep integer only when there is no better hint.
+            if hk is not None:
+                merged_kinds.append(hk)
             else:
-                merged_kinds.append(hk or bk)
+                merged_kinds.append(bk)
         local_func_arg_kinds[fn.name] = merged_kinds
     # Propagate argument-rank requirements across local wrapper calls, e.g.:
     #   def outer(x): return inner(x, ...)
@@ -20269,6 +20432,114 @@ def generate_flat(
                                 local_func_arg_ranks[callee][j] = int(src_rank)
                                 changed = True
             if not changed:
+                break
+        # Reverse rank propagation: when a caller dummy is passed into a callee
+        # dummy with known rank, lift the caller dummy rank accordingly.
+        for _ in range(max(1, len(local_funcs)) + 2):
+            changed_rr = False
+            for fn in local_funcs:
+                caller = fn.name
+                caller_args = local_func_arg_names.get(caller, [])
+                caller_ranks = local_func_arg_ranks.get(caller, [])
+                if not caller_args:
+                    continue
+                caller_idx = {nm: i for i, nm in enumerate(caller_args)}
+                for n in ast.walk(fn):
+                    if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
+                        continue
+                    callee = n.func.id
+                    if callee not in local_func_arg_ranks:
+                        continue
+                    callee_ranks = local_func_arg_ranks.get(callee, [])
+                    callee_args = local_func_arg_names.get(callee, [])
+                    callee_name_to_idx = {nm: i for i, nm in enumerate(callee_args)}
+                    # Positional actuals.
+                    for j, a in enumerate(n.args):
+                        if j >= len(callee_ranks):
+                            break
+                        want_r = int(callee_ranks[j])
+                        if want_r <= 0:
+                            continue
+                        if isinstance(a, ast.Name) and a.id in caller_idx:
+                            i_src = caller_idx[a.id]
+                            cur_r = int(caller_ranks[i_src]) if i_src < len(caller_ranks) else 0
+                            if want_r > cur_r:
+                                caller_ranks[i_src] = want_r
+                                changed_rr = True
+                    # Keyword actuals.
+                    for kw in getattr(n, "keywords", []):
+                        if kw.arg is None or kw.arg not in callee_name_to_idx:
+                            continue
+                        j = callee_name_to_idx[kw.arg]
+                        if j >= len(callee_ranks):
+                            continue
+                        want_r = int(callee_ranks[j])
+                        if want_r <= 0:
+                            continue
+                        if isinstance(kw.value, ast.Name) and kw.value.id in caller_idx:
+                            i_src = caller_idx[kw.value.id]
+                            cur_r = int(caller_ranks[i_src]) if i_src < len(caller_ranks) else 0
+                            if want_r > cur_r:
+                                caller_ranks[i_src] = want_r
+                                changed_rr = True
+            if not changed_rr:
+                break
+        # Propagate argument-kind requirements across local wrapper calls.
+        # Example:
+        #   def outer(x): return inner(x)
+        # if inner expects real x, infer outer's x as real as well.
+        for _ in range(max(1, len(local_funcs)) + 2):
+            changed_k = False
+            for fn in local_funcs:
+                caller = fn.name
+                caller_args = local_func_arg_names.get(caller, [])
+                caller_kinds = local_func_arg_kinds.get(caller, [])
+                if not caller_args:
+                    continue
+                caller_idx = {nm: i for i, nm in enumerate(caller_args)}
+                for n in ast.walk(fn):
+                    if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
+                        continue
+                    callee = n.func.id
+                    if callee not in local_func_arg_kinds:
+                        continue
+                    callee_kinds = local_func_arg_kinds.get(callee, [])
+                    if not callee_kinds:
+                        continue
+                    # Positional actuals.
+                    for j, a in enumerate(n.args):
+                        if j >= len(callee_kinds):
+                            break
+                        want = callee_kinds[j]
+                        if want not in {"real", "complex", "logical", "char"}:
+                            continue
+                        if isinstance(a, ast.Name) and a.id in caller_idx:
+                            i_src = caller_idx[a.id]
+                            cur = caller_kinds[i_src] if i_src < len(caller_kinds) else None
+                            newk = _promote_kind_hint(cur, want)
+                            if newk != cur:
+                                caller_kinds[i_src] = newk
+                                changed_k = True
+                    # Keyword actuals.
+                    callee_args = local_func_arg_names.get(callee, [])
+                    callee_name_to_idx = {nm: i for i, nm in enumerate(callee_args)}
+                    for kw in getattr(n, "keywords", []):
+                        if kw.arg is None or kw.arg not in callee_name_to_idx:
+                            continue
+                        j = callee_name_to_idx[kw.arg]
+                        if j >= len(callee_kinds):
+                            continue
+                        want = callee_kinds[j]
+                        if want not in {"real", "complex", "logical", "char"}:
+                            continue
+                        if isinstance(kw.value, ast.Name) and kw.value.id in caller_idx:
+                            i_src = caller_idx[kw.value.id]
+                            cur = caller_kinds[i_src] if i_src < len(caller_kinds) else None
+                            newk = _promote_kind_hint(cur, want)
+                            if newk != cur:
+                                caller_kinds[i_src] = newk
+                                changed_k = True
+            if not changed_k:
                 break
         # Recompute local return and tuple-return metadata with propagated
         # wrapper argument ranks so chained wrappers preserve array outputs.
@@ -21758,7 +22029,18 @@ def main():
         return 1
 
     src_path = Path(args.input_py)
-    src_text = src_path.read_text(encoding="utf-8-sig")
+    if not src_path.exists():
+        print(f"Input: FAIL (missing source file: {src_path})")
+        return 1
+    if not src_path.is_file():
+        print(f"Input: FAIL (not a file: {src_path})")
+        return 1
+    try:
+        src_text = src_path.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        print(f"Input: FAIL (could not read source file: {src_path})")
+        print(str(e))
+        return 1
     if args.tee_orig:
         print(f"Original source ({src_path}):")
         if src_text:
