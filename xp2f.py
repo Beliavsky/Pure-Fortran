@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import argparse
 import glob
+import traceback
 import shlex
 import subprocess
 import time
@@ -16371,8 +16372,87 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
     def _emit_print_call(self, call):
+        def _fortran_write_for_percent_format(fmt_text, rhs_node, advance_no):
+            conv_chars = set("diouxXeEfFgGcrs")
+            # Collect argument nodes from RHS of `%`.
+            if isinstance(rhs_node, (ast.Tuple, ast.List)):
+                arg_nodes = list(rhs_node.elts)
+            else:
+                arg_nodes = [rhs_node]
+            items = []
+            arg_i = 0
+            i = 0
+            n = len(fmt_text)
+            while i < n:
+                if fmt_text[i] != "%":
+                    j = i
+                    while j < n and fmt_text[j] != "%":
+                        j += 1
+                    lit = fmt_text[i:j]
+                    if lit:
+                        items.append(("lit", lit))
+                    i = j
+                    continue
+                # Escaped percent '%%'
+                if i + 1 < n and fmt_text[i + 1] == "%":
+                    items.append(("lit", "%"))
+                    i += 2
+                    continue
+                j = i + 1
+                while j < n and fmt_text[j] not in conv_chars:
+                    j += 1
+                if j >= n:
+                    raise NotImplementedError("unsupported old-style print format: unterminated % specifier")
+                code = fmt_text[j]
+                if arg_i >= len(arg_nodes):
+                    raise NotImplementedError("unsupported old-style print format: argument count mismatch")
+                an = arg_nodes[arg_i]
+                arg_i += 1
+                cl = code.lower()
+                if cl in {"d", "i", "o", "u", "x"}:
+                    items.append(("desc", "i0", an))
+                elif cl in {"e", "f", "g"}:
+                    items.append(("desc", "g0", an))
+                elif cl in {"c", "r", "s"}:
+                    items.append(("desc", "a", an))
+                else:
+                    raise NotImplementedError(f"unsupported old-style print format code '%{code}'")
+                i = j + 1
+            if arg_i != len(arg_nodes):
+                raise NotImplementedError("unsupported old-style print format: argument count mismatch")
+
+            fmt_parts = []
+            write_args = []
+            for ent in items:
+                if ent[0] == "lit":
+                    lit = ent[1].replace("'", "''")
+                    fmt_parts.append(f"'{lit}'")
+                else:
+                    fmt_parts.append(ent[1])
+                    write_args.append(self.expr(ent[2]))
+            if not fmt_parts:
+                fmt_parts = ["' '"]
+            ffmt = "(" + ",".join(fmt_parts) + ")"
+            adv = ", advance='no'" if advance_no else ""
+            if write_args:
+                self.o.w(f"write(*,{fstr(ffmt)}{adv}) " + ", ".join(write_args))
+            else:
+                self.o.w(f"write(*,{fstr(ffmt)}{adv})")
+
+        end_txt = None
+        for kw in getattr(call, "keywords", []):
+            if kw.arg == "end":
+                if is_const_str(kw.value):
+                    end_txt = kw.value.value
+                else:
+                    raise NotImplementedError("print(end=...) currently supports only string literals")
+        advance_no = (end_txt == "")
+
         if len(call.args) == 0:
-            self.o.w("print *")
+            if advance_no:
+                self.o.w(f"write(*,{fstr('(a)')}, advance='no') {fstr('')}")
+            else:
+                self.o.w("print *")
             return
         if len(call.args) == 1:
             a0 = call.args[0]
@@ -16413,9 +16493,21 @@ class translator(ast.NodeVisitor):
             return
         a = call.args[0]
 
+        # print('...%d...' % (...), end='') old-style formatting.
+        if (
+            isinstance(a, ast.BinOp)
+            and isinstance(a.op, ast.Mod)
+            and is_const_str(a.left)
+        ):
+            _fortran_write_for_percent_format(a.left.value, a.right, advance_no)
+            return
+
         # print("literal")
         if is_const_str(a):
-            self.o.w(f"write(*,{fstr('(a)')}) {fstr(a.value)}")
+            if advance_no:
+                self.o.w(f"write(*,{fstr('(a)')}, advance='no') {fstr(a.value)}")
+            else:
+                self.o.w(f"write(*,{fstr('(a)')}) {fstr(a.value)}")
             return
 
         # print(f"...{x}...")
@@ -20403,13 +20495,61 @@ def main():
             print(py_err.rstrip())
         py_run = subprocess.CompletedProcess(py_cmd, py_rc, py_out, py_err)
 
+    def _format_transpile_error(exc, src_text):
+        msg = str(exc)
+        src_lines = src_text.splitlines()
+        tb = exc.__traceback__
+        frames = []
+        while tb is not None:
+            frames.append(tb.tb_frame)
+            tb = tb.tb_next
+
+        def _node_lineno_from_obj(obj):
+            if isinstance(obj, ast.AST):
+                ln = getattr(obj, "lineno", None)
+                if isinstance(ln, int) and ln >= 1:
+                    return ln
+            if isinstance(obj, list):
+                for it in obj:
+                    ln = _node_lineno_from_obj(it)
+                    if ln is not None:
+                        return ln
+            return None
+
+        ln = None
+        for fr in reversed(frames):
+            loc = fr.f_locals
+            for key in (
+                "node",
+                "v",
+                "c",
+                "n",
+                "st",
+                "rhs",
+                "size_node",
+                "elt",
+                "elts",
+                "part",
+            ):
+                if key in loc:
+                    ln = _node_lineno_from_obj(loc[key])
+                    if ln is not None:
+                        break
+            if ln is not None:
+                break
+
+        if ln is not None and 1 <= ln <= len(src_lines):
+            code = src_lines[ln - 1].rstrip()
+            return f"{msg} at line {ln}: {code}"
+        return msg
+
     t0_transpile = time.perf_counter()
     try:
         out, used_flat_fallback, used_main_unwrap = transpile_file(
             args.input_py, args.helpers, args.flat, no_comment=(not args.comment), out_path=args.out
         )
     except (NotImplementedError, FileNotFoundError) as e:
-        print(f"Transpile: FAIL ({e})")
+        print(f"Transpile: FAIL ({_format_transpile_error(e, src_text)})")
         return 1
     timings["transpile"] = time.perf_counter() - t0_transpile
     print(f"wrote {out}")
