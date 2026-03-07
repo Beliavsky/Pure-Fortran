@@ -74,6 +74,7 @@ class Candidate:
     expr_refs: List[str]
     unit_start: int
     unit_end: int
+    write_lines: List[int]
 
 
 @dataclass
@@ -246,6 +247,11 @@ def is_parameter_safe_expr(
     if bad:
         return False, f"depends on non-parameter name(s): {', '.join(bad)}"
     return True, ""
+
+
+def normalize_expr_for_equality(expr: str) -> str:
+    """Whitespace-insensitive expression normalization for repeated-write checks."""
+    return re.sub(r"\s+", "", (expr or "").strip())
 
 
 def unwrap_single_line_if(stmt: str) -> Tuple[str, bool]:
@@ -533,6 +539,10 @@ def analyze_unit(
     first_write_deterministic: Dict[str, bool] = {}
     first_write_expr: Dict[str, str] = {}
     first_write_in_control: Dict[str, bool] = {}
+    write_lines: Dict[str, List[int]] = {}
+    write_expr_norms: Dict[str, Set[str]] = {}
+    write_expr_raw: Dict[str, str] = {}
+    has_unknown_write: Set[str] = set()
     declared_parameters: Set[str] = set()
     parameter_decl_line: Dict[str, int] = {}
     control_depth = 0
@@ -583,12 +593,19 @@ def analyze_unit(
 
                 if has_init:
                     writes[name] = writes.get(name, 0) + 1
+                    write_lines.setdefault(name, []).append(ln)
                     if name not in first_write_line:
                         first_write_line[name] = ln
                         first_write_detail[name] = "declaration initialization"
                         first_write_deterministic[name] = not is_nondeterministic(init_expr)
                         first_write_expr[name] = init_expr
                         first_write_in_control[name] = is_conditional_stmt
+                    if is_nondeterministic(init_expr):
+                        has_unknown_write.add(name)
+                    else:
+                        nn = normalize_expr_for_equality(init_expr)
+                        write_expr_norms.setdefault(name, set()).add(nn)
+                        write_expr_raw.setdefault(name, init_expr)
             if BLOCK_START_RE.match(low):
                 control_depth += 1
             continue
@@ -621,11 +638,13 @@ def analyze_unit(
         if m_ptr:
             n = m_ptr.group(1).lower()
             writes[n] = writes.get(n, 0) + 1
+            write_lines.setdefault(n, []).append(ln)
             if n not in first_write_line:
                 first_write_line[n] = ln
                 first_write_detail[n] = "pointer assignment"
                 first_write_deterministic[n] = False
                 first_write_in_control[n] = is_conditional_stmt
+            has_unknown_write.add(n)
             if BLOCK_START_RE.match(low):
                 control_depth += 1
             continue
@@ -638,11 +657,13 @@ def analyze_unit(
                 if not n:
                     continue
                 writes[n] = writes.get(n, 0) + 1
+                write_lines.setdefault(n, []).append(ln)
                 if n not in first_write_line:
                     first_write_line[n] = ln
                     first_write_detail[n] = f"{m_alloc.group(1).lower()} statement"
                     first_write_deterministic[n] = False
                     first_write_in_control[n] = is_conditional_stmt
+                has_unknown_write.add(n)
             if BLOCK_START_RE.match(low):
                 control_depth += 1
             continue
@@ -656,11 +677,13 @@ def analyze_unit(
                 if not n:
                     continue
                 writes[n] = writes.get(n, 0) + 1
+                write_lines.setdefault(n, []).append(ln)
                 if n not in first_write_line:
                     first_write_line[n] = ln
                     first_write_detail[n] = "read statement"
                     first_write_deterministic[n] = False
                     first_write_in_control[n] = is_conditional_stmt
+                has_unknown_write.add(n)
             if BLOCK_START_RE.match(low):
                 control_depth += 1
             continue
@@ -675,11 +698,13 @@ def analyze_unit(
                 n = is_simple_name(call_args[0])
                 if n:
                     writes[n] = writes.get(n, 0) + 1
+                    write_lines.setdefault(n, []).append(ln)
                     if n not in first_write_line:
                         first_write_line[n] = ln
                         first_write_detail[n] = "random_number output"
                         first_write_deterministic[n] = False
                         first_write_in_control[n] = is_conditional_stmt
+                    has_unknown_write.add(n)
 
             if call_name in proc_sigs and len(proc_sigs[call_name]) == 1:
                 sig = proc_sigs[call_name][0]
@@ -692,11 +717,13 @@ def analyze_unit(
                     if not n:
                         continue
                     writes[n] = writes.get(n, 0) + 1
+                    write_lines.setdefault(n, []).append(ln)
                     if n not in first_write_line:
                         first_write_line[n] = ln
                         first_write_detail[n] = f"CALL {call_name} actual for INTENT({intent.upper()})"
                         first_write_deterministic[n] = False
                         first_write_in_control[n] = is_conditional_stmt
+                    has_unknown_write.add(n)
             if BLOCK_START_RE.match(low):
                 control_depth += 1
             continue
@@ -708,12 +735,19 @@ def analyze_unit(
             base = first_identifier(lhs)
             if base:
                 writes[base] = writes.get(base, 0) + 1
+                write_lines.setdefault(base, []).append(ln)
                 if base not in first_write_line:
                     first_write_line[base] = ln
                     first_write_detail[base] = "assignment"
                     first_write_deterministic[base] = not is_nondeterministic(rhs)
                     first_write_expr[base] = rhs
                     first_write_in_control[base] = is_conditional_stmt
+                if is_nondeterministic(rhs):
+                    has_unknown_write.add(base)
+                else:
+                    nn = normalize_expr_for_equality(rhs)
+                    write_expr_norms.setdefault(base, set()).add(nn)
+                    write_expr_raw.setdefault(base, rhs)
             if BLOCK_START_RE.match(low):
                 control_depth += 1
             continue
@@ -727,6 +761,15 @@ def analyze_unit(
     desc = descendant_writes or {}
 
     for name, decl_line in sorted(locals_decl_line.items(), key=lambda kv: kv[1]):
+        repeated_same_deterministic = (
+            writes.get(name, 0) > 1
+            and name not in has_unknown_write
+            and len(write_expr_norms.get(name, set())) == 1
+        )
+        if repeated_same_deterministic and (name in write_expr_raw):
+            first_write_expr[name] = write_expr_raw[name]
+            if first_write_detail.get(name, "") == "assignment":
+                first_write_detail[name] = "repeated identical assignment"
         if name in unit.dummy_names:
             reason = "dummy argument"
         elif not local_ok.get(name, False):
@@ -735,9 +778,13 @@ def analyze_unit(
             reason = f"assigned in internal procedure ({desc.get(name, 0)} write(s))"
         elif writes.get(name, 0) == 0:
             reason = "never assigned"
-        elif writes.get(name, 0) > 1:
+        elif writes.get(name, 0) > 1 and not repeated_same_deterministic:
             reason = f"assigned {writes.get(name, 0)} times"
-        elif first_write_in_control.get(name, False):
+        elif first_write_in_control.get(name, False) and not (
+            first_write_deterministic.get(name, False)
+            and name not in has_unknown_write
+            and writes.get(name, 0) >= 1
+        ):
             reason = "first set occurs inside control-flow block"
         elif not first_write_deterministic.get(name, False):
             reason = f"first set is non-deterministic ({first_write_detail.get(name, 'unknown')})"
@@ -793,6 +840,7 @@ def analyze_unit(
                     expr_refs=sorted(expr_refs(first_write_expr.get(name, ""))),
                     unit_start=unit.start,
                     unit_end=unit.end,
+                    write_lines=sorted(set(write_lines.get(name, [first_write_line.get(name, decl_line)]))),
                 )
             )
 
@@ -865,22 +913,7 @@ def apply_fixes_for_file(
             skipped.append(FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "missing first-write expression"))
             continue
 
-        # For executable assignment fixes, remove only simple standalone assignment lines.
-        if c.first_write_detail == "assignment":
-            a_idx = c.first_write_line - 1
-            if a_idx < 0 or a_idx >= len(lines):
-                skipped.append(FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "assignment line out of range"))
-                continue
-            assign_raw = lines[a_idx]
-            assign_code, _ = split_code_comment(assign_raw)
-            if ";" in assign_code:
-                skipped.append(FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "assignment shares line with other statements"))
-                continue
-            m = ASSIGN_RE.match(assign_code.strip().lower())
-            lhs_name = first_identifier(m.group(1)) if m else None
-            if not m or lhs_name != c.name:
-                skipped.append(FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "first assignment is not simple variable assignment"))
-                continue
+        remove_targets = sorted(set(c.write_lines or [c.first_write_line]), reverse=True)
 
         indent = re.match(r"^\s*", decl_raw).group(0) if decl_raw else ""
         left_clean = remove_nonparameter_attrs(left.strip())
@@ -927,14 +960,40 @@ def apply_fixes_for_file(
             lines.insert(d_idx + 1, param_decl_line)
             inserted_line = True
             cand_idx = d_idx + 1
-        if c.first_write_detail in {"assignment", "data statement"}:
-            a_idx = c.first_write_line - 1
-            if inserted_line and a_idx > d_idx:
-                a_idx += 1
-            if a_idx != d_idx:
-                del lines[a_idx]
-                if a_idx < cand_idx:
-                    cand_idx -= 1
+        if c.first_write_detail in {"assignment", "repeated identical assignment", "data statement", "declaration initialization"}:
+            target_norm = normalize_expr_for_equality(c.first_write_expr)
+            span_start = max(0, c.unit_start - 1)
+            span_end = min(len(lines) - 1, c.unit_end - 1)
+            for a_idx in range(span_end, span_start - 1, -1):
+                if a_idx == cand_idx or a_idx < 0 or a_idx >= len(lines):
+                    continue
+                raw = lines[a_idx]
+                code, _ = split_code_comment(raw)
+                s = code.strip().lower()
+                if not s:
+                    continue
+                removable = False
+                m_asn = ASSIGN_RE.match(s)
+                if m_asn and ";" not in code and "=" in code:
+                    lhs_name = first_identifier(m_asn.group(1))
+                    rhs_raw = code.split("=", 1)[1].strip()
+                    rhs_norm = normalize_expr_for_equality(rhs_raw)
+                    if lhs_name == c.name and rhs_norm == target_norm:
+                        removable = True
+                if (not removable) and s.startswith("data "):
+                    tail = s[4:].strip()
+                    for m_data in DATA_ITEM_RE.finditer(tail):
+                        var_spec = m_data.group(1).strip()
+                        n = first_identifier(var_spec)
+                        data_vals = m_data.group(2).strip()
+                        rhs_norm = normalize_expr_for_equality(f"[{data_vals}]")
+                        if n == c.name and rhs_norm == target_norm:
+                            removable = True
+                            break
+                if removable:
+                    del lines[a_idx]
+                    if a_idx < cand_idx:
+                        cand_idx -= 1
 
         # Reorder generated declaration so referenced names are declared first.
         if c.expr_refs:
