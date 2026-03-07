@@ -2796,6 +2796,14 @@ def detect_needed_helpers(tree):
             self.generic_visit(node)
 
         def visit_Call(self, node):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "time"
+                and node.func.attr == "time"
+                and len(node.args) == 0
+            ):
+                needed.add("py_time")
             if isinstance(node.func, ast.Name) and node.func.id == "set":
                 needed.add("unique_char")
                 needed.add("unique_int")
@@ -4187,6 +4195,21 @@ def runtime_helper_templates():
          end if
       end function nanargmax"""
 
+    py_time_pub = (
+        "public :: py_time !@pyapi kind=function ret=real "
+        "args= desc=\"wall-clock seconds from system_clock (Python time.time approximation)\""
+    )
+    py_time_blk = """      function py_time() result(t)
+         real(kind=dp) :: t
+         integer :: count, rate
+         call system_clock(count, rate)
+         if (rate > 0) then
+            t = real(count, kind=dp) / real(rate, kind=dp)
+         else
+            t = 0.0_dp
+         end if
+      end function py_time"""
+
     return {
         "isqrt_int": (isqrt_pub, isqrt_blk),
         "print_int_list": (pil_pub, pil_blk),
@@ -4215,6 +4238,7 @@ def runtime_helper_templates():
         "nanmax": (nanmax_pub, nanmax_blk),
         "nanargmin": (nanargmin_pub, nanargmin_blk),
         "nanargmax": (nanargmax_pub, nanargmax_blk),
+        "py_time": (py_time_pub, py_time_blk),
     }
 
 
@@ -5629,6 +5653,14 @@ class translator(ast.NodeVisitor):
                 return "char"
             return None
         if isinstance(node, ast.Attribute):
+            if (
+                node.attr == "version"
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "np"
+                and node.value.attr == "version"
+            ):
+                return "char"
             if node.attr == "dtype" and isinstance(node.value, ast.Name):
                 nm = self._aliased_name(node.value.id)
                 if nm in self.structured_array_types:
@@ -5757,6 +5789,22 @@ class translator(ast.NodeVisitor):
                     return "char"
             return None
         if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "platform"
+                and node.func.attr == "python_version"
+                and len(node.args) == 0
+            ):
+                return "char"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "time"
+                and node.func.attr == "time"
+                and len(node.args) == 0
+            ):
+                return "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"strip", "lstrip", "rstrip"}
@@ -10625,6 +10673,22 @@ class translator(ast.NodeVisitor):
                 return f"sqrt({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "platform"
+                and node.func.attr == "python_version"
+                and len(node.args) == 0
+            ):
+                return fstr("unknown")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "time"
+                and node.func.attr == "time"
+                and len(node.args) == 0
+            ):
+                return "py_time()"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"strip", "lstrip", "rstrip"}
                 and len(node.args) <= 1
             ):
@@ -10697,6 +10761,14 @@ class translator(ast.NodeVisitor):
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
+            if (
+                node.attr == "version"
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "np"
+                and node.value.attr == "version"
+            ):
+                return fstr("unknown")
             if node.attr == "dtype" and isinstance(node.value, ast.Name):
                 anm = self._aliased_name(node.value.id)
                 if anm in self.structured_array_types:
@@ -20168,6 +20240,7 @@ def main():
     ap.add_argument("--run-diff", action="store_true", help="run Python and Fortran and compare outputs")
     ap.add_argument("--pretty", action="store_true", help="pretty-format Fortran runtime output")
     ap.add_argument("--tee", action="store_true", help="stream output while running transpiled Fortran")
+    ap.add_argument("--tee-orig", action="store_true", help="print original input source text")
     ap.add_argument("--tee-both", action="store_true", help="stream output while running both Python and Fortran")
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original Python run and transpiled Fortran run (implies --run)")
@@ -20203,6 +20276,10 @@ def main():
 
     src_path = Path(args.input_py)
     src_text = src_path.read_text(encoding="utf-8-sig")
+    if args.tee_orig:
+        print(f"Original source ({src_path}):")
+        if src_text:
+            print(src_text.rstrip())
     if args.strict_fix:
         fixed_text, nfix = _strict_fix_mixed_numeric_literals(src_text)
         nover = 0

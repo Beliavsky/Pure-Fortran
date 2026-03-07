@@ -217,6 +217,7 @@ public :: nanmax !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in
 public :: nanargmin !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmin ignoring NaN values; -1 when all NaN"
 public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmax ignoring NaN values; -1 when all NaN"
 public :: optval !@pyapi kind=function ret=scalar args=x:scalar:intent(in):optional,default:scalar:intent(in) desc="return x when present, otherwise default"
+public :: py_time !@pyapi kind=function ret=real args= desc="wall-clock seconds from system_clock (Python time.time approximation)"
 public :: cumsum
 public :: cumprod
 public :: eye
@@ -504,6 +505,17 @@ contains
          call random_seed(put=seed_buf)
          deallocate(seed_buf)
       end subroutine seed_rng
+
+      function py_time() result(t)
+         real(kind=dp) :: t
+         integer :: count, rate
+         call system_clock(count, rate)
+         if (rate > 0) then
+            t = real(count, kind=dp) / real(rate, kind=dp)
+         else
+            t = 0.0_dp
+         end if
+      end function py_time
 
       function loadtxt_real_2d(path, skiprows) result(x)
          character(len=*), intent(in) :: path
