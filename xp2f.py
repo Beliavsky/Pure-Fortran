@@ -6557,13 +6557,29 @@ class translator(ast.NodeVisitor):
         def _lower_expr_fortran():
             if slc.lower is None:
                 return extent_expr if step_val < 0 else "1"
+            lconst = _int_const(slc.lower)
+            if lconst is not None:
+                if lconst >= 0:
+                    return str(lconst + 1)
+                return f"({extent_expr} - {abs(lconst) - 1})"
             return f"({self.expr(slc.lower)} + 1)"
 
         def _upper_expr_fortran():
             if slc.upper is None:
                 return "1" if step_val < 0 else extent_expr
+            uconst = _int_const(slc.upper)
+            if step_val > 0:
+                if uconst is not None:
+                    if uconst >= 0:
+                        return str(uconst)
+                    return f"({extent_expr} - {abs(uconst)})"
+                return self.expr(slc.upper)
             # For negative-step slices, Python upper bound is exclusive and maps to +1 in Fortran.
             if step_val < 0:
+                if uconst is not None:
+                    if uconst >= 0:
+                        return str(uconst + 1)
+                    return f"({extent_expr} - {abs(uconst) - 1})"
                 return f"({self.expr(slc.upper)} + 1)"
             return self.expr(slc.upper)
 
@@ -8351,6 +8367,17 @@ class translator(ast.NodeVisitor):
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 return f"isqrt_int({self.expr(node.args[0])})"
+            if isinstance(node.func, ast.Name) and node.func.id == "round":
+                if len(node.args) == 1:
+                    return f"nint({self.expr(node.args[0])})"
+                if (
+                    len(node.args) == 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, int)
+                    and int(node.args[1].value) == 0
+                ):
+                    return f"nint({self.expr(node.args[0])})"
+                raise NotImplementedError("round() currently supports one argument (or ndigits=0)")
             if isinstance(node.func, ast.Name) and node.func.id == "int" and len(node.args) == 1:
                 return f"int({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id == "float" and len(node.args) == 1:
