@@ -28,6 +28,7 @@ import copy
 import io
 import tokenize
 import keyword
+import tempfile
 from datetime import datetime
 import fortran_output as fout
 import fortran_post as fpost
@@ -40,6 +41,7 @@ from fortran_scan import (
 )
 
 SHOW_TRANSLATION_NOTES = False
+SHOW_NOOP_NOTES = False
 
 
 def run_capture(cmd, tee=False, stream_line_filter=None):
@@ -5873,6 +5875,9 @@ class translator(ast.NodeVisitor):
                 return "char"
             return None
         if isinstance(node, ast.Attribute):
+            if node.attr == "__version__" and isinstance(node.value, ast.Name):
+                # Runtime package version strings are diagnostic only.
+                return fstr("unknown")
             if (
                 node.attr == "version"
                 and isinstance(node.value, ast.Attribute)
@@ -11093,9 +11098,29 @@ class translator(ast.NodeVisitor):
                     if name == "fftfreq":
                         return f"fft_fftfreq(int({n0}), {d_txt})" if d_txt is not None else f"fft_fftfreq(int({n0}))"
                     return f"fft_rfftfreq(int({n0}), {d_txt})" if d_txt is not None else f"fft_rfftfreq(int({n0}))"
+            if isinstance(node.func, ast.Attribute):
+                def _root_name_of_attr(a):
+                    cur = a
+                    while isinstance(cur, ast.Attribute):
+                        cur = cur.value
+                    return cur.id if isinstance(cur, ast.Name) else None
+                root = _root_name_of_attr(node.func.value)
+                # Expression-context visualization constructors/handle calls:
+                # return a dummy integer handle so assignments like
+                #   fig = plt.figure()
+                # remain compilable.
+                if root in {"plt", "pyplot", "matplotlib", "graphviz"} and node.func.attr in {
+                    "figure", "subplots", "gca", "gcf", "Graph", "Digraph",
+                }:
+                    return "0"
+                if node.func.attr in {"add_subplot", "add_axes", "subplot", "gca", "gcf", "twinx", "twiny"}:
+                    return "0"
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
+            if node.attr == "__version__" and isinstance(node.value, ast.Name):
+                # Runtime package version strings are diagnostic only.
+                return fstr("unknown")
             if (
                 node.attr == "version"
                 and isinstance(node.value, ast.Attribute)
@@ -16763,19 +16788,39 @@ class translator(ast.NodeVisitor):
         # Plotting/visualization calls are side-effect only and can be safely
         # ignored for numeric transpilation workflows.
         if isinstance(c.func, ast.Attribute):
+            def _root_name_of_attr(a):
+                cur = a
+                while isinstance(cur, ast.Attribute):
+                    cur = cur.value
+                return cur.id if isinstance(cur, ast.Name) else None
+
             attr = c.func.attr
             vis_noop = {
                 "plot", "scatter", "hist", "bar", "imshow", "contour", "contourf",
                 "figure", "subplots", "subplot", "show", "savefig", "close", "clf",
                 "cla", "grid", "legend", "xlabel", "ylabel", "title", "xlim", "ylim",
-                "xticks", "yticks", "suptitle", "tight_layout", "pause",
+                "xticks", "yticks", "suptitle", "tight_layout", "pause", "axis",
+                # graphviz-like builder/render calls
+                "node", "edge", "attr", "render", "view",
             }
             if attr in vis_noop:
-                base = c.func.value
-                is_plt = isinstance(base, ast.Name) and base.id in {"plt", "pyplot"}
-                is_fig_ax = isinstance(base, ast.Name) and (base.id.startswith("ax") or base.id.startswith("fig"))
-                if is_plt or is_fig_ax:
-                    return
+                if SHOW_NOOP_NOTES:
+                    call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+                    print(f"note: no-op standalone visual call: {call_txt}")
+                return
+            if attr.startswith("set_"):
+                if SHOW_NOOP_NOTES:
+                    call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+                    print(f"note: no-op standalone set_* call: {call_txt}")
+                return
+            # Conservative generic fallback for standalone module-style calls
+            # that are very commonly visualization/formatting only.
+            root = _root_name_of_attr(c.func.value)
+            if root in {"plt", "pyplot", "matplotlib", "graphviz"}:
+                if SHOW_NOOP_NOTES:
+                    call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+                    print(f"note: no-op standalone call: {call_txt}")
+                return
 
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
@@ -20952,6 +20997,128 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     return out_path, used_flat_fallback, used_main_unwrap
 
 
+def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_path=None):
+    """Best-effort partial transpilation: keep only transpilable top-level functions.
+
+    Produces Fortran that should compile to an object (`-c`) by avoiding
+    unsupported executable top-level statements.
+    """
+    src_path = Path(py_path)
+    src = src_path.read_text(encoding="utf-8-sig")
+    tree = ast.parse(src)
+
+    top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    top_funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    if not top_funcs:
+        raise NotImplementedError("partial mode found no top-level functions to transpile")
+
+    def _mk_src(nodes):
+        # Add a no-op executable statement so normal transpile flow remains valid.
+        mod = ast.Module(body=list(nodes) + [ast.Pass()], type_ignores=[])
+        ast.fix_missing_locations(mod)
+        txt = ast.unparse(mod)
+        return txt if txt.endswith("\n") else (txt + "\n")
+
+    def _try_src(src_text):
+        tmp_py = None
+        tmp_out = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
+                tmp_py = Path(f.name)
+                f.write(src_text)
+            with tempfile.NamedTemporaryFile("w", suffix=".f90", delete=False, encoding="utf-8") as f2:
+                tmp_out = Path(f2.name)
+            outp, _, _ = transpile_file(
+                tmp_py,
+                helper_paths,
+                flat=flat,
+                no_comment=no_comment,
+                out_path=tmp_out,
+            )
+            return True, None, outp
+        except (NotImplementedError, FileNotFoundError) as e:
+            return False, e, None
+        finally:
+            if tmp_py is not None:
+                try:
+                    tmp_py.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    # First-pass function screening.
+    keep = []
+    skipped = []
+    fn_names = {f.name for f in top_funcs}
+    for fn in top_funcs:
+        ok, err, outp = _try_src(_mk_src(top_imports + [fn]))
+        if ok:
+            keep.append(fn)
+            try:
+                if outp is not None:
+                    Path(outp).unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            skipped.append((fn.name, str(err)))
+
+    if not keep:
+        details = "; ".join([f"{n}: {r}" for n, r in skipped[:5]])
+        raise NotImplementedError(
+            "partial mode found no transpilable top-level functions"
+            + (f" ({details})" if details else "")
+        )
+
+    # Dependency pruning: if a kept function calls a local function that was
+    # skipped, drop the caller too.
+    name_to_fn = {f.name: f for f in top_funcs}
+    kept_names = {f.name for f in keep}
+
+    def _called_local_names(fn):
+        out = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in fn_names:
+                out.add(n.func.id)
+        return out
+
+    changed = True
+    while changed:
+        changed = False
+        for nm in list(kept_names):
+            deps = _called_local_names(name_to_fn[nm])
+            missing = [d for d in deps if d not in kept_names]
+            if missing:
+                kept_names.remove(nm)
+                skipped.append((nm, f"depends on non-transpilable local function(s): {', '.join(sorted(set(missing)))}"))
+                changed = True
+
+    keep = [fn for fn in top_funcs if fn.name in kept_names]
+    if not keep:
+        raise NotImplementedError("partial mode eliminated all candidate functions after dependency pruning")
+
+    final_src = _mk_src(top_imports + keep)
+    ok, err, outp = _try_src(final_src)
+    if not ok or outp is None:
+        raise err if err is not None else NotImplementedError("partial transpilation failed")
+
+    final_out = Path(out_path) if out_path else src_path.with_name(f"{src_path.stem}_p.f90")
+    txt = Path(outp).read_text(encoding="utf-8")
+    # Keep source attribution to original input path.
+    txt = re.sub(
+        r"^(!\s*transpiled by xp2f\.py from )([^\s]+)( on .*)$",
+        rf"\1{src_path.name}\3",
+        txt,
+        count=1,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    final_out.write_text(txt, encoding="utf-8")
+    try:
+        Path(outp).unlink(missing_ok=True)
+    except Exception:
+        pass
+    report = {"kept": [f.name for f in keep], "skipped": skipped}
+    return final_out, report
+
+
 def main():
     ap = argparse.ArgumentParser(description="partial python -> fortran transpiler")
     ap.add_argument("input_py", help="input python source")
@@ -20963,6 +21130,7 @@ def main():
     ap.add_argument("--strict-fix-inplace", action="store_true", help="overwrite input file when used with --strict-fix")
     ap.add_argument("--out-python", help="output path for --strict-fix (default: <input>_strict.py)")
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
+    ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
     ap.add_argument("--compile", action="store_true", help="compile transpiled source with helper files")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
     ap.add_argument("--run-both", action="store_true", help="run original Python and transpiled Fortran (no timing)")
@@ -21141,15 +21309,35 @@ def main():
         return msg
 
     t0_transpile = time.perf_counter()
+    partial_report = None
     try:
         out, used_flat_fallback, used_main_unwrap = transpile_file(
             args.input_py, args.helpers, args.flat, no_comment=(not args.comment), out_path=args.out
         )
     except (NotImplementedError, FileNotFoundError) as e:
-        print(f"Transpile: FAIL ({_format_transpile_error(e, src_text)})")
-        return 1
+        if not args.partial:
+            print(f"Transpile: FAIL ({_format_transpile_error(e, src_text)})")
+            return 1
+        try:
+            out, partial_report = transpile_partial_file(
+                args.input_py, args.helpers, args.flat, no_comment=(not args.comment), out_path=args.out
+            )
+            used_flat_fallback, used_main_unwrap = False, False
+            print(f"Transpile: PARTIAL ({_format_transpile_error(e, src_text)})")
+        except (NotImplementedError, FileNotFoundError) as pe:
+            print(f"Transpile: FAIL ({_format_transpile_error(pe, src_text)})")
+            return 1
     timings["transpile"] = time.perf_counter() - t0_transpile
     print(f"wrote {out}")
+    if partial_report is not None:
+        kept = partial_report.get("kept", [])
+        skipped = partial_report.get("skipped", [])
+        print(f"Partial: kept {len(kept)} function(s): {', '.join(kept)}")
+        print(f"Partial: skipped {len(skipped)} function(s)")
+        for nm, why in skipped[:10]:
+            print(f"  - {nm}: {why}")
+        if len(skipped) > 10:
+            print(f"  ... and {len(skipped) - 10} more")
     if SHOW_TRANSLATION_NOTES and used_flat_fallback and not args.flat:
         print("note: structured mode not applicable; used flat mode fallback")
     if SHOW_TRANSLATION_NOTES and used_main_unwrap:
