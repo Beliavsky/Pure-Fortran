@@ -2360,6 +2360,8 @@ def simplify_allocate_shape_to_mold(lines):
                     dims = _split_top_level(m_item.group(2))
                     src = None
                     ok = len(dims) >= 1
+                    if len(dims) > 3:
+                        ok = False
                     for i, d in enumerate(dims, start=1):
                         mm = re.fullmatch(r"size\s*\(\s*([a-z_]\w*)\s*,\s*(\d+)\s*\)", d, flags=re.IGNORECASE)
                         if not mm:
@@ -2379,6 +2381,18 @@ def simplify_allocate_shape_to_mold(lines):
                         dst_t = unit_types.get(dst.lower())
                         src_t = unit_types.get(src.lower())
                         if dst_t is None or src_t is None or dst_t != src_t:
+                            ok = False
+                    # Only rewrite true shape-clone forms where allocate rank
+                    # matches source rank exactly (size(src,1..rank)).
+                    if ok and src is not None and len(dims) >= 2:
+                        dim_ids = []
+                        for d in dims:
+                            mm = re.fullmatch(r"size\s*\(\s*[a-z_]\w*\s*,\s*(\d+)\s*\)", d, flags=re.IGNORECASE)
+                            if not mm:
+                                ok = False
+                                break
+                            dim_ids.append(int(mm.group(1)))
+                        if ok and dim_ids != list(range(1, len(dims) + 1)):
                             ok = False
                     if ok and src is not None:
                         code = f"{indent}allocate({dst}, mold={src})"
@@ -7422,10 +7436,28 @@ class translator(ast.NodeVisitor):
 
     def _shape_rank_hint(self, node):
         """Best-effort rank from a NumPy shape expression."""
+        def _is_shape_concat_term(n):
+            if isinstance(n, (ast.Tuple, ast.List)):
+                return True
+            if isinstance(n, ast.Attribute) and n.attr == "shape":
+                return True
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "shape"
+                and n.args
+            ):
+                return True
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+                return _is_shape_concat_term(n.left) or _is_shape_concat_term(n.right)
+            return False
+
         if isinstance(node, (ast.Tuple, ast.List)):
             return sum(max(0, self._shape_rank_hint(e)) for e in node.elts)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            return max(0, self._shape_rank_hint(node.left)) + max(0, self._shape_rank_hint(node.right))
+            if _is_shape_concat_term(node):
+                return max(0, self._shape_rank_hint(node.left)) + max(0, self._shape_rank_hint(node.right))
+            return 1
         if isinstance(node, ast.Attribute) and node.attr == "shape":
             return max(0, self._rank_expr(node.value))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "shape" and node.args:
@@ -7434,13 +7466,31 @@ class translator(ast.NodeVisitor):
 
     def _shape_dim_exprs(self, node):
         """Flatten a NumPy shape expression into Fortran extent expressions."""
+        def _is_shape_concat_term(n):
+            if isinstance(n, (ast.Tuple, ast.List)):
+                return True
+            if isinstance(n, ast.Attribute) and n.attr == "shape":
+                return True
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "shape"
+                and n.args
+            ):
+                return True
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+                return _is_shape_concat_term(n.left) or _is_shape_concat_term(n.right)
+            return False
+
         if isinstance(node, (ast.Tuple, ast.List)):
             dims = []
             for e in node.elts:
                 dims.extend(self._shape_dim_exprs(e))
             return dims
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            return self._shape_dim_exprs(node.left) + self._shape_dim_exprs(node.right)
+            if _is_shape_concat_term(node):
+                return self._shape_dim_exprs(node.left) + self._shape_dim_exprs(node.right)
+            return [self.expr(node)]
         if isinstance(node, ast.Attribute) and node.attr == "shape":
             base = self.expr(node.value)
             rr = max(0, int(self._rank_expr(node.value)))
