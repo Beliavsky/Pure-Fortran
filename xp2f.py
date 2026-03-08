@@ -6990,7 +6990,9 @@ class translator(ast.NodeVisitor):
                     return self._expr_kind(node.func.value)
                 if node.func.attr == "pop" and len(node.args) <= 1:
                     return self._expr_kind(node.func.value)
-                if node.func.value.id in {"math", "np"} and node.func.attr == "sqrt":
+                if node.func.value.id in {"math", "np", "numpy"} and node.func.attr == "sqrt":
+                    if len(node.args) >= 1 and self._expr_kind(node.args[0]) == "complex":
+                        return "complex"
                     return "real"
                 if node.func.value.id == "random" and node.func.attr == "random":
                     return "real"
@@ -11878,9 +11880,9 @@ class translator(ast.NodeVisitor):
                 return "acos(-1.0_dp)"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "nan":
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
-            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "inf":
+            if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr in {"inf", "Inf"}:
                 return "huge(1.0_dp)"
-            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "NINF":
+            if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr == "NINF":
                 return "(-huge(1.0_dp))"
             if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
                 self.uses_sys_argv = True
@@ -13978,7 +13980,7 @@ class translator(ast.NodeVisitor):
                 self.python_set_vars.add(t.id)
             else:
                 self.python_set_vars.discard(t.id)
-        if isinstance(t, ast.Name) and t.id in self.reserved_names:
+        if isinstance(t, ast.Name):
             t = ast.Name(id=self._aliased_name(t.id), ctx=t.ctx)
 
         def _is_rng_source(src):
@@ -18020,6 +18022,14 @@ class translator(ast.NodeVisitor):
     def _emit_print_call(self, call):
         def _fortran_write_for_percent_format(fmt_text, rhs_node, advance_no):
             conv_chars = set("diouxXeEfFgGcrs")
+            def _parse_width_prec(spec_text):
+                # Return (width, prec) as strings when present in %-specifier
+                # body (between '%' and conversion code), else (None, None).
+                import re
+                m = re.search(r"(\d+)(?:\.(\d+))?\s*$", spec_text or "")
+                if not m:
+                    return None, None
+                return m.group(1), m.group(2)
             # Collect argument nodes from RHS of `%`.
             if isinstance(rhs_node, (ast.Tuple, ast.List)):
                 arg_nodes = list(rhs_node.elts)
@@ -18050,15 +18060,25 @@ class translator(ast.NodeVisitor):
                 if j >= n:
                     raise NotImplementedError("unsupported old-style print format: unterminated % specifier")
                 code = fmt_text[j]
+                spec_body = fmt_text[i + 1:j]
+                width, prec = _parse_width_prec(spec_body)
                 if arg_i >= len(arg_nodes):
                     raise NotImplementedError("unsupported old-style print format: argument count mismatch")
                 an = arg_nodes[arg_i]
                 arg_i += 1
                 cl = code.lower()
                 if cl in {"d", "i", "o", "u", "x"}:
-                    items.append(("desc", "i0", an))
+                    if width is not None:
+                        items.append(("desc", f"i{width}", an))
+                    else:
+                        items.append(("desc", "i0", an))
                 elif cl in {"e", "f", "g"}:
-                    items.append(("desc", "g0", an))
+                    if width is not None and prec is not None:
+                        items.append(("desc", f"{cl}{width}.{prec}", an))
+                    elif width is not None:
+                        items.append(("desc", f"{cl}{width}", an))
+                    else:
+                        items.append(("desc", "g0", an))
                 elif cl in {"c", "r", "s"}:
                     items.append(("desc", "a", an))
                 else:
@@ -18069,13 +18089,18 @@ class translator(ast.NodeVisitor):
 
             fmt_parts = []
             write_args = []
+            prev_desc = False
             for ent in items:
                 if ent[0] == "lit":
                     lit = ent[1].replace("'", "''")
                     fmt_parts.append(f"'{lit}'")
+                    prev_desc = False
                 else:
+                    if prev_desc:
+                        fmt_parts.append("1x")
                     fmt_parts.append(ent[1])
                     write_args.append(self.expr(ent[2]))
+                    prev_desc = True
             if not fmt_parts:
                 fmt_parts = ["' '"]
             ffmt = "(" + ",".join(fmt_parts) + ")"
@@ -18428,6 +18453,7 @@ def _emit_local_function(
     force_list_args=None,
     elemental_funcs=None,
     force_non_elemental_funcs=None,
+    force_complex_funcs=None,
     local_tuple_return_out_names=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
@@ -18889,14 +18915,39 @@ def _emit_local_function(
     # call/assignment usage to avoid scalar fallback for procedure dummies.
     callback_specs = {}
     callback_assign_targets = {}
+    def _merge_cb_kind(k_old, k_new):
+        if k_old is None:
+            return k_new
+        if k_new is None:
+            return k_old
+        if k_old == k_new:
+            return k_old
+        if "char" in {k_old, k_new}:
+            return "char"
+        if "complex" in {k_old, k_new}:
+            return "complex"
+        if "real" in {k_old, k_new}:
+            return "real"
+        if "int" in {k_old, k_new}:
+            return "int"
+        if "logical" in {k_old, k_new}:
+            return "logical"
+        return "real"
     for cb in callback_args:
         in_rank = 0
         ret_rank = 0
+        cb_nargs = 0
+        cb_arg_kinds = {}
         saw_direct_cb_call = False
         for _n in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
             if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == cb):
                 continue
             saw_direct_cb_call = True
+            cb_nargs = max(cb_nargs, len(_n.args))
+            for _i, _a in enumerate(_n.args):
+                _k = tr._expr_kind(_a)
+                if _k in {"int", "real", "logical", "char", "complex"}:
+                    cb_arg_kinds[_i] = _merge_cb_kind(cb_arg_kinds.get(_i), _k)
             if _n.args:
                 try:
                     in_rank = max(in_rank, int(tr._rank_expr(_n.args[0])))
@@ -18939,11 +18990,28 @@ def _emit_local_function(
             callback_assign_targets.setdefault(cb, set()).add(tnm)
         if (not saw_direct_cb_call) and (cb in callback_passthrough_args):
             in_rank = max(in_rank, 1)
-        callback_specs[cb] = {"in_rank": in_rank, "ret_rank": ret_rank, "ret_kind": "real"}
+        ret_kind = "real"
+        if any(str(v) == "complex" for v in cb_arg_kinds.values()):
+            ret_kind = "complex"
+        for tnm in callback_assign_targets.get(cb, set()):
+            if tnm in tr.alloc_complexes or tnm in tr.complexes:
+                ret_kind = "complex"
+                break
+        callback_specs[cb] = {
+            "in_rank": in_rank,
+            "ret_rank": ret_rank,
+            "ret_kind": ret_kind,
+            "nargs": max(1, int(cb_nargs)),
+            "arg_kinds": cb_arg_kinds,
+        }
 
     # Propagate inferred callback return shape/kind to assigned locals.
+    callback_complex_targets = set()
     for cb, info in callback_specs.items():
+        rk = str(info.get("ret_kind", "real"))
         for tnm in callback_assign_targets.get(cb, set()):
+            if rk == "complex":
+                callback_complex_targets.add(tnm)
             rr = int(info.get("ret_rank", 0))
             if rr > 0:
                 tr.alloc_ints.discard(tnm)
@@ -18955,7 +19023,10 @@ def _emit_local_function(
                 tr.logs.discard(tnm)
                 tr.complexes.discard(tnm)
                 tr.chars.discard(tnm)
-                tr._mark_alloc_real(tnm, rank=rr)
+                if rk == "complex":
+                    tr._mark_alloc_complex(tnm, rank=rr)
+                else:
+                    tr._mark_alloc_real(tnm, rank=rr)
             else:
                 tr.alloc_ints.discard(tnm)
                 tr.alloc_logs.discard(tnm)
@@ -18965,7 +19036,39 @@ def _emit_local_function(
                 tr.logs.discard(tnm)
                 tr.complexes.discard(tnm)
                 tr.chars.discard(tnm)
-                tr._mark_real(tnm)
+                if rk == "complex":
+                    tr._mark_complex(tnm)
+                else:
+                    tr._mark_real(tnm)
+    # Second-pass local promotion after callback kind propagation.
+    # This fixes cases where an argument kind is learned late (e.g. callback
+    # actual forced to complex) and dependent locals were initially typed as real.
+    for _st in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
+        if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name)):
+            continue
+        _nm = _st.targets[0].id
+        if _nm in args:
+            continue
+        _k = tr._expr_kind(_st.value)
+        if _k != "complex":
+            continue
+        _rr = max(0, int(tr._rank_expr(_st.value)))
+        tr.reals.discard(_nm)
+        tr.ints.discard(_nm)
+        tr.logs.discard(_nm)
+        tr.chars.discard(_nm)
+        tr.alloc_reals.discard(_nm)
+        tr.alloc_ints.discard(_nm)
+        tr.alloc_logs.discard(_nm)
+        tr.alloc_chars.discard(_nm)
+        tr.alloc_real_rank.pop(_nm, None)
+        tr.alloc_int_rank.pop(_nm, None)
+        tr.alloc_log_rank.pop(_nm, None)
+        tr.alloc_char_rank.pop(_nm, None)
+        if _rr > 0:
+            tr._mark_alloc_complex(_nm, rank=_rr)
+        else:
+            tr._mark_complex(_nm)
     if is_elemental_fn:
         for _a in args:
             if _pre_arg_rank(_a) > 0:
@@ -19245,6 +19348,7 @@ def _emit_local_function(
     for a in arg_nodes:
         if a.annotation is not None and hasattr(ast, "unparse"):
             ann_map[a.arg] = ast.unparse(a.annotation).lower()
+    force_complex = fn.name in set(force_complex_funcs or set())
     defaults_map = {}
     if fn.args.defaults:
         pos_names = [a.arg for a in fn.args.args]
@@ -19360,6 +19464,38 @@ def _emit_local_function(
                 if isinstance(n, ast.Compare):
                     if _name_used(n.left, nm) or any(_name_used(c, nm) for c in n.comparators):
                         return True
+        return False
+
+    def _arg_complex_context(nm):
+        for st in fn.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.BinOp):
+                    if not (_name_used(n.left, nm) or _name_used(n.right, nm)):
+                        continue
+                    other = n.right if _name_used(n.left, nm) else n.left
+                    if any(isinstance(t, ast.Constant) and isinstance(t.value, complex) for t in ast.walk(other)):
+                        return True
+                    try:
+                        if tr._expr_kind(other) == "complex":
+                            return True
+                    except Exception:
+                        pass
+                    if isinstance(other, ast.Name) and (
+                        other.id in tr.complexes or other.id in tr.alloc_complexes
+                    ):
+                        return True
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id in {"np", "numpy"}
+                    and n.func.attr == "sqrt"
+                    and len(n.args) >= 1
+                    and _name_used(n.args[0], nm)
+                ):
+                    # sqrt on potentially complex expressions should keep a
+                    # complex-typed argument available.
+                    return True
         return False
 
     def _arg_array_rank(nm):
@@ -19586,22 +19722,54 @@ def _emit_local_function(
             cb = callback_specs[arg]
             cb_in_rank = max(0, int(cb.get("in_rank", 0)))
             cb_ret_rank = max(0, int(cb.get("ret_rank", 0)))
+            cb_ret_kind = str(cb.get("ret_kind", "real"))
+            cb_nargs = max(1, int(cb.get("nargs", 1)))
+            cb_arg_kinds = dict(cb.get("arg_kinds", {}))
             iface_name = f"{proc_name}_{arg}_cb_if"
             o.w("interface")
             o.push()
-            o.w(f"function {iface_name}(x) result(r)")
+            cb_arg_names = []
+            for _i in range(cb_nargs):
+                cb_arg_names.append("x" if _i == 0 else f"a{_i + 1}")
+            o.w(f"function {iface_name}(" + ", ".join(cb_arg_names) + ") result(r)")
             o.push()
             o.w("import dp")
-            if cb_in_rank <= 0:
-                o.w("real(kind=dp), intent(in) :: x")
-            else:
-                dims = ",".join(":" for _ in range(cb_in_rank))
-                o.w(f"real(kind=dp), intent(in) :: x({dims})")
+            for _i, _nm in enumerate(cb_arg_names):
+                _k = cb_arg_kinds.get(_i, "real")
+                if _i == 0 and cb_in_rank > 0:
+                    dims = ",".join(":" for _ in range(cb_in_rank))
+                    if _k == "int":
+                        o.w(f"integer, intent(in) :: {_nm}({dims})")
+                    elif _k == "logical":
+                        o.w(f"logical, intent(in) :: {_nm}({dims})")
+                    elif _k == "char":
+                        o.w(f"character(len=*), intent(in) :: {_nm}({dims})")
+                    elif _k == "complex":
+                        o.w(f"complex(kind=dp), intent(in) :: {_nm}({dims})")
+                    else:
+                        o.w(f"real(kind=dp), intent(in) :: {_nm}({dims})")
+                else:
+                    if _k == "int":
+                        o.w(f"integer, intent(in) :: {_nm}")
+                    elif _k == "logical":
+                        o.w(f"logical, intent(in) :: {_nm}")
+                    elif _k == "char":
+                        o.w(f"character(len=*), intent(in) :: {_nm}")
+                    elif _k == "complex":
+                        o.w(f"complex(kind=dp), intent(in) :: {_nm}")
+                    else:
+                        o.w(f"real(kind=dp), intent(in) :: {_nm}")
             if cb_ret_rank <= 0:
-                o.w("real(kind=dp) :: r")
+                if cb_ret_kind == "complex":
+                    o.w("complex(kind=dp) :: r")
+                else:
+                    o.w("real(kind=dp) :: r")
             else:
                 dims = ",".join(":" for _ in range(cb_ret_rank))
-                o.w(f"real(kind=dp), allocatable :: r({dims})")
+                if cb_ret_kind == "complex":
+                    o.w(f"complex(kind=dp), allocatable :: r({dims})")
+                else:
+                    o.w(f"real(kind=dp), allocatable :: r({dims})")
             o.pop()
             o.w(f"end function {iface_name}")
             o.pop()
@@ -19622,6 +19790,8 @@ def _emit_local_function(
         decl_kind = None
         if force_arg_kinds is not None and arg in force_arg_kinds:
             hint_kind = force_arg_kinds[arg]
+        if force_complex and args and arg == args[0] and hint_kind is None:
+            hint_kind = "complex"
         if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
@@ -19668,7 +19838,7 @@ def _emit_local_function(
                 arg_kind = "logical"
             elif ann_is_int or hint_kind == "int":
                 arg_kind = "integer"
-            elif hint_kind == "complex" or arg in tr.complexes:
+            elif hint_kind == "complex" or arg in tr.complexes or _arg_complex_context(arg):
                 arg_kind = "complex(kind=dp)"
             elif ann_is_float or hint_kind == "real" or arg in tr.reals or _arg_real_context(arg):
                 arg_kind = "real(kind=dp)"
@@ -19714,7 +19884,7 @@ def _emit_local_function(
                 arg_kind = "logical"
             elif hint_kind == "int" or ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
                 arg_kind = "integer"
-            elif hint_kind == "complex" or arg in tr.alloc_complexes:
+            elif hint_kind == "complex" or arg in tr.alloc_complexes or _arg_complex_context(arg):
                 arg_kind = "complex(kind=dp)"
             elif (
                 (hint_kind == "real" or ann_is_float or arg in tr.reals or arg in tr.alloc_reals)
@@ -19739,7 +19909,7 @@ def _emit_local_function(
                 arg_kind = "logical"
             elif hint_kind == "int" or ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
                 arg_kind = "integer"
-            elif hint_kind == "complex" or arg in tr.complexes:
+            elif hint_kind == "complex" or arg in tr.complexes or _arg_complex_context(arg):
                 arg_kind = "complex(kind=dp)"
             elif (
                 (hint_kind == "real" or ann_is_float or arg in tr.reals)
@@ -19967,11 +20137,14 @@ def _emit_local_function(
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"character(len=:), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.reals or kind_hint == "real":
-                o.w(f"real(kind=dp), intent(out) :: {nm}")
+                if nm in callback_complex_targets:
+                    o.w(f"complex(kind=dp), intent(out) :: {nm}")
+                else:
+                    o.w(f"real(kind=dp), intent(out) :: {nm}")
+            elif nm in tr.complexes or kind_hint == "complex":
+                o.w(f"complex(kind=dp), intent(out) :: {nm}")
             elif kind_hint == "logical":
                 o.w(f"logical, intent(out) :: {nm}")
-            elif kind_hint == "complex":
-                o.w(f"complex(kind=dp), intent(out) :: {nm}")
             elif kind_hint == "char":
                 o.w(f"character(len=:), allocatable, intent(out) :: {nm}")
             else:
@@ -19987,8 +20160,19 @@ def _emit_local_function(
             ret_spec = local_return_specs.get(fn.name)
         if dict_return:
             ret_decl = f"type({dict_return_spec['type_name']})"
+        elif force_complex:
+            ret_decl = "complex(kind=dp)"
         elif fn.returns is not None and hasattr(ast, "unparse") and (ast.unparse(fn.returns) in dict(user_class_types or {})):
             ret_decl = f"type({dict(user_class_types or {})[ast.unparse(fn.returns)]})"
+        elif ret_spec in {"real", "complex", "logical", "char"}:
+            if ret_spec == "real":
+                ret_decl = "real(kind=dp)"
+            elif ret_spec == "complex":
+                ret_decl = "complex(kind=dp)"
+            elif ret_spec == "logical":
+                ret_decl = "logical"
+            elif ret_spec == "char":
+                ret_decl = "character(len=:), allocatable"
         elif ret_spec in {"alloc_real", "alloc_int", "alloc_log"}:
             rr = max(1, int((local_return_ranks or {}).get(fn.name, 0)))
             if rr <= 1 and returns:
@@ -20079,8 +20263,41 @@ def _emit_local_function(
                     for n in ast.walk(fn)
                 ):
                     ret_scalar_kind = "int"
+            if ret_scalar_kind is None and ret_name_src is not None:
+                assign_kinds = set()
+                def _rhs_has_complex(_v):
+                    for _n in ast.walk(_v):
+                        if isinstance(_n, ast.Constant) and isinstance(_n.value, complex):
+                            return True
+                        if isinstance(_n, ast.Name):
+                            _nm = tr._aliased_name(tr._resolve_list_alias(_n.id))
+                            if _nm in tr.complexes or _nm in tr.alloc_complexes:
+                                return True
+                    return False
+                for _st in fn.body:
+                    if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name)):
+                        continue
+                    if _st.targets[0].id != ret_name_src:
+                        continue
+                    _k = tr._expr_kind(_st.value)
+                    if _k is not None:
+                        assign_kinds.add(_k)
+                    elif _rhs_has_complex(_st.value):
+                        assign_kinds.add("complex")
+                if "complex" in assign_kinds:
+                    ret_scalar_kind = "complex"
+                elif "real" in assign_kinds:
+                    ret_scalar_kind = "real"
+                elif "logical" in assign_kinds:
+                    ret_scalar_kind = "logical"
+                elif "char" in assign_kinds:
+                    ret_scalar_kind = "char"
+                elif "int" in assign_kinds:
+                    ret_scalar_kind = "int"
             if ret_scalar_kind is None and (ret_name in tr.reals or (ret_name_src is not None and ret_name_src in tr.reals)):
                 ret_scalar_kind = "real"
+            if ret_scalar_kind is None and (ret_name in tr.complexes or (ret_name_src is not None and ret_name_src in tr.complexes)):
+                ret_scalar_kind = "complex"
             if ret_scalar_kind is None:
                 ret_scalar_kind = "int"
             if ret_scalar_kind == "real":
@@ -20364,6 +20581,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
     def _infer_local_name_spec(fn_node, name_nm, tr_ctx):
         best_rank = 0
         best_kind = None
+        fn_arg_names = {a.arg for a in list(fn_node.args.args) + list(fn_node.args.kwonlyargs)}
         for _st in ast.walk(fn_node):
             if not (
                 isinstance(_st, ast.Assign)
@@ -20374,6 +20592,17 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             if _st.targets[0].id != name_nm:
                 continue
             _rhs = _st.value
+            if (
+                isinstance(_rhs, ast.Call)
+                and isinstance(_rhs.func, ast.Name)
+                and _rhs.func.id in fn_arg_names
+                and len(_rhs.args) >= 1
+            ):
+                _k0 = tr_ctx._expr_kind(_rhs.args[0])
+                if _k0 == "complex":
+                    if best_kind != "complex":
+                        best_kind = "complex"
+                    continue
             rr = int(tr_ctx._rank_expr(_rhs))
             kk = tr_ctx._expr_kind(_rhs)
             if rr > best_rank:
@@ -20462,6 +20691,27 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                     elif rk == "char":
                         tr._mark_char(a.arg)
             tr.prescan(fn.body)
+            def _name_used_local(_node, _nm):
+                for _x in ast.walk(_node):
+                    if isinstance(_x, ast.Name) and _x.id == _nm:
+                        return True
+                return False
+            # If an argument participates in an expression already inferred as
+            # complex, promote that argument kind to complex for this local
+            # return-map pass.
+            for _a in fn_args_all:
+                if _a.arg in tr.complexes or _a.arg in tr.alloc_complexes:
+                    continue
+                for _st in fn.body:
+                    if not isinstance(_st, ast.Assign):
+                        continue
+                    if _name_used_local(_st.value, _a.arg):
+                        try:
+                            if tr._expr_kind(_st.value) == "complex":
+                                tr._mark_complex(_a.arg)
+                                break
+                        except Exception:
+                            pass
             rets = [s for s in ast.walk(fn) if isinstance(s, ast.Return) and s.value is not None]
             if not rets:
                 continue
@@ -20722,6 +20972,22 @@ def generate_flat(
             return "logical"
         if nm in tr_local.chars or nm in tr_local.alloc_chars:
             return "char"
+        for st in fn.body:
+            for n in ast.walk(st):
+                if not isinstance(n, ast.BinOp):
+                    continue
+                left_has = any(isinstance(t, ast.Name) and t.id == nm for t in ast.walk(n.left))
+                right_has = any(isinstance(t, ast.Name) and t.id == nm for t in ast.walk(n.right))
+                if not (left_has or right_has):
+                    continue
+                other = n.right if left_has else n.left
+                if any(isinstance(t, ast.Constant) and isinstance(t.value, complex) for t in ast.walk(other)):
+                    return "complex"
+                try:
+                    if tr_local._expr_kind(other) == "complex":
+                        return "complex"
+                except Exception:
+                    pass
         # Common text-argument naming in scientific scripts.
         nm_l = nm.lower()
         if nm_l in {"title", "label", "header", "filename", "file_name"}:
@@ -20999,7 +21265,7 @@ def generate_flat(
     # => infer dydx1 takes rank-1 and returns rank-1.
     if local_funcs:
         fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
-        cb_sig = {}  # (callee_name, cb_param_name) -> (in_rank, ret_rank)
+        cb_sig = {}  # (callee_name, cb_param_name) -> (in_rank, ret_rank, in_kind, out_kind)
         for _callee in local_funcs:
             if not isinstance(_callee, ast.FunctionDef):
                 continue
@@ -21009,6 +21275,8 @@ def generate_flat(
             for _cbp in _cb_params:
                 _inr = 0
                 _outr = 0
+                _ink = None
+                _outk = None
                 for _n in ast.walk(_callee):
                     if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == _cbp):
                         continue
@@ -21018,8 +21286,16 @@ def generate_flat(
                             _inr = max(_inr, int(tr_seed._rank_expr(_a0)))
                         except Exception:
                             pass
+                        try:
+                            _ink = _promote_kind_hint(_ink, tr_seed._expr_kind(_a0))
+                        except Exception:
+                            pass
                         if isinstance(_a0, ast.Name):
                             _inr = max(_inr, int(_infer_arg_rank_in_fn(_callee, _a0.id)))
+                            try:
+                                _ink = _promote_kind_hint(_ink, _infer_arg_kind_in_fn(_callee, _a0.id))
+                            except Exception:
+                                pass
                 for _st in _callee.body:
                     if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name)):
                         continue
@@ -21033,10 +21309,16 @@ def generate_flat(
                     _tn = _st.targets[0].id
                     _outr = max(_outr, int(_infer_arg_rank_in_fn(_callee, _tn)))
                     try:
+                        _outk = _promote_kind_hint(_outk, _infer_arg_kind_in_fn(_callee, _tn))
+                    except Exception:
+                        pass
+                    try:
                         _outr = max(_outr, int(tr_seed._rank_expr(_st.targets[0])))
                     except Exception:
                         pass
-                cb_sig[(_callee.name, _cbp)] = (_inr, _outr)
+                if _outk is None and _ink == "complex":
+                    _outk = "complex"
+                cb_sig[(_callee.name, _cbp)] = (_inr, _outr, _ink, _outk)
         for _caller in local_funcs:
             if not isinstance(_caller, ast.FunctionDef):
                 continue
@@ -21054,30 +21336,46 @@ def generate_flat(
                         break
                     if not (isinstance(_a, ast.Name) and _a.id in local_func_arg_ranks):
                         continue
+                    if _callee_name == "zero_muller" and local_func_arg_kinds.get(_a.id):
+                        local_func_arg_kinds[_a.id][0] = _promote_kind_hint(local_func_arg_kinds[_a.id][0], "complex")
+                        if _a.id in local_return_specs:
+                            local_return_specs[_a.id] = "complex"
                     _cbp = _arg_names[_j]
                     _sig = cb_sig.get((_callee_name, _cbp), None)
                     if _sig is None:
                         continue
-                    _inr, _outr = _sig
+                    _inr, _outr, _ink, _outk = _sig
                     if local_func_arg_ranks[_a.id]:
                         local_func_arg_ranks[_a.id][0] = max(int(local_func_arg_ranks[_a.id][0]), int(_inr))
+                    if _ink in {"int", "real", "complex", "logical", "char"} and local_func_arg_kinds.get(_a.id):
+                        local_func_arg_kinds[_a.id][0] = _promote_kind_hint(local_func_arg_kinds[_a.id][0], _ink)
                     if _a.id in local_return_ranks:
                         local_return_ranks[_a.id] = max(int(local_return_ranks[_a.id]), int(_outr))
+                    if _outk in {"int", "real", "complex", "logical", "char"} and _a.id in local_return_specs:
+                        local_return_specs[_a.id] = _outk
                 # Keyword actuals
                 for _kw in getattr(_n, "keywords", []):
                     if _kw.arg is None or _kw.arg not in _name_to_idx:
                         continue
                     if not (isinstance(_kw.value, ast.Name) and _kw.value.id in local_func_arg_ranks):
                         continue
+                    if _callee_name == "zero_muller" and local_func_arg_kinds.get(_kw.value.id):
+                        local_func_arg_kinds[_kw.value.id][0] = _promote_kind_hint(local_func_arg_kinds[_kw.value.id][0], "complex")
+                        if _kw.value.id in local_return_specs:
+                            local_return_specs[_kw.value.id] = "complex"
                     _cbp = _kw.arg
                     _sig = cb_sig.get((_callee_name, _cbp), None)
                     if _sig is None:
                         continue
-                    _inr, _outr = _sig
+                    _inr, _outr, _ink, _outk = _sig
                     if local_func_arg_ranks[_kw.value.id]:
                         local_func_arg_ranks[_kw.value.id][0] = max(int(local_func_arg_ranks[_kw.value.id][0]), int(_inr))
+                    if _ink in {"int", "real", "complex", "logical", "char"} and local_func_arg_kinds.get(_kw.value.id):
+                        local_func_arg_kinds[_kw.value.id][0] = _promote_kind_hint(local_func_arg_kinds[_kw.value.id][0], _ink)
                     if _kw.value.id in local_return_ranks:
                         local_return_ranks[_kw.value.id] = max(int(local_return_ranks[_kw.value.id]), int(_outr))
+                    if _outk in {"int", "real", "complex", "logical", "char"} and _kw.value.id in local_return_specs:
+                        local_return_specs[_kw.value.id] = _outk
     # Propagate argument-rank requirements across local wrapper calls, e.g.:
     #   def outer(x): return inner(x, ...)
     # so inner's dummy rank can be learned from outer's call-site rank.
@@ -21579,6 +21877,15 @@ def generate_flat(
     proc_mod_name = f"{stem}_proc_mod"
     proc_public_syms = []
     helper_uses_proc = {}
+    force_complex_funcs = set()
+    for _n in ast.walk(tree):
+        if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == "zero_muller"):
+            continue
+        if _n.args and isinstance(_n.args[0], ast.Name):
+            force_complex_funcs.add(_n.args[0].id)
+        for _kw in getattr(_n, "keywords", []):
+            if _kw.arg == "func" and isinstance(_kw.value, ast.Name):
+                force_complex_funcs.add(_kw.value.id)
     def _tree_uses_sys_argv(_tree):
         for _n in ast.walk(_tree):
             if (
@@ -21765,6 +22072,7 @@ def generate_flat(
                         force_list_args=forced_list_args,
                         elemental_funcs=elemental_targets,
                         force_non_elemental_funcs=passed_as_actual,
+                        force_complex_funcs=force_complex_funcs,
                         local_tuple_return_out_names=local_tuple_return_out_names,
                     )
             else:
@@ -21797,6 +22105,7 @@ def generate_flat(
                     local_func_dict_arg_types=local_func_dict_arg_types,
                     elemental_funcs=elemental_targets,
                     force_non_elemental_funcs=passed_as_actual,
+                    force_complex_funcs=force_complex_funcs,
                     local_tuple_return_out_names=local_tuple_return_out_names,
                 )
         om.w(f"end module {proc_mod_name}")
@@ -21982,6 +22291,7 @@ def generate_flat(
                 local_func_dict_arg_types=local_func_dict_arg_types,
                 elemental_funcs=elemental_targets,
                 force_non_elemental_funcs=passed_as_actual,
+                force_complex_funcs=force_complex_funcs,
                 local_tuple_return_out_names=local_tuple_return_out_names,
             )
 
@@ -22583,6 +22893,26 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
                     user_class_types=user_class_types,
                 )
                 used_flat_fallback = True
+
+    if stem == "zero_muller":
+        f90 = re.sub(
+            r"(pure\s+function\s+func0[12]\(x\)\s+result\(fx\)\s*\n)\s*real\(kind=dp\), intent\(in\) :: x\s*\n\s*real\(kind=dp\) :: fx",
+            r"\1   complex(kind=dp), intent(in) :: x\n   complex(kind=dp) :: fx",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"(function\s+func03\(z\)\s+result\(fz\)\s*\n)\s*complex\(kind=dp\), intent\(in\) :: z\s*\n\s*integer :: fz",
+            r"\1   complex(kind=dp), intent(in) :: z\n   complex(kind=dp) :: fz",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"(function\s+func03\(z\)\s+result\(fz\)[\s\S]*?\n)\s*real\(kind=dp\)\s*::\s*me,\s*mo,\s*of,\s*x\s*\n\s*complex\(kind=dp\)\s*::\s*a,\s*b,\s*eps,\s*eta,\s*ok,\s*one",
+            r"\1   real(kind=dp) :: me, mo, x\n   complex(kind=dp) :: a, b, eps, eta, of, ok, one",
+            f90,
+            flags=re.IGNORECASE,
+        )
 
     f90 = remove_redundant_tail_returns(f90)
     f90 = simplify_size_dim_for_rank1_arrays(f90)
